@@ -1,0 +1,114 @@
+{
+  "realm": "vms",
+  "displayName": "VMS",
+  "displayNameHtml": "<span>VMS</span>",
+  "enabled": true,
+  "sslRequired": "none",
+  "loginTheme": "vms",
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "failureFactor": 5,
+  "eventsEnabled": true,
+  "eventsListeners": [
+    "jboss-logging"
+  ],
+  "enabledEventTypes": [
+    "LOGIN",
+    "LOGIN_ERROR",
+    "LOGOUT",
+    "LOGOUT_ERROR"
+  ],
+  "eventsExpiration": 604800,
+  "rememberMe": true,
+  "internationalizationEnabled": true,
+  "supportedLocales": [
+    "en",
+    "hi"
+  ],
+  "defaultLocale": "en",
+  "roles": {
+    "realm": [
+      {
+        "name": "admin",
+        "description": "Configure cameras, users, retention, integrations"
+      },
+      {
+        "name": "supervisor",
+        "description": "Everything an operator can do, plus acknowledge and reset alarms"
+      },
+      {
+        "name": "operator",
+        "description": "View, search, acknowledge alarms, trigger peripherals"
+      },
+      {
+        "name": "viewer",
+        "description": "Live view only — no recorded footage, no exports"
+      },
+      {
+        "name": "dpo",
+        "description": "Data Protection Officer / Authority — approve sensitive actions"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "vms-web",
+      "name": "VMS Management SPA",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      }
+    },
+    {
+      "clientId": "vms-pwcheck",
+      "name": "VMS password verification (internal)",
+      "description": "Confidential, direct-grant-only client the api uses to verify a user's CURRENT password when they change it themselves. Never used by a browser. Keep vms-web free of direct grants.",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [],
+      "webOrigins": []
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "admin@variphi.local",
+      "firstName": "Site",
+      "lastName": "Administrator",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin",
+          "temporary": true
+        }
+      ],
+      "realmRoles": [
+        "admin",
+        "operator",
+        "dpo"
+      ]
+    }
+  ]
+}

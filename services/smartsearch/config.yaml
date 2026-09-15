@@ -1,0 +1,386 @@
+# Smart Search index service defaults. Cameras are NOT configured here — the
+# camera-mgmt registry pushes them at runtime (POST /cameras/{slug}) and
+# re-asserts them via its reconcile loop, exactly like the NVR and motion.
+
+ingest:
+  # A CAP, not a rate. Phase 0 measured delivered frame rates from 0.08 fps to
+  # 15 fps across cameras on one appliance — a 190x spread — so the sampler
+  # takes whatever exists up to this, and never assumes a frame is available.
+  # NOT A RATE THIS SERVICE APPLIES ANY MORE. Detection moved to
+  # services/analytics and SEARCH_FRAME_SOURCE=none is the only valid mode, so
+  # nothing here samples: /health reports this as `expected_source_fps`, the
+  # rate the frame source is expected to run at. It therefore has to equal the
+  # frames broker's rate. It stayed at 2.0 when frames moved to 5.0, and the
+  # one field meant to reveal a mismatch reported one that was not real.
+  # tests/test_compose_defaults.py at the repo root now holds them together.
+  #
+  # 5 FPS is for the TRACKER and nothing else. Replaying the same 16 NVR
+  # segments 2026-09-07: 1 -> 2 moved tracker cost p99 3.57 -> 1.63 (walking
+  # pairs p95 7.88 -> 1.96) while distinct objects rose only 89 -> 91 against
+  # 2.05x the detections. frames measured 2 -> 5 the same way: association
+  # failure 14.9% -> 9.2% recorded, for about 1.4x broker CPU.
+  max_sample_fps: 5.0
+  # `none` IS THE ONLY VALUE THIS SERVICE STILL ACCEPTS. "sampler" (decode our
+  # own RTSP session) and "broker" (consume vms_frames) were its own decoders;
+  # both moved to services/analytics with the detector, and index/config.py now
+  # refuses either by raising at startup rather than registering cameras,
+  # reporting healthy and indexing nothing.
+  #
+  # This file said `sampler` until 2026-09-12, which made the SHIPPED config
+  # invalid against its own code: the image's CMD is `--config config.yaml`, so
+  # it started only because docker-compose.yml happens to set
+  # SEARCH_FRAME_SOURCE=none, and a plain `python main.py` raised ValueError.
+  frame_source: none
+  broker_url: "redis://127.0.0.1:6379/0"   # overridden by REDIS_URL
+  broker_channel_prefix: "vms.frames"
+  detect_confidence: 0.35
+  min_crop_width: 16
+  min_crop_height: 32
+  # Deduplicate by appearance, not by geometry. At 1 FPS a walking person moves
+  # most of the frame between samples, so IOU association is at its least
+  # reliable; phase 0 measured a tracker MERGING people at this rate (5 tracks
+  # where the 15 FPS reference found 8). Embedding-distance clustering scored
+  # purity 0.983 / ARI 0.946 against that reference and was flat across
+  # 0.80-0.88, so 0.85 sits mid-plateau rather than on a cliff edge.
+  dedup_window_seconds: 30.0
+  dedup_cosine_threshold: 0.85
+  # The temporal gate that lived here is gone; see the `tracking` and
+  # `index_policy` sections below. Its association logic became the tracker's
+  # matcher and its suppression logic became an explicit policy.
+  # Bounded queue from the capture threads to the single inference worker.
+  # Full drops the newest frame and counts it: blocking the capture thread
+  # would stall the stream and drop frames anyway, silently, inside ffmpeg.
+  queue_size: 64
+  enabled: true
+
+tracking:
+  # Object identity only. "Is this the same physical object?" — never "should
+  # this be indexed?", which is index_policy's job below.
+  #
+  # EVERY VALUE IS SECONDS OR OBJECT HEIGHTS. Never frames, never pixels. That
+  # is what keeps the tracker independent of max_sample_fps above, and it is
+  # the reason we did not adopt Norfair or ByteTrack, both of which count in
+  # frames and would have to be re-tuned whenever the sample rate moved.
+  enabled: true
+  # MEASURED 2026-09-07, 16 replayed NVR segments at 2 FPS. Real continuations
+  # sit at p50 0.07 / p90 0.55 / p95 0.79 / p99 1.63, so 1.75 covers ~99% of
+  # them without reaching far enough to grab the neighbouring object.
+  #
+  # The cost is NOT IoU, deliberately. Measured on the same footage, an
+  # IoU-based matcher fails on 100% of walking-person pairs at 1 FPS and 79% at
+  # 2 FPS, with 62.5% having literally zero overlap — no threshold reaches
+  # those. That is what eliminated ByteTrack, SORT and BoT-SORT.
+  #
+  # SWEPT 2026-09-07 on the 2 FPS trace (1,989 detections). Reduction is flat
+  # across the range, so this parameter buys identity quality, not cost:
+  #
+  #     cost   tracks   fragmentation   assoc-fail
+  #     0.75      209       2.30           10.5%
+  #     1.25      154       1.69            7.7%
+  #     1.75      134       1.47            6.7%   <- chosen
+  #     2.50      114       1.25            5.7%
+  #     3.00      107       1.18            5.4%
+  #
+  # Fragmentation keeps falling above 1.75, and it is TEMPTING to go further.
+  # Do not: real continuations top out at p99 = 1.63, so every association
+  # bought above ~1.75 is one the evidence says is not a continuation. That is
+  # not less fragmentation, it is the beginning of MERGING — and a merged
+  # identity is a person who never comes back as a hit, which is the worse
+  # failure. 1.75 is the last value justified by the data.
+  max_association_cost: 1.75
+  # UNRESOLVED, AND HONESTLY SO. The sweep found no benefit from prediction
+  # (fragmentation 1.41 at alpha 0 rising to 1.49 at alpha 1.0 — slightly
+  # WORSE with it), but the trace is 76% near-stationary pairs, which is
+  # exactly the case where prediction cannot help and its noise can hurt. The
+  # case it exists for — fast objects and re-acquisition after a miss — is 79
+  # pairs out of 1,731 here, too few to resolve. Kept at a middling 0.5 and
+  # flagged for footage with more movement; this is the one parameter below
+  # still chosen on principle rather than evidence.
+  velocity_alpha: 0.5
+  confirm_after_seconds: 1.0
+  # Longer ages fragment less (1.30 at 10 s against 1.47 at 3 s) and the
+  # temptation is the same as above. Short on purpose: the longer a track can
+  # be resurrected, the more likely it is resurrected onto the WRONG object.
+  max_age_seconds: 3.0
+  stationary_after_seconds: 4.0
+  stationary_distance: 0.15
+  max_tracks_per_key: 64
+  # TRUE, AND THE SWEEP IS WHY. The design proposed false — two hits before
+  # indexing, to keep detector flicker out of the index. Measured against 1,989
+  # real detections it removed far more than flicker:
+  #
+  #     tentative NOT indexed   91.3% reduction   31.3% of tracks NEVER indexed
+  #     tentative indexed       87.0% reduction    0.0% never indexed
+  #
+  # A track that produces no observation is a person no search can return.
+  # Four points of embedding saving does not buy that, so first sight is always
+  # recorded and CLIP dedup absorbs the flicker — its existing job.
+  index_tentative: true
+
+index_policy:
+  # Whether an observation of an already-identified object earns a row. Kept
+  # separate from `tracking` on purpose: conflating the two is what made the old
+  # temporal gate hard to reason about, since its window was simultaneously the
+  # identity timeout and the re-index interval.
+  #
+  # false = index every observation of every confirmed track. The escape hatch;
+  # SEARCH_INDEX_SUPPRESSION_ENABLED=false does the same without an edit.
+  suppression_enabled: true
+  # Measured from the LAST INDEXED position, not the last seen one. The old gate
+  # could not tell the difference because its entries followed the object; a
+  # tracker separates the two, which is the main gain of this whole change.
+  displacement_heights: 1.5
+  scale_change_ratio: 1.5
+  # HOW MANY CONSECUTIVE OBSERVATIONS THE SCALE CHANGE MUST SURVIVE. 1 restores
+  # the old behaviour.
+  #
+  # 2, because the detector's box is noisier than the threshold. Measured over
+  # 14 minutes of continuous footage: consecutive same-track height ratios run
+  # p50 1.03 / p95 1.64 / p99 2.55, so 6.1% of ordinary frame-to-frame pairs
+  # already clear 1.5x on noise alone — and 83.7% of multi-observation tracks
+  # have heights that OSCILLATE rather than move one way. A single bad box then
+  # becomes the anchor and manufactures a row: one real case was a legs-only
+  # detection at confidence 0.54, after which an ordinary full-body box read as
+  # a 1.61x "scale change" and earned its own index entry.
+  #
+  #     variant                 scale fires  rows  good-coverage
+  #     1.5x, no persistence             70   229      23.9%
+  #     2.0x threshold                   25   207      21.4%
+  #     smoothed heights                 35   205      22.2%
+  #     1.5x + persist 2                 43   200      22.4%   <- this
+  #
+  # Fewest rows AND more forensic coverage than either raising the threshold or
+  # smoothing the heights. The idea is Frigate's CHANGED_FRAMES_TO_FLIP: one
+  # frame's disagreement is not evidence, a change that survives two is.
+  #
+  # NOT Frigate's pixel classifier, which was measured and rejected — its NCC
+  # check only discriminates for objects already STATIONARY, and at our fire
+  # points it scored median 0.262 against a 0.85 threshold, vetoing 0 of 27.
+  scale_change_persist: 2
+  # Re-index a visible object at least this often regardless.
+  #
+  # OFF BY DEFAULT, ON EVIDENCE — the mechanism is kept and still works, set any
+  # positive number to enable it. Measured over 14 minutes of CONTINUOUS
+  # single-camera footage (2,292 detections, 148 tracks):
+  #
+  #     heartbeat  indexed  rows  coverage  fires
+  #         60 s       322   230     30.9%      1     <- the old default
+  #         30 s       326   232     31.3%      7
+  #         10 s       389   244     36.1%     57
+  #          0         321   229     30.8%      0     <- default now
+  #
+  # Track lifetimes are short (median 2.5 s, longest 99 s; only 3 of 148 could
+  # reach 60 s) because tracking.max_age_seconds ends a track after a 3 s
+  # detection gap. And where it does fire, its observations become rows at 22%
+  # against a 71% baseline — CLIP dedup rejects them as visually identical,
+  # which is unsurprising since a heartbeat fires when nothing has changed.
+  #
+  # Keeping a motionless object findable is already handled by first-sight,
+  # which is never skipped. Re-enable for a site with genuinely long-lived
+  # tracks, such as a car park.
+  heartbeat_seconds: 0
+  quality_confidence_gain: 0.15
+
+motion:
+  # The gate in front of the detector, done INLINE on the frame we already
+  # decoded. Asking the motion service instead would decode every stream twice,
+  # costing more than the inference it saves.
+  #
+  # The saving is the GATE: no motion, no inference. Phase 0 measured 11 of 12
+  # sample windows with nobody in them. Cropping to regions is NOT a second
+  # saving — the detector resizes any input to its own resolution, so three
+  # crops cost three inferences. Cropping buys ACCURACY on distant figures, so
+  # it is used only while regions stay few and small.
+  #
+  # THESE TWO NUMBERS WERE FITTED, AND TO A SAMPLE OF EIGHT PEOPLE. Measured
+  # 2026-08-31 on one 10-minute clip: ungated indexing found 8 people; the gate
+  # at threshold 25 / min_area 0.0008 found 7 — it lost someone. 18 / 0.0002
+  # recovers all 8 while still skipping 89% of frames (3.9x faster).
+  #
+  # Going FURTHER did not help and actively hurt: 15 / 0.0001 returned 6. The
+  # gate changes which frames reach the deduplicator, and more crops spread
+  # across the window make it merge two people into one. Sensitivity and
+  # recall are not monotonic here, so do not "tune up to be safe".
+  #
+  # Re-validate at a real site before trusting these. Escape hatch:
+  # SEARCH_MOTION_GATE=false runs every sampled frame through the detector.
+  enabled: true
+  threshold: 18                # per-pixel intensity delta
+  # Contour AREA, not a whole-frame changed-pixel ratio: someone at the end of a
+  # corridor moves a few pixels and would never cross a global threshold.
+  min_area_fraction: 0.0002
+  dilate_iterations: 2
+  max_regions: 3               # beyond this, one full-frame pass is cheaper
+  region_padding: 0.15
+  full_frame_fraction: 0.35    # regions covering more of the frame -> whole frame
+  scene_change_fraction: 0.55  # lights / IR cut / camera moved -> whole frame
+
+plates:
+  # Number-plate reading. TWO STAGES, and the localiser is required.
+  #
+  # Measured 2026-08-31 against cct-xs-v2-global-model: a synthetic plate crop
+  # read at mean char probability 0.929, while random noise, flat grey and a
+  # person crop ALL returned an empty string at 0.99-1.00. Confidence does not
+  # separate plates from non-plates — it is high precisely when the model is
+  # sure there are no characters. The real rejection is min_length; confidence
+  # only grades how well an actual plate was read.
+  #
+  # The localiser therefore has an open BASELINE (localiser_model below) that
+  # auto-downloads, and a site-tuned OVERRIDE (localiser_weights) that wins
+  # whenever set — open baseline proves the feature, tuned weights make it
+  # accurate on one site's plates. Only with BOTH empty is plate reading
+  # INACTIVE, and /health says so rather than running recognition over whole
+  # cars and storing nothing.
+  enabled: true
+  # fast-plate-ocr, MIT, ONNX, ~3 MB. Downloads to the models volume on first
+  # use — weights are never committed.
+  model: "cct-xs-v2-global-model"
+  # Site-tuned plate-DETECTION weights, loaded through ultralytics (AGPL, fine
+  # in tier 1). Class-agnostic, so a single-class ANPR model works as-is.
+  # Override with SEARCH_PLATE_WEIGHTS. Wins over localiser_model when set.
+  localiser_weights: ""
+  # The open-baseline plate detector: open-image-models (MIT, ONNX, same
+  # author as the recogniser), auto-downloaded on first use. Override with
+  # SEARCH_PLATE_MODEL; set explicitly empty to disable plate reading.
+  localiser_model: "yolo-v9-t-384-license-plate-end2end"
+  localiser_confidence: 0.3
+  min_confidence: 0.6
+  min_length: 4
+  # Margin added around the localiser's box before recognition — the recogniser
+  # needs whitespace around the characters. Measured: the same plates read as
+  # "L8CAF503" from tight crops and "DL8CAF5030" with margin. NOT a cure: it can
+  # only include pixels that exist, so a crop already flush to the plate edge
+  # stays truncated. The localiser must box generously.
+  region_padding: 0.12
+  # STACKED (two-line) plates. The recogniser resizes every region to a fixed
+  # 128x64 — a single-line shape — so a two-row plate gets read straight across
+  # and loses a character, CONFIDENTLY: measured on JH10AF7931, the stacked
+  # plate read "JH10AF793" at 0.98-0.99 while the single-line plate on the same
+  # bumper read correctly at 0.92 and lost, because read() ranks by confidence
+  # and confidence is not comparable across region shapes.
+  #
+  # Below this width/height a region is read row by row instead. Measured over
+  # 109 real regions here: 93 fell under 2.2 and 69 clustered at ~1.5, so on a
+  # site of stacked truck plates this is the common path, not an edge case.
+  # 0 disables it.
+  two_line_max_aspect: 2.2
+  # A row must clear this to REPLACE the whole-region read. Far above
+  # min_confidence on purpose: overturning an answer the model already accepted
+  # needs more evidence than accepting one. Good rows measured 0.96-1.00; the
+  # one row that invented a character scored 0.679.
+  two_line_min_row_confidence: 0.80
+
+lifecycle:
+  # WHEN THE HEAVY MODELS ARE HELD. The detector, encoder and plate reader load
+  # when the FIRST camera is registered and are released once the LAST one has
+  # been gone this long. A deployment with Smart Search switched off on every
+  # camera should not be paying for it — measured on the reference appliance,
+  # holding them costs 2.9 GB resident whether or not anything is indexed.
+  #
+  # THIS IS A DEBOUNCE, NOT A TUNING KNOB. A camera URL change is a remove
+  # followed by an add, and camera-mgmt reconciles from four uvicorn workers at
+  # once, so the registered count touches zero during ordinary registry traffic
+  # with nobody having turned anything off. Below ~60 s this starts unloading
+  # and reloading on that traffic alone; warm reload is ~1.7 s, so there is no
+  # reward for cutting it fine.
+  #
+  # 0 disables hibernation entirely — load once, hold forever, the behaviour
+  # before this existed. That is the right setting for a permanently busy site.
+  # Override with SEARCH_IDLE_TIMEOUT.
+  idle_timeout_seconds: 300
+  poll_seconds: 10
+
+models:
+  # Swapping to an Apache-2.0 detector is one class in index/detector.py plus
+  # this string. Nothing else imports ultralytics — see the AGPL note there.
+  detector: "ultralytics"
+  # Absolute, and under the models volume ON PURPOSE. Ultralytics resolves a
+  # BARE asset name relative to the cwd, so "yolov8n.pt" landed in /app —
+  # outside the volume, re-downloaded on every container recreate. Given a
+  # full path it downloads the same release asset to exactly that path, so
+  # the weights survive with the CLIP and plate models.
+  detector_weights: "/models/weights/yolov8n.pt"
+  # The SAME encoder must serve ingest and query, or the vectors are not
+  # comparable. Changing it is a full re-index, not a migration.
+  clip_model: "ViT-B-32"
+  clip_pretrained: "laion2b_s34b_b79k"
+  device: null            # null = CUDA if present, else CPU
+  embed_batch_size: 32
+  # Which detector implementation to load: auto | openvino | torch.
+  #
+  # AUTO MEANS OPENVINO ON CPU, and that is measured rather than assumed. Live
+  # 1920x1080 camera frames, 15 timed rounds after a discarded warm-up:
+  #
+  #     torch      p50 40.8ms   p95  62.0ms   23.9 fps
+  #     openvino   p50 17.6ms   p95  21.8ms   55.4 fps   <-- 2.3x, and steadier
+  #     onnx       p50 89.4ms   p95 215.9ms   10.0 fps   <-- 2.2x SLOWER
+  #
+  # ONNX Runtime is not offered as a choice. It matched torch on a developer
+  # laptop and was twice as slow in the container — the reason "ONNX is fast on
+  # CPU" is not a safe assumption to build a default on.
+  #
+  # AUTO PICKS TORCH ON CUDA: the OpenVINO build here reports a CPU device only.
+  #
+  # KEEP THE PRIZE IN PROPORTION. At 16 cameras the detector was 0.20 of 4.70
+  # cores — about 4% of this container's CPU, the rest being RTSP decode and the
+  # motion gate. This switch is worth taking because it is free once built, but
+  # it is not what decides how many cameras fit. See scripts/capacity.py.
+  detector_backend: auto
+  # How many times the preferred backend may fail to load before the service
+  # stops trying and stays on torch for the life of the process. A failure
+  # never costs ingest: it falls through to torch inside the same warm-up.
+  backend_attempts: 3
+  # Where the exported OpenVINO IR is cached — the models volume, beside the
+  # weights ultralytics downloads. Built at runtime, never committed.
+  models_dir: /models
+  # Letterbox to a SQUARE input rather than ultralytics' default rectangular
+  # padding, so that swapping a backend does not change what gets detected.
+  #
+  # MEASURED 2026-09-04. An exported artifact (ONNX, OpenVINO) has a fixed
+  # 640x640 input and pads square; the torch path pads only to a stride
+  # multiple, so an 1080x810 frame becomes 640x480. On ultralytics' bus.jpg at
+  # conf 0.35 the torch default found 4 detections where every exported backend
+  # found 5 — the extra one a partially-visible person at the frame edge, at
+  # 0.436. On a wide 405x1080 frame, 2 against 3.
+  #
+  # true reproduces the exported behaviour on torch EXACTLY, making backend
+  # choice a pure performance decision. Neither imgsz=640 nor imgsz=(640,640)
+  # achieves this; exported models ignore the setting because their input shape
+  # already forces it.
+  #
+  # THE COST IS REAL: ~33% more pixels for a 4:3 frame, and the extra marginal
+  # detections become extra crops, embeddings and stored rows. Sites running
+  # ANPR should re-validate plate reading after changing this — the two-line
+  # thresholds were fitted under rectangular preprocessing.
+  square_letterbox: true
+
+store:
+  # Overridden by SEARCHDB_URL / SEARCH_CROP_DIR / SEARCH_RETENTION_DAYS.
+  crop_dir: "/data/search/crops"
+  # fsync every crop before a row may reference it (SEARCH_CROP_FSYNC=0 turns it
+  # off). Measured 5.6 ms per crop against 0.5 ms without, on NVMe. It buys the
+  # thing the database already has and the crop store did not: after a power
+  # cut, a row and its JPEG agree. 80 zero-byte crops on this appliance were
+  # what the default is answering — see index/writer.py.
+  crop_fsync: true
+  retention_days: 30
+  # Whole frames for the Recent-detections feed are kept this long — less than
+  # rows, because the feed only shows recent detections and a frame is tens of
+  # KB against a crop's ~5. A row that outlives its frame falls back to the crop
+  # in the UI. 0 keeps frames as long as their rows.
+  # Override with SEARCH_FRAME_RETENTION_DAYS.
+  frame_retention_days: 7
+  # How often the in-service sweep deletes expired rows and their crop files.
+  # 0 disables it — reads stay filtered to unexpired rows regardless, so the
+  # cost of disabling is disk, not wrong answers.
+  retention_sweep_seconds: 3600
+  # Sweep unreferenced crop files every Nth pass (24 = daily at the default
+  # interval). Walks the whole crop tree, so it is not worth doing hourly.
+  retention_orphan_every_n: 24
+
+api:
+  host: "127.0.0.1"     # loopback: reached only via the api proxy
+  port: 8013
+
+logging:
+  level: "INFO"

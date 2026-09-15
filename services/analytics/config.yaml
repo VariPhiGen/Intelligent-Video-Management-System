@@ -1,0 +1,184 @@
+# Analytics service — detection, plates, tracking and the indexing policy.
+#
+# THE VALUES ARE THE ONES THE PIPELINE THIS REPLACES WAS MEASURED AT, so
+# splitting the service changes where the work happens and not what it decides.
+# Every one of them is also an environment switch (see analytics/config.py), so
+# a running appliance can be retuned without a rebuild.
+
+api:
+  host: "127.0.0.1"      # loopback: reached only via the api proxy
+  port: 8015
+
+source:
+  # broker | sampler. Broker is the default HERE, unlike the older services:
+  # they had a decoder before the broker existed and keep it as a fallback,
+  # this one is new so the single-decode path is simply how it works.
+  frame_source: broker
+  broker_url: "redis://127.0.0.1:6379/0"    # overridden by REDIS_URL
+  broker_channel_prefix: "vms.frames"
+  max_sample_fps: 2.0                        # sampler mode only
+
+detect:
+  confidence: 0.35
+  min_crop_width: 16       # too small to embed is too small to track
+  min_crop_height: 32
+  queue_size: 64           # frames, not detections; full evicts the OLDEST
+  enabled: true
+  # SPLIT-BOX SUPPRESSION. Drop a box lying this far inside another box of the
+  # SAME domain — intersection over the SMALLER area, not IoU.
+  #
+  # Ultralytics' own NMS cannot catch these, because a nested box has a LOW
+  # IoU: measured on rows 41577/41578 (cam1-h5e0, 2026-09-09 19:48:40.075, a
+  # full body and the torso cut out of it) IoU was 0.48, under the 0.7 NMS
+  # default, while containment was ~1.0.
+  #
+  # NOTHING DOWNSTREAM CAN UNDO IT, which is why it belongs here. The tracker
+  # treats two boxes in one frame as two objects by invariant, so a split box
+  # is guaranteed to become two identities; and CLIP dedup compares appearance,
+  # which a torso and a whole body do not share — that pair measured cosine
+  # 0.7698 against a 0.85 threshold.
+  #
+  # 0.9 FROM THE DISTRIBUTION, not from taste. Over 20,714 stored person rows,
+  # same-frame pairs bucketed by containment and checked for edge alignment:
+  #
+  #     containment   pairs   share an edge to within 1% of frame
+  #       0.0-0.5      6635         31  (0.5%)
+  #       0.5-0.8       335         53  (16%)
+  #       0.8-0.9        92         57  (62%)
+  #       0.9-1.0       420        390  (93%)
+  #       1.0           444        414  (93%)
+  #
+  # Two people who overlap do not align an edge; a box cut out of another box
+  # does. 0.9 sits in the gap between the two populations. Set 0 to disable
+  # (ANALYTICS_NESTED_CONTAINMENT=0) and compare.
+  nested_containment: 0.9
+
+motion:
+  # The gate, used only in sampler mode. In broker mode the canonical analysis
+  # arrives with the frame and these are never consulted.
+  enabled: true
+  threshold: 18
+  min_area_fraction: 0.0002
+  dilate_iterations: 2
+  max_regions: 3
+  region_padding: 0.15
+  full_frame_fraction: 0.35
+  scene_change_fraction: 0.55
+  despeckle_iterations: 1
+
+tracking:
+  enabled: true
+  max_association_cost: 1.75   # real continuations measured at p99 = 1.63
+  velocity_alpha: 0.5
+  confirm_after_seconds: 1.0
+  max_age_seconds: 3.0
+  stationary_after_seconds: 4.0
+  stationary_distance: 0.15
+  max_tracks_per_key: 64
+  index_tentative: true
+
+index_policy:
+  suppression_enabled: true
+  displacement_heights: 1.5    # re-record once it has moved this far
+  scale_change_ratio: 1.5      # approaching or receding
+  scale_change_persist: 2      # a one-frame spike is a bad box
+  quality_confidence_gain: 0.15
+  # ONE LOOK PER TRACK PER INTERVAL — the operator's rule, adopted 2026-09-12.
+  #
+  # At 5 FPS each change-driven rule above fires on its own evidence, and one
+  # person reached Smart Search five times in ten seconds (tracker 3721, cam3,
+  # 2026-09-11 11:34:17-27): five CLIP passes and five cards in the feed for
+  # one walk past a camera. The floor caps that at one record per track per
+  # interval, whatever changed; the heartbeat re-records an object that stays,
+  # once per interval, so a long stay still shows up.
+  #
+  # First sight is never delayed, and most tracks live under 10 s (median about
+  # 2 s), so for most objects this is exactly one record. CLIP dedup still runs
+  # after it: a heartbeat of a motionless object usually looks identical and is
+  # dropped there — the saving working, not a fault.
+  #
+  # 0 on both restores the previous behaviour. Env:
+  # ANALYTICS_INDEX_MIN_INTERVAL_SECONDS / ANALYTICS_INDEX_HEARTBEAT_SECONDS.
+  min_interval_seconds: 10
+  heartbeat_seconds: 10
+
+plates:
+  enabled: true
+  model: "cct-xs-v2-global-model"
+  localiser_weights: ""        # site-tuned .pt; empty = the open baseline
+  localiser_model: "yolo-v9-t-384-license-plate-end2end"
+  localiser_confidence: 0.3
+  min_confidence: 0.6
+  min_length: 4
+  region_padding: 0.12
+  two_line_max_aspect: 2.2
+  two_line_min_row_confidence: 0.80
+  localiser_square_letterbox: false
+
+models:
+  detector: "ultralytics"
+  detector_weights: "/models/weights/yolov8n.pt"
+  device: null                 # null = CUDA if present, else CPU
+  detector_backend: auto       # auto | openvino | torch
+  backend_attempts: 3
+  models_dir: /models
+  square_letterbox: true
+
+lifecycle:
+  # The models are ingest-only: they load on the first camera and go when the
+  # last one does. Switching Person/Vehicles/ANPR off on every camera is
+  # therefore a real saving, not just a pause.
+  #
+  # THE TIMER IS A DEBOUNCE, NOT A TUNING KNOB. camera-mgmt reconciles from
+  # every uvicorn worker and a domain change is a remove followed by an add, so
+  # the registered count touches zero on ordinary traffic. Below ~60s this
+  # starts unloading and reloading for no reason. 0 = load once, hold forever.
+  idle_timeout_seconds: 300.0      # env: ANALYTICS_IDLE_TIMEOUT_SECONDS
+  poll_seconds: 10.0               # only bounds how LATE a release can be
+  retry_seconds: 60.0              # backoff before a failed warm-up is retried
+
+sink:
+  # Where accepted observations go. EMPTY = produce nothing, which is what
+  # phase A runs as: detect, track and decide, report the counts, send nothing.
+  # That is what makes this safe to deploy beside the pipeline it replaces.
+  url: ""
+  timeout_seconds: 10.0
+
+snapshot:
+  # The whole frame each recorded observation came from, for the Recent-
+  # detections feed on the Smart Search page: the scene, with the object's box
+  # drawn over it BY THE UI — the stored file is exactly what the camera saw.
+  # Not for search: the crop is still what CLIP embeds.
+  #
+  # Downscaled because the feed never needs 1080p: measured on cam3, a busy
+  # 1920x1080 frame is ~130-170 KB at 1280 px wide. One file per frame however
+  # many objects it holds, kept SEARCH_FRAME_RETENTION_DAYS (7) by Smart Search.
+  # 0 = send no frame; the feed then shows the crop.
+  # Env: ANALYTICS_FRAME_WIDTH / ANALYTICS_FRAME_QUALITY.
+  frame_width: 1280
+  frame_quality: 75
+
+activities:
+  # THE CPU ACTIVITY PATH. Every frame the broker samples (5 FPS) for a camera
+  # with a running activity goes through its OWN OpenVINO YOLO and its OWN
+  # tracker to the activity engine — NO motion gate, so a parked vehicle or a
+  # group standing still keeps being seen. Smart Search's motion-gated path is
+  # separate and unchanged. Env: ANALYTICS_ACTIVITIES_ENABLED.
+  enabled: true
+  queue_size: 16             # frames; full evicts the OLDEST
+
+events:
+  # CPU ACTIVITY EVENTS -> the VMS. The activity engine runs on this service's
+  # detections and tracks (analytics/activities/); every event it raises is
+  # POSTed to camera-mgmt's /api/analytics/events, which stores it in
+  # analytics_events for the Events page. `url` is the API root. EMPTY = run
+  # the activities, count their events on /health, deliver nothing.
+  # Env: ANALYTICS_EVENTS_URL / ANALYTICS_INTERNAL_API_KEY (or INTERNAL_API_KEY).
+  url: ""
+  internal_api_key: ""
+  timeout_seconds: 10.0
+  queue_size: 1024
+  batch_size: 50
+
+logging:
+  level: "INFO"

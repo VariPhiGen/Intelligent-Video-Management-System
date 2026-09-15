@@ -1,0 +1,82 @@
+# GPU overlay (CDI) — layered by ./vms when the host has a CDI spec for NVIDIA
+# devices (Docker ≥ 28.3 + nvidia-container-toolkit ≥ 1.17). Preferred over
+# docker-compose.gpu.yml wherever available, for one reason:
+#
+# The legacy `driver: nvidia` reservation grants device access through the
+# nvidia runtime hook, BEHIND systemd's back. On a cgroup-v2 host, the next
+# `systemctl daemon-reload` (unattended-upgrades runs one routinely) rewrites
+# the container's device-cgroup rules from what systemd knows — which doesn't
+# include the hook-injected /dev/nvidia* — and GPU access is silently revoked:
+# NVML returns "Unknown Error" and the health card reports the GPU down until
+# the container is recreated. With CDI the devices are declared in the OCI
+# spec itself, systemd tracks them, and a daemon-reload cannot drop them.
+#
+# `nvidia.com/gpu=all` resolves against the host-generated spec
+# (/var/run/cdi/nvidia.yaml, refreshed on boot/driver upgrade by the
+# toolkit's nvidia-cdi-refresh service), so any card model, count, or driver
+# version works without editing this file.
+#
+# Like the legacy overlay: metrics-only visibility. The API reads nvidia-smi;
+# inference lives in its own containers. (CDI injects the full driver library
+# set — there is no `utility`-only subset — but this process never opens a
+# CUDA context, so nothing is pinned.)
+#
+#   ./vms up -d              # auto-detected
+#   VMS_GPU=legacy ./vms up -d  # force the old nvidia-runtime overlay
+#   VMS_GPU=off ./vms up -d     # force off (troubleshooting)
+
+services:
+  api:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              # capabilities is dead weight on the CDI path (the spec decides
+              # what's injected) but the compose schema requires the key.
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
+
+  # NVR: GPU transcode (h264_nvenc) for HEVC clip extraction. CDI injects the
+  # full driver set incl. libnvidia-encode; the NVR's startup probe (a real
+  # test encode) decides whether to use it, so a broken/absent GPU still boots
+  # cleanly on the libx264 CPU path.
+  nvr:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
+
+  # Analytics: THE detector. `9f5a5ec` moved object detection, plate reading and
+  # tracking out of Smart Search into this service — and the GPU reservation did
+  # not move with it, so on a GPU appliance the detector ran on CPU while
+  # smartsearch (which now only embeds crops) kept the card. Built with
+  # TORCH_VARIANT=cu121 like smartsearch; without this block torch reports
+  # cuda_available=False no matter how the image was built.
+  analytics:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
+
+  # Smart Search: opens a CUDA context and keeps it, for the CLIP encoder.
+  # Requires the image built with TORCH_VARIANT=cu121; a CPU build ignores the
+  # device and logs that it is running on CPU.
+  smartsearch:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all

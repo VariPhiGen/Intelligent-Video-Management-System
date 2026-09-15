@@ -1,0 +1,21 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+# Multipart form parsing for POST /observations, the endpoint the
+# analytics service hands crops to. FastAPI raises at request time
+# without it, so a missing pin here looks like a working build and a
+# broken ingest.
+python-multipart>=0.0.9,<0.1
+pyyaml>=6.0,<7
+psycopg[binary,pool]>=3.1,<4
+opencv-python-headless>=4.9,<4.12
+numpy>=1.26,<3
+pillow>=10,<12
+open_clip_torch>=2.24,<4
+
+# NOT HERE ANY MORE, AND THAT IS THE POINT OF THE SPLIT. Detection, plate
+# reading and the OpenVINO toolchain moved to services/analytics with the code
+# that used them:
+#     ultralytics  openvino  onnx  onnxslim
+#     fast-plate-ocr  open-image-models
+# This service embeds crops and searches embeddings; it loads one model, and
+# torch is here for that encoder alone.

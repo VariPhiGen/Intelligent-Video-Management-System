@@ -1,0 +1,202 @@
+Variphi VMS
+Copyright (c) 2026 Variphi
+
+This product is free software licensed under the GNU Affero General Public
+License, version 3. The full text is in the LICENSE file at the root of this
+distribution.
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. THIRD-PARTY COMPONENTS
+────────────────────────────────────────────────────────────────────────────────
+
+The container images published for this product bundle software written by other
+people. THIRD-PARTY-NOTICES.md lists every component, its version, its licence
+and which image carries it — 470 components at the time of writing.
+
+That file is GENERATED, by scripts/gen-notice.sh, directly from the built images
+rather than from our dependency manifests. The manifests record what we asked
+for; the image records what you actually receive. Anything that cannot be
+resolved from a package's own declared metadata is listed as UNDETERMINED rather
+than assumed, because an attribution file that invents a licence is worse than
+one that admits a gap.
+
+We do not modify any of these components. They are installed from their
+distributors (Debian, PyPI, npm) and invoked as separate programs or linked
+libraries.
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. SOURCE CODE FOR GPL-LICENSED COMPONENTS
+────────────────────────────────────────────────────────────────────────────────
+
+Some bundled components are licensed under the GNU General Public License. The
+most significant is FFmpeg: the Debian packages we install are built with
+--enable-gpl, which makes those binaries GPL-2+ (and GPL-3+ for the libavcodec
+and libavfilter flavour). Debian's own copyright file records that these builds
+do NOT include --enable-nonfree and are therefore redistributable;
+scripts/gen-notice.sh asserts that on every run and refuses to generate notices
+for an image where it is not true.
+
+FFmpeg is executed as a separate process. That is aggregation, not linking, and
+it does not place this product's own source code under the GPL. It does oblige
+us to make the corresponding source available.
+
+HOW WE SATISFY THAT — equivalent access, not a written offer:
+
+    The corresponding source for every GPL- and LGPL-licensed component in a
+    release is published alongside that release, in the same place, obtainable
+    by anyone who can obtain the image, at no further charge.
+
+This is GPLv3 section 6(d) ("offer equivalent access to the Corresponding Source
+in the same way through the same place") and GPLv2 section 3(a) (accompany the
+object code with the source). It fits how these images are actually distributed:
+pulled from a registry, not handed over on physical media.
+
+Why this rather than the three-year written offer of sections 3(b) and 6(b): the
+written offer exists for distribution where shipping source alongside the binary
+is impractical. It is not, here. Choosing it would mean publishing the source
+archive anyway AND separately committing to answer individual source requests
+for three years after every release — an ongoing operational obligation on top
+of work already being done. Equivalent access discharges the same duty with no
+tail.
+
+WHAT THIS REQUIRES OF US, EVERY RELEASE:
+
+  * Base images pinned by digest, so the exact source that went into a build can
+    be identified later. Every FROM in this repository carries an `@sha256:`
+    manifest digest alongside its tag; a moving tag would mean the same
+    Dockerfile produced different package contents on different days, and the
+    source we published could not be matched back to the image we shipped.
+  * The matching Debian source packages archived and published with the release
+    artifact, from the same place, at no charge.
+
+A release published without that archive does not satisfy section 6(d) — and
+unlike a written offer, there is no grace period in which to fix it. The source
+must be there when the image is.
+
+Questions about source availability: information@variphi.com
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. APACHE LICENSE 2.0 COMPONENTS
+────────────────────────────────────────────────────────────────────────────────
+
+Components under the Apache License 2.0 — Keycloak among them — are redistributed
+under its terms. Section 4 of that licence requires that attribution notices from
+those works be carried forward; they are reproduced in THIRD-PARTY-NOTICES.md.
+A copy of the Apache License 2.0 is included with each such component in the
+image, under /usr/share/doc/<package>/ or the distribution's equivalent.
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. FILES VENDORED INTO THIS REPOSITORY
+────────────────────────────────────────────────────────────────────────────────
+
+Sections 1-3 concern the container images. This section concerns the SOURCE
+repository, which itself redistributes a small number of third-party files
+committed directly to it. That obligation applies as soon as the repository is
+published, before any image exists.
+
+They are declared in vendored-licenses.tsv and rendered into
+THIRD-PARTY-NOTICES.md under "Vendored in the repository". No package manager
+reports them, so scripts/gen-notice.sh instead ENFORCES that every git-tracked
+file under a vendor/ directory (or the ONVIF bundle) appears in that manifest,
+and fails if one does not. The failure mode this prevents is a minified library
+being dropped into vendor/ and nobody noticing that we now redistribute it.
+
+Currently: the IBM Plex Sans (variable) and IBM Plex Mono fonts (SIL Open Font
+License 1.1), and the twelve XML schema files under backend/onvif_wsdl/. They
+replaced the Inter and JetBrains Mono fonts in the web console on 2026-09-15;
+the Keycloak sign-in theme still carries its own copy of Inter.
+
+Two vendored Apache-2.0 libraries, hls.js and keycloak-js, were removed on
+2026-08-27 together with the legacy single-file SPA that used them. Their
+licence headers had been stripped by minification and were restored by hand
+before the deletion; the deletion then made the point moot. Removing a second,
+unmaintained UI shrank the attribution surface as a side effect — worth noting
+because it is the cheapest way to reduce a licence inventory: ship less.
+
+That schema bundle is NOT one work, and describing it as "the ONVIF bundle" was
+wrong. It carries files from three rights holders:
+
+    ONVIF   onvif.xsd, common.xsd, media2.wsdl
+            Redistribution is permitted expressly on the condition that the
+            copyright notice, licence and disclaimer are retained. Verified
+            present in all three.
+    OASIS   the three docs.oasis-open.org_* schemas, (C) OASIS Open 2004-2006
+    W3C     the six www.w3.org_* schemas, under the W3C Software License
+
+Modification scope, as of 2026-08-28: NONE. All twelve files are byte-identical
+to their upstream URLs, re-fetched and diffed that day.
+
+They were not always, and the change is worth recording. Until 2026-08-28 the
+bundle carried rewritten schemaLocation attributes — absolute URLs replaced by
+local filenames — so that the SOAP client could resolve it without network
+access, which is the entire reason these files are vendored. That worked, but it
+meant this repository redistributed MODIFIED copies of specification documents
+belonging to three rights holders, under licences that grant redistribution on
+condition of retained notices and were written for specification texts rather
+than for software. Modifying them bought a convenience that could be had
+elsewhere.
+
+It is now had elsewhere. backend/services/onvif_wsdl_transport.py maps the
+upstream URLs onto these files inside zeep's Transport.load(), which is the only
+layer where it can be done at all: zeep fetches import bytes itself rather than
+handing URLs to lxml, so neither an XML Catalog nor an lxml resolver ever sees
+them. The schemas ship exactly as published; only the loader is ours.
+
+Two things were found while doing it, both recorded rather than quietly fixed:
+
+  * The 2026-08-27 note this replaces said three files were identical and nine
+    differed. The re-fetch found five and seven. The counts had been carried
+    forward on trust.
+  * Upstream media.wsdl imports onvif.xsd by a RELATIVE path correct only for
+    onvif.org's own directory layout, so a locally loaded copy resolves it to
+    /ver10/schema/onvif.xsd and fails. Verified: with the transport the bundle
+    loads in 0.03s with all outbound HTTP blackholed, exposing all 59 Media2
+    operations; without it, the load fails on exactly that path.
+
+Three of the W3C schemas carry no copyright notice. That is upstream's own
+state, confirmed by the same diff — nothing was stripped here.
+
+One thing about them is worth stating plainly rather than leaving implicit:
+
+  * RESOLVED 2026-08-28: the SIL Open Font License requires its text to
+    accompany the font files. Each font's own upstream licence file was fetched
+    verbatim and placed beside it:
+
+        plex-sans-var.woff2, plex-mono-{400,500,600}.woff2 → plex-OFL.txt (IBM/plex)
+
+    The project's OWN file was shipped rather than a hand-assembled copy of OFL
+    1.1. One file serves all four fonts because it is one text: the LICENSE.txt
+    in the @ibm/plex-sans-variable 0.2.0 and @ibm/plex-mono 2.5.0 packages was
+    compared byte for byte and is identical. (That is not a given — when this
+    repository shipped Inter and JetBrains Mono, their two OFL copies differed in
+    wording and whitespace, which is why each is fetched rather than assumed.)
+    Same reason the AGPL text in LICENSE was fetched rather than retyped.
+
+    IBM Plex DOES declare a Reserved Font Name: "Plex". Under OFL clause 3 a
+    Modified Version may not use that name. The woff2 files are shipped exactly
+    as published in those packages — not subset, renamed or re-encoded — so they
+    are not Modified Versions and keep their name. Anyone who subsets or edits
+    them must rename the result.
+
+    scripts/gen-notice.sh excludes licence texts from its completeness sweep: a
+    licence file beside an artifact is that artifact's required NOTICE, not a
+    separately redistributed component, and declaring it would invent an
+    inventory row for something with no licence of its own. Verified the sweep
+    still catches a library dropped into vendor/.
+
+Several entries carry UNKNOWN in their version column. That is deliberate: the
+artifact records no version and it must be confirmed against upstream rather
+than guessed.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. TRADEMARKS
+────────────────────────────────────────────────────────────────────────────────
+
+The AGPL grants rights in the software. It does not grant permission to use the
+name or logo of Variphi, nor those of any third party named in
+THIRD-PARTY-NOTICES.md, to endorse or promote derived works.

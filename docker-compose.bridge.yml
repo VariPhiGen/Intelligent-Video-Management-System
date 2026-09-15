@@ -1,0 +1,202 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bridge-networking overlay — macOS / Windows (Docker Desktop).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d
+#
+# On Docker Desktop, network_mode: host binds inside the hidden Linux VM and is
+# unreachable from the host browser. This overlay moves every host-network
+# service onto the vms_internal bridge, switches interconnects from 127.0.0.1
+# to service-name DNS, and publishes the browser/consumer-facing ports.
+#
+# Linux keeps using the base file ALONE (host networking) — required there for
+# ONVIF WS-Discovery multicast and zero-NAT RTSP.
+#
+# Known limits vs Linux:
+#   • WS-Discovery multicast can't cross the VM NAT — camera discovery falls
+#     back to the TCP sweep + manual add (both fully functional).
+#   • The TLS front door (caddy, --profile tls) is host-network and not
+#     remapped here; TLS deployments are Linux-first.
+#
+# Requires docker compose >= 2.24 (`!reset` support).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  mediamtx:
+    network_mode: !reset null
+    networks: [vms_internal]
+    ports:
+      - "${RTSP_PORT:-8654}:8654"   # RTSP fan-out (VLC/consumers on the host/LAN)
+      - "8988:8988"                 # HLS live view (browser)
+      # The MediaMTX control API (9987) stays unpublished — the api reaches it
+      # by service name; nothing on the host needs it.
+    environment:
+      # On Docker Desktop each container has its own netns, so the base file's
+      # 127.0.0.1 binds are unreachable from the api/nvr/motion containers. Move
+      # the RTSP/RTSPS/API/metrics listeners onto all interfaces so they can be
+      # reached by the mediamtx service name over the vms_internal bridge. HLS
+      # (:8988) is already all-interfaces in the base file. The matching
+      # full-access auth grant for the bridge subnet lives in deploy/mediamtx.yml
+      # (172.16.0.0/12). Linux uses the base file alone and keeps loopback binds.
+      MTX_RTSPADDRESS:    "0.0.0.0:8654"
+      MTX_RTSPSADDRESS:   "0.0.0.0:8322"
+      MTX_APIADDRESS:     "0.0.0.0:9987"
+      MTX_METRICSADDRESS: "0.0.0.0:9988"
+
+  keycloak_db_init:
+    network_mode: !reset null
+    networks: [vms_internal]
+    command:
+      - "sh"
+      - "-c"
+      - >
+        psql -h postgres -p 5432 -U ${POSTGRES_USER:-rtsp}
+        -d ${POSTGRES_DB:-rtsp_relay}
+        -tc "SELECT 1 FROM pg_database WHERE datname='keycloak'" | grep -q 1 ||
+        createdb -h postgres -p 5432 -U ${POSTGRES_USER:-rtsp} keycloak
+
+  keycloak:
+    network_mode: !reset null
+    networks: [vms_internal]
+    ports:
+      - "${KEYCLOAK_PORT:-8085}:${KEYCLOAK_PORT:-8085}"
+    environment:
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+
+  keycloak_client_sync:
+    network_mode: !reset null
+    networks: [vms_internal]
+    environment:
+      KC_URL: http://keycloak:${KEYCLOAK_PORT:-8085}
+
+  api:
+    network_mode: !reset null
+    networks: [vms_internal]
+    ports:
+      # Both sides follow API_PORT: the base command binds ${API_PORT} inside
+      # the container, so the published host port must map to the same port.
+      - "${API_PORT:-8091}:${API_PORT:-8091}"
+    environment:
+      DATABASE_URL:        postgresql+asyncpg://${POSTGRES_USER:-rtsp}:${POSTGRES_PASSWORD:-rtsp_secret}@postgres:5432/${POSTGRES_DB:-rtsp_relay}
+      REDIS_URL:           redis://redis:6379/0
+      MEDIAMTX_API_URL:    http://mediamtx:9987
+      # The /hls/* reverse proxy (routers/hls.py) defaults to loopback, which on
+      # the bridge is the api container itself — every HTTPS/tunnel preview
+      # would 404. Plain-HTTP browsers bypass it via the published :8988 port.
+      MEDIAMTX_HLS_URL:    http://mediamtx:8988
+      NVR_API_URL:         http://nvr:8009
+      NVR_RECORD_HOST:     mediamtx
+      MOTION_API_URL:      http://motion:8012
+      # Service-name DNS instead of the base file's 127.0.0.1:8014/8015, which
+      # on the bridge is this container's own loopback — so the registry sync
+      # to the frame broker and to analytics would never connect.
+      FRAMES_API_URL:      http://frames:8014
+      ANALYTICS_API_URL:   http://analytics:8015
+      # Smart Search, same treatment as the NVR and motion above. A loopback
+      # URL can never be right here: on Docker Desktop 127.0.0.1 inside the api
+      # container is the api itself, so a .env carrying the Linux default
+      # (http://127.0.0.1:8013) produces exactly "Search index unavailable" in
+      # the SPA while every service is healthy.
+      #
+      # `${VAR-default}` (unset-only), NOT an unconditional override. That
+      # distinction is the whole point: a deployment that feeds no index sets
+      # these EXPLICITLY EMPTY, and an unconditional rewrite would silently
+      # turn indexing back on for them.
+      SMARTSEARCH_API_URL:   ${SMARTSEARCH_API_URL-http://smartsearch:8013}
+      SMARTSEARCH_INDEX_URL: ${SMARTSEARCH_INDEX_URL-http://smartsearch:8013}
+      KEYCLOAK_ADMIN_URL:  http://keycloak:${KEYCLOAK_PORT:-8085}
+      RELAY_INTERNAL_HOST: mediamtx
+      OIDC_JWKS_URL:       http://keycloak:${KEYCLOAK_PORT:-8085}/realms/vms/protocol/openid-connect/certs
+
+  nvr:
+    network_mode: !reset null
+    networks: [vms_internal]
+    # Bind 0.0.0.0 INSIDE the container so the api's authenticated /api/nvr
+    # proxy can reach it by service name. Deliberately NOT published to the
+    # host — the NVR has no auth of its own; on the bridge it is actually
+    # better isolated than under Linux host networking.
+    command: ["--config", "config/cameras.yaml", "--host", "0.0.0.0", "--port", "${NVR_PORT:-8009}"]
+
+  motion:
+    network_mode: !reset null
+    networks: [vms_internal]
+    # Same posture as the NVR: bind in-container for the /api/motion proxy,
+    # never published to the host (no auth of its own).
+    environment:
+      MOTION_BIND_HOST: 0.0.0.0
+      # Only consulted in broker mode (docker-compose.broker.yml), but set
+      # unconditionally: the base default is 127.0.0.1:6379, which on the
+      # bridge is this container's own loopback. Harmless in capture mode,
+      # where nothing reads it, and the alternative is a "Connection refused"
+      # loop that only appears once someone layers the overlay.
+      REDIS_URL: redis://redis:6379/0
+
+  # Analytics IS host-networked in the base file now (it has to reach the
+  # frame broker and Smart Search, both host-networked there), so it needs the
+  # same reset as the api and the NVR.
+  analytics:
+    network_mode: !reset null
+    networks: [vms_internal]
+    environment:
+      # Bind in-container so the api's proxy can reach it by service name.
+      # Same posture as the NVR, motion and Smart Search: NOT published.
+      ANALYTICS_BIND_HOST: 0.0.0.0
+      # Service-name DNS instead of the base file's 127.0.0.1:6380, which on
+      # the bridge is this container's own loopback.
+      REDIS_URL: redis://redis:6379/0
+      # Where observations go. The base file's 127.0.0.1:8013 is this
+      # container's own loopback on the bridge; smartsearch is moved onto
+      # vms_internal below, so the service name is what reaches it here.
+      ANALYTICS_SINK_URL: http://smartsearch:8013
+      # Activity events go to the api by service name, for the same reason.
+      ANALYTICS_EVENTS_URL: http://api:${API_PORT:-8091}
+
+  # ── Smart Search (--profile search) ─────────────────────────────────────────
+  # THE ONE HOST-NETWORK SERVICE THIS OVERLAY USED TO MISS. Without these lines
+  # The frame broker IS host-networked in the base file now — on the bridge it
+  # bound 127.0.0.1 inside its own namespace and published nothing, so neither
+  # the api nor analytics could reach it. Reset it back onto vms_internal here.
+  frames:
+    network_mode: !reset null
+    networks: [vms_internal]
+    environment:
+      # Bind in-container so the api's proxy can reach it by service name
+      # later. Same posture as the NVR and motion: NOT published to the host.
+      FRAMES_BIND_HOST: 0.0.0.0
+      # Service-name DNS instead of the base file's 127.0.0.1:6380, which on
+      # the bridge is this container's own loopback — the exact mistake that
+      # produced "Connection refused" on first boot here.
+      REDIS_URL: redis://redis:6379/0
+
+  # smartsearch keeps network_mode: host from the base file, which on Docker
+  # Desktop is a namespace of its own rather than the host — so it binds
+  # 127.0.0.1:8013 where nothing else can see it, cannot reach searchdb on the
+  # vms_internal bridge, and the SPA reports "Search index unavailable" while
+  # `docker ps` shows every container healthy.
+  #
+  # AND it needs Docker DNS, which a host-netns container in the Desktop VM
+  # does not have: camera-mgmt hands it relay URLs built from NVR_RECORD_HOST
+  # (services/smartsearch_sync.py), which on the bridge is the name `mediamtx`.
+  # Left on host networking it can neither be reached by the api nor resolve
+  # the stream it was told to index.
+  #
+  # The api's SMARTSEARCH_*_URL overrides live in its own environment block
+  # above; an explicit empty value in .env still disables indexing entirely.
+  #
+  # searchdb needs nothing here: it never had network_mode: host and is already
+  # on vms_internal, publishing 127.0.0.1:5434 for the migration runner.
+  smartsearch:
+    network_mode: !reset null
+    networks: [vms_internal]
+    environment:
+      # Bind in-container so the api's authenticated /api/search proxy can
+      # reach it by service name. Same posture as the NVR and motion: NOT
+      # published to the host, because it has no auth of its own.
+      SMARTSEARCH_BIND_HOST: 0.0.0.0
+      # Frame-broker notices, when SEARCH_FRAME_SOURCE=broker. Same reason as
+      # SEARCHDB_URL below: the base file's 127.0.0.1:6380 is this container's
+      # own loopback on the bridge, so the subscription would never connect.
+      REDIS_URL: redis://redis:6379/0
+      # Service-name DNS instead of the base file's 127.0.0.1:5434, which on
+      # the bridge is this container's own loopback.
+      SEARCHDB_URL: postgresql://${SEARCHDB_USER:-search}:${SEARCHDB_PASSWORD:-search_secret}@searchdb:5432/${SEARCHDB_NAME:-smartsearch}

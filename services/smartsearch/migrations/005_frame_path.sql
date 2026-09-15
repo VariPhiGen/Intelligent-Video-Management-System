@@ -1,0 +1,22 @@
+-- 005 — the whole frame each observation came from, for the detections feed.
+--
+-- The index stores a crop: what CLIP embeds and what a search result shows. The
+-- Recent-detections feed shows something else — the full scene with a box drawn
+-- around the object, so an operator sees where in the frame it was and what was
+-- around it. That frame is written once per decoded frame (several objects in one
+-- frame share one file) and referenced from every row it served.
+--
+-- The box is NOT drawn into the file. `bbox` is already stored normalised on the
+-- row, so the UI draws it over the image; the file stays exactly what the camera
+-- saw.
+--
+-- Nullable and deliberately NOT backfilled: rows written before this have no
+-- frame and never will — nothing kept one. The UI shows their crop instead, which
+-- is the honest fallback.
+--
+-- Frames are kept for less time than rows (store.frame_retention_days, 7 by
+-- default): the feed only shows recent detections, and a frame is tens of KB
+-- against a crop's ~5. A row that outlives its frame keeps the path; the frame
+-- endpoint answers 404 and the UI falls back to the crop.
+ALTER TABLE search_persons  ADD COLUMN IF NOT EXISTS frame_path text;
+ALTER TABLE search_vehicles ADD COLUMN IF NOT EXISTS frame_path text;

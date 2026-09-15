@@ -1,0 +1,81 @@
+# Broker mode overlay — SmartSearch consumes vms_frames instead of decoding.
+#
+#   ./vms --profile search --profile frames -f docker-compose.broker.yml up -d
+#
+# LAYERED SEPARATELY ON PURPOSE. Joining another container's IPC namespace is
+# not a setting that can be made conditional inside one compose file, and
+# putting it in the base would make smartsearch refuse to start whenever the
+# frames service is absent — which is every deployment that has not opted in.
+# An overlay keeps the default posture (own sampler, own gate) working with no
+# knowledge of this file at all.
+#
+# WHAT CHANGES WHEN THIS IS LAYERED:
+#   * smartsearch stops opening its own RTSP sessions and stops running its
+#     local MotionGate; both stay in the image as the fallback.
+#   * it reads frames from the broker's shared memory and uses the CANONICAL
+#     motion analysis that was computed on those exact pixels.
+#   * one decode per camera instead of two.
+#
+# Region parity between the canonical implementation and the gate it replaces
+# is exact — verified over 430 frames (200 synthetic covering every branch,
+# 230 live across three cameras) by services/frames/scripts/parity.py.
+
+services:
+
+  # WHAT TURNS THE SYNC ON. The broker's camera set is in-memory and nothing
+  # pushes to it by default, so without this URL it decodes nothing and both
+  # consumers wait on notices that never arrive. Setting it starts the
+  # registry->broker reconcile loop (services/camera-mgmt frames_client),
+  # alongside the existing NVR, motion and Smart Search ones.
+  #
+  # The desired set is the UNION of what motion and Smart Search want. That is
+  # not a coupling between them: each still filters notices to its own cameras.
+  # NOTE: FRAMES_API_URL / ANALYTICS_API_URL are NOT set here any more.
+  # They are topology-dependent, and this overlay is layered in BOTH network
+  # modes (see ./vms, which picks it from the `frames` profile). Service-name
+  # DNS only exists on the bridge — a host-netns container cannot resolve
+  # `frames`, verified: gethostbyname('frames') raises. Setting them here
+  # therefore broke Linux, silently, in exactly the way this overlay's own
+  # comment warns about: the registry->broker sync never connects, the broker
+  # decodes nothing, and every container reports healthy.
+  #
+  # So they live where the topology is decided instead:
+  #   host mode   docker-compose.yml       -> http://127.0.0.1:8014 / :8015
+  #   bridge mode docker-compose.bridge.yml -> http://frames:8014 / analytics:8015
+
+  # The Motion service needs NO shared memory and no IPC namespace: it only
+  # ever used one float per sample, never the pixels. Paying a full 1080p
+  # decode to produce that float is exactly the duplication this removes.
+  #
+  # Event semantics are untouched. Both paths call the same
+  # worker.apply_feature — same 3 s confirmation window, same 60% ratio, same
+  # TRIGGERED/MONITORING machine, same 30 s cooldown, same Events API.
+  # Verified: the scalar the broker publishes is bit-identical to what this
+  # service would have computed, on 16:9 and non-16:9 cameras alike
+  # (services/frames/scripts/scalar_parity.py).
+  motion:
+    environment:
+      MOTION_FRAME_SOURCE: broker
+    depends_on:
+      frames:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # SMART SEARCH IS NO LONGER A BROKER CONSUMER. It used to read frames here
+  # and run its own detector; both moved to services/analytics, which is the
+  # broker consumer now. This service receives finished observations over HTTP
+  # and never looks at a frame, so it needs no shared memory, no ring volume
+  # and no dependency on the broker at all.
+  #
+  # The shared-memory design notes that lived here are in the volumes block of
+  # docker-compose.yml, next to the frames_shm definition they describe.
+  smartsearch:
+    depends_on:
+      searchdb:
+        condition: service_healthy
+
+# Declared so this overlay can mount it; defined in docker-compose.yml.
+volumes:
+  frames_shm:
+    external: false

@@ -1,0 +1,31 @@
+-- 004 — give vehicles the tracker_id that persons already had.
+--
+-- search_persons has carried `tracker_id`, `frame_number` and `pad_index` since
+-- 001. They are DeepStream-era columns: index/queries.py already selects
+-- tracker_id and returns it on every person result, and nothing has ever
+-- written it. search_vehicles was created without them, so the two tables
+-- disagreed about whether an observation can name the object it belongs to.
+--
+-- index/tracking.py now produces that name, so the asymmetry stops being
+-- harmless. Only vehicles need the column; persons already have it and adding
+-- it twice would be a no-op anyway under IF NOT EXISTS.
+--
+-- WHY ONLY tracker_id, AND NOT frame_number / pad_index. Those two describe a
+-- DeepStream batch layout this pipeline does not have — there is no pad and no
+-- meaningful frame number when frames are pulled from a relay at 2 FPS. Adding
+-- columns nothing can populate would be inventing a contract, so they are left
+-- to persons alone, where they are equally unwritten but at least historical.
+--
+-- `text`, matching search_persons. The ids are scoped strings rather than
+-- integers — `camera:nonce.epoch:n`, see ObjectTracker._new_id — because a
+-- bare counter would silently mean two different objects either side of a
+-- restart, a reconnect or a wake from hibernation. A caller that wants "every
+-- observation of this object" needs an id that cannot be ambiguous, and an
+-- ambiguous id is worse than no id: it merges two identities into one answer.
+--
+-- Deliberately NOT backfilled and NOT indexed. Rows written before this
+-- migration belong to no track and NULL is the honest representation of that.
+-- No index because nothing queries by it yet — add one alongside the first
+-- query that needs it, when its selectivity is known, rather than paying for
+-- a guess on every insert from now until then.
+ALTER TABLE search_vehicles ADD COLUMN IF NOT EXISTS tracker_id text;

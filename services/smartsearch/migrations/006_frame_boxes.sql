@@ -1,0 +1,22 @@
+-- 006 — every object the frame held, for the detections feed.
+--
+-- 005 gave each row the whole frame it came from. That is one picture per
+-- frame, shared by every object found in it — but a row can only describe its
+-- own object, so a card drawn from one row boxed one person and left the other
+-- three in the same shot unmarked. An operator could not tell whether the rest
+-- had been seen at all.
+--
+-- This is the frame's complete detection result, written identically on every
+-- row that frame produced: a list of {bbox, label, domain, tracker_id,
+-- confidence, recorded}, with bbox normalised 0-1 exactly like the row's own.
+-- `recorded` marks the objects the frame was actually sent for, as against the
+-- ones merely in shot whose 10-second interval had not elapsed.
+--
+-- DRAWING ONLY. Nothing here is embedded, searched or deduplicated: crops still
+-- go to CLIP one object at a time, unchanged. It is duplicated across the rows
+-- of one frame on purpose — a few hundred bytes buys a feed that needs no join
+-- and a card that survives its siblings being deduplicated away.
+--
+-- Nullable and not backfilled: rows written before this show only their own box.
+ALTER TABLE search_persons  ADD COLUMN IF NOT EXISTS frame_boxes jsonb;
+ALTER TABLE search_vehicles ADD COLUMN IF NOT EXISTS frame_boxes jsonb;

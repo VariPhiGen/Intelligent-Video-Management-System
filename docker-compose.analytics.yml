@@ -1,0 +1,66 @@
+# Analytics mode — detection moves out of Smart Search.
+#
+#   ./vms --profile search --profile frames --profile analytics \
+#     -f docker-compose.broker.yml -f docker-compose.analytics.yml up -d
+#
+# LAYER THIS AFTER docker-compose.broker.yml. Analytics reads frames from the
+# broker, so broker mode is a prerequisite rather than an alternative.
+#
+# WHY THE TWO SETTINGS LIVE IN ONE FILE, and why that is the whole point of
+# this overlay existing at all: they are a PAIR, and applying either alone is
+# a fault.
+#
+#   ANALYTICS_SINK_URL alone      every object is recorded TWICE — once by
+#                                 Smart Search's own detector and once by
+#                                 analytics. Appearance dedup absorbs some of
+#                                 it and not all, because the two paths carry
+#                                 different tracker ids, so the index quietly
+#                                 fills with near-duplicates.
+#
+#   SEARCH_FRAME_SOURCE=none      nothing detects at all. Smart Search stops
+#   alone                         looking at frames and no one replaces it, so
+#                                 the index simply stops growing while every
+#                                 service reports healthy.
+#
+# Putting them in one file makes the pair atomic: layer it and both move, drop
+# it and both move back.
+#
+# NOT `SEARCH_INGEST_ENABLED=false`, which is the obvious switch and the wrong
+# one: it tears down the very pipeline POST /observations calls into, so every
+# observation analytics sends would be answered 503. `frame_source: none` stops
+# the DECODING and keeps the encoder, the deduplicator and the store.
+
+services:
+
+  # Detection, plates, tracking and the indexing policy. Now the only thing
+  # looking at frames for search purposes.
+  analytics:
+    # ANALYTICS_SINK_URL is NOT set here any more — same reason as
+    # docker-compose.broker.yml: `smartsearch` is a bridge-only name and this
+    # overlay is layered in both modes, so pinning it here left analytics
+    # unable to reach its own sink on Linux. The sink is defaulted ON in
+    # docker-compose.yml (127.0.0.1:8013) and re-pointed at the service name by
+    # docker-compose.bridge.yml. What this overlay still guarantees is the
+    # PAIRING below: analytics detects and Smart Search stops looking at frames,
+    # together or not at all.
+    depends_on:
+      frames:
+        condition: service_healthy
+      smartsearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # RECEIVE-ONLY. No sampler, no broker subscription, no detector and no plate
+  # models — this service becomes what its name says: it embeds crops and
+  # searches the embeddings.
+  #
+  # The camera set is still synced here, because Smart Search still owns which
+  # cameras are searchable, what their domains are, and the retention of what
+  # they produced. It simply no longer looks at their pixels.
+  smartsearch:
+    environment:
+      # Already the default in the base file — restated here because this
+      # overlay is where the pairing is documented, and because reading it
+      # alongside ANALYTICS_SINK_URL is the point.
+      SEARCH_FRAME_SOURCE: none

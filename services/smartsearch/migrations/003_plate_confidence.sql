@@ -1,0 +1,22 @@
+-- 003 — keep the plate-read confidence that was being measured and thrown away.
+--
+-- index/plates.py computes a mean character probability for every accepted read
+-- and index/pipeline.py puts it on the row as `plate_confidence`. Nothing ever
+-- stored it: store.write_batch names its columns explicitly and that key was
+-- not among them, so the value was discarded on every insert with no error and
+-- no log line. The column it needed simply did not exist.
+--
+-- It matters because plate reads fail by NEAR MISS, not by absence. The first
+-- two live reads on this appliance were `VB53C1825` and `NB53C1825` — the same
+-- truck, one character apart. A confidence is what lets an operator tell a
+-- clean read from one worth a second look; without it every plate on the
+-- dashboard carries equal weight, including the wrong ones.
+--
+-- Deliberately NOT backfilled. Rows written before this migration have no
+-- recorded confidence and NULL is the honest representation of that — inventing
+-- a default would make old reads indistinguishable from measured ones. The
+-- dashboard renders NULL as "—", not as 0.
+--
+-- `real`, matching the existing `confidence` column: this is a 0-1 mean of
+-- character probabilities, and double precision would be false precision.
+ALTER TABLE search_vehicles ADD COLUMN IF NOT EXISTS plate_confidence real;

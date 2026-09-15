@@ -1,0 +1,45 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+uvloop==0.21.0
+
+# Database — async SQLAlchemy + asyncpg driver
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# Alembic migrations
+alembic==1.14.0
+
+# Redis async client
+redis==5.2.1
+
+# HTTP client (for MediaMTX REST API calls)
+httpx==0.28.0
+
+# Configuration
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Structured logging
+structlog==24.4.0
+
+# Async file I/O (for CSV bulk upload)
+aiofiles==24.1.0
+
+# Multipart form uploads (CSV bulk upload)
+python-multipart==0.0.18
+
+# APScheduler for periodic tasks (optional fallback to asyncio native tasks)
+apscheduler==3.10.4
+
+# Identity: validate Keycloak OIDC Bearer JWTs (RS256 via JWKS)
+PyJWT==2.10.1
+cryptography==43.0.3
+
+# ONVIF camera interrogation for discovery (GetProfiles / GetStreamUri / device info)
+onvif-zeep==0.2.12
+
+# Excel export for the uptime report (same pin as the NVR service)
+openpyxl==3.1.5
+# §63 BSA chain-of-custody certificate for evidence packages (pure-Python, air-gap safe)
+fpdf2==2.8.1

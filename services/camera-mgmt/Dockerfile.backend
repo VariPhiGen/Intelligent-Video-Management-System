@@ -1,0 +1,82 @@
+# ── Stage 1: build the React UI (frontend-react → static dist) ────────────────
+# node is BUILD-ONLY: the runtime image stays python-slim and fully offline.
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS ui-build
+WORKDIR /ui
+
+# Per-deployment branding + the AGPL source URL, baked in at build time. The SPA
+# is compiled inside this image, so a var set only in .env never reaches Vite —
+# it has to arrive as a build arg. Empty values are fine: vite.config.ts falls
+# back to the shipped defaults, so an argless `docker build` still works.
+ARG VITE_BRAND_NAME=""
+ARG VITE_BRAND_SITE=""
+ARG VITE_SOURCE_URL=""
+ENV VITE_BRAND_NAME=$VITE_BRAND_NAME \
+    VITE_BRAND_SITE=$VITE_BRAND_SITE \
+    VITE_SOURCE_URL=$VITE_SOURCE_URL
+
+COPY frontend-react/package.json frontend-react/package-lock.json ./
+RUN npm ci
+COPY frontend-react/ ./
+RUN npm run build
+
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
+# Install system dependencies:
+#   - ffmpeg: used by the snapshot endpoint (one-shot frame extraction)
+#   - libpq-dev: required by asyncpg native extensions
+#   - curl: used by the compose healthcheck
+# TODO: VERIFY — ffmpeg version on debian:bookworm-slim is 5.x; if you need a
+#   specific version (e.g. 6.x for AV1 support), build from source or use
+#   a pre-built static binary.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build context is the REPO ROOT (see docker-compose.yml) because the SPA
+# source lives at frontend-react/ at the top level, outside services/camera-mgmt.
+COPY services/camera-mgmt/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY services/camera-mgmt/alembic.ini .
+COPY services/camera-mgmt/migrations/ migrations/
+COPY services/camera-mgmt/backend/ backend/
+# The SPA is served directly by FastAPI (StaticFiles) — no nginx container.
+# The legacy single-file SPA that used to sit at /legacy was removed on
+# 2026-08-27: its two remaining exclusives, the ONVIF device forms and CSV bulk
+# import, are now in React (pages/config/device/, pages/wizard/CsvImport.tsx).
+COPY --from=ui-build /ui/dist/ frontend_dist/
+
+# ── ONVIF Media2 (ver20) WSDL bundle ──────────────────────────────────────────
+# onvif-zeep 0.2.12 ships only Media ver10, but most H.265 cameras expose their
+# encoder settings (fps/bitrate/resolution) ONLY via Media2 (their ver10 service
+# returns empty config bodies). backend/onvif_wsdl/ is a fully self-contained
+# ver20 media WSDL bundle (media2.wsdl + a fresh onvif.xsd/common.xsd — the
+# pinned lib's predate Media2 types like StringList — plus every transitive
+# schema import). The files are byte-identical to upstream; the URL→file mapping
+# that keeps zeep off the network lives in backend/services/onvif_wsdl_transport.py,
+# NOT in rewritten schemaLocation attributes (see NOTICE §4). onvif_media.py reads
+# it via ONVIF_MEDIA2_WSDL; the ver10 discovery path keeps using the library's own
+# bundle untouched.
+ENV ONVIF_MEDIA2_WSDL=/app/backend/onvif_wsdl/media2.wsdl
+
+# Non-root user for security
+RUN useradd --no-create-home --shell /bin/false relay
+
+# Evidence packages + the appliance signing key live on the evidence_data
+# volume mounted here. Create it in the image owned by relay: Docker seeds a
+# fresh named volume from the image path (content AND ownership), so the API
+# can write without a root entrypoint. Without this the dir lands root-owned
+# and every package build fails with PermissionError.
+RUN mkdir -p /evidence-exports/keys && chown -R relay:relay /evidence-exports
+
+USER relay
+
+# Documentation only; the real listen port follows $API_PORT (see CMD). Under
+# compose the `command:` overrides this CMD anyway.
+EXPOSE 8091
+
+# Shell form so $API_PORT expands at runtime; defaults to 8091 when unset.
+CMD ["/bin/sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${API_PORT:-8091} --workers 4 --loop uvloop --access-log"]

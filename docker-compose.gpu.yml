@@ -1,0 +1,72 @@
+# GPU overlay (legacy nvidia runtime) — layered by ./vms only when the daemon
+# reports an `nvidia` runtime but no CDI spec; hosts with CDI get
+# docker-compose.gpu-cdi.yml instead, which survives `systemctl daemon-reload`
+# (this hook-based path silently loses GPU access on reload — NVML "Unknown
+# Error" — until the container is recreated).
+# Never merge this into docker-compose.yml: a device reservation in
+# the base file makes `api` refuse to START on an appliance without the NVIDIA
+# container toolkit, and this product ships to CPU-only boxes too. Conditional
+# composition is the same trick docker-compose.bridge.yml uses for networking.
+#
+# Grants the API metrics-only GPU visibility so nvidia-smi is mounted in and
+# the topbar gauge has something to read. Inference lives in its own
+# containers; this one must never hold a compute context.
+#
+#   ./vms up -d              # auto-detected
+#   VMS_GPU=off ./vms up -d  # force off (troubleshooting)
+
+services:
+  api:
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      # `utility` = nvidia-smi + NVML only. Deliberately NOT `compute`: the API
+      # reads utilization, it does not run CUDA, and asking for compute would
+      # pin driver context this process has no use for.
+      NVIDIA_DRIVER_CAPABILITIES: utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+
+  # NVR gets the VIDEO capability: HEVC→H.264 clip transcodes run on the GPU's
+  # NVENC/NVDEC blocks (h264_nvenc) instead of pinning CPU cores with libx264.
+  # The NVR probes with a real test encode at startup and falls back to the
+  # CPU path when the probe fails, so this grant is safe on any driver state.
+  nvr:
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, utility]
+
+  # Smart Search: the one container that actually runs inference. Unlike api and
+  # nvr above this opens a CUDA context and keeps it — that is the point.
+  # Requires the image built with TORCH_VARIANT=cu121; a CPU build ignores the
+  # device and logs that it is running on CPU.
+  # Analytics: THE detector since 9f5a5ec — see docker-compose.gpu-cdi.yml for
+  # why this block has to exist separately from smartsearch's.
+  analytics:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all
+
+  smartsearch:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all

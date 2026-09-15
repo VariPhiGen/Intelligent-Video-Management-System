@@ -1,0 +1,47 @@
+# Variphi VMS — NVR recording config.
+# Cameras are NOT listed here: the camera-mgmt service syncs the registry into
+# the NVR at runtime (add/remove + a periodic reconcile), using the MediaMTX
+# relay URL rtsp://<SERVER_IP>:8654/<slug>. Manual entries still work if added.
+cameras: []
+
+recording:
+  segment_duration: 60          # seconds per MPEG-TS segment
+  storage_path: /data/nvr
+  clips_path: /data/nvr/clips
+  clip_ttl_minutes: 30
+  # How long a built HLS artifact (remuxed / transcoded segment) stays cached.
+  # Longer than clips on purpose: these are what make re-seeking free, and each
+  # one is keyed on its source segment's size+mtime, so a long TTL can never
+  # serve footage that grooming or an erasure has since changed.
+  hls_cache_ttl_minutes: 360
+  # Simultaneous ffmpeg transcodes allowed. LEAVE UNSET to size it to whatever
+  # encoder the startup probe finds: 4 with a hardware encoder (the work is on
+  # a dedicated ASIC, so cores are not the constraint), and one per 4 CPU cores
+  # otherwise. That floor is not arbitrary — a segment must transcode faster
+  # than it plays or the player runs dry mid-segment, and on a 4-vCPU appliance
+  # four concurrent libx264 jobs fall UNDER realtime. Set explicitly only if you
+  # have measured your own hardware; an explicit value always wins.
+  # max_concurrent_extractions: 4
+  # Age-based retention for cameras without their own value (registry-synced
+  # cameras pass NVR_DEFAULT_RETENTION_DAYS per camera, which takes priority).
+  default_retention_days: 30
+  # HARD storage cap (GB): when total footage exceeds this, the oldest segments
+  # across ALL cameras are deleted until back under. Strongly recommended —
+  # size it to the disk backing the nvr_data volume. Set NVR_MAX_STORAGE_GB in
+  # the product .env (preferred — it OVERRIDES this key), or uncomment:
+  # max_storage_gb: 500
+  # Grooming (Milestone-style): footage older than this many days is rewritten
+  # keyframe-only (no re-encode — cheap remux; plays as ~0.5-1 fps slideshow,
+  # ~10-30% of original size). 0 / commented = disabled.
+  groom_after_days: 2
+  # Nightly work window, interpreted in the CONTAINER's timezone (the TZ env
+  # var in .env — set it to the site's zone, e.g. Asia/Kolkata, or this will
+  # silently run in UTC). Overnight spans like "23:00-05:00" are supported.
+  # Test immediately regardless of window: python main.py --groom-now
+  groom_window: "02:00-06:00"
+
+ffmpeg:
+  rtsp_transport: tcp
+  reconnect_delay: 5
+  max_reconnect_attempts: 0     # 0 = retry forever
+  loglevel: warning

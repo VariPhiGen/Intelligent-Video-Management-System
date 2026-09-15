@@ -1,0 +1,785 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Variphi VMS — unified product stack
+# ─────────────────────────────────────────────────────────────────────────────
+# One deployment for the whole product:
+#   camera-mgmt  (services/camera-mgmt) — registry + ONVIF discovery API, relay ctl
+#   nvr          (services/nvr)         — recording + clip/snapshot retrieval
+#   mediamtx                            — single camera pull, fan-out relay
+#   keycloak                            — OIDC identity (single login)
+#   postgres / redis                    — persistence + ephemeral state
+#
+# The browser only talks to the camera-mgmt API (:8091), which serves the SPA
+# (repo-root frontend/), runs camera discovery natively (/api/discovery/*),
+# and proxies /api/nvr/* — all behind the single Keycloak login.
+# The NVR binds to 127.0.0.1 only — it has no auth of its own by design.
+#
+# Host networking is used for media/LAN services (mediamtx, api, nvr,
+# keycloak) — RTSP and ONVIF discovery misbehave behind Docker NAT.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: variphi-vms
+
+networks:
+  vms_internal:
+    driver: bridge
+
+volumes:
+  # THE FRAME TRANSPORT (broker mode). A tmpfs volume, not a disk one: these
+  # are 6 MB frames rewritten twice a second per camera, and they must never
+  # reach storage.
+  #
+  # A VOLUME RATHER THAN A SHARED IPC NAMESPACE, which was the first design
+  # and failed silently. `ipc: "service:frames"` binds a consumer to the
+  # broker's namespace once, at container start; restart the broker and it
+  # gets a NEW namespace while every consumer keeps the dead one. Measured on
+  # this appliance: after a broker restart the consumer's /dev/shm was empty,
+  # the broker held five healthy rings, and SmartSearch delivered zero frames
+  # indefinitely while /health still reported five rings mapped. Nothing
+  # logged an error, because a consumer that cannot read a frame looks
+  # exactly like a consumer under back-pressure.
+  #
+  # A volume has no such lifetime coupling: it outlives both containers, so
+  # either side can restart and reconnect on its own. Verified here with a
+  # live reader across a writer restart.
+  #
+  # Size tracks camera count: 5 cameras x 4 slots x 6.22 MB = 124 MB at 1080p.
+  frames_shm:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=${FRAMES_SHM_SIZE:-256m}
+
+  postgres_data:
+  searchdb_data:
+  search_crops:
+  search_models:
+  redis_data:
+  nvr_data:
+  evidence_data:
+  caddy_data:
+  caddy_config:
+
+services:
+
+  # ── PostgreSQL (camera registry + discovery DB + keycloak DB) ───────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: vms_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-rtsp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rtsp_secret}
+      POSTGRES_DB:       ${POSTGRES_DB:-rtsp_relay}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    networks:
+      - vms_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rtsp} -d ${POSTGRES_DB:-rtsp_relay}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Smart Search index (pgvector) — started by default ─────────────────────
+  # Backs the smartsearch service below, which now starts with the stack (see
+  # its comment for the history and how to opt out).
+  #
+  # A SECOND Postgres, deliberately, and not pgvector added to the one above:
+  #
+  #   * The registry runs postgres:15-alpine (musl); pgvector's images are
+  #     Debian (glibc). Swapping the image under the EXISTING volume changes
+  #     collation and silently invalidates its text btree indexes, the audit
+  #     log's included. A new database on a new volume never has that history.
+  #   * Smart Search is optional. Recording, playback and audit do not depend on
+  #     it, so a deployment that does not want it simply never starts this.
+  #   * It is a continuous index-heavy write workload, which does not belong
+  #     next to the data that has to survive.
+  #
+  searchdb:
+    image: pgvector/pgvector:pg15
+    container_name: vms_searchdb
+    # The `search` profile is ON for new installs via COMPOSE_PROFILES=search
+    # in .env.example — NOT by removing the profile. Removing it was tried and
+    # reverted: it force-started this database and the ~2.4 GB smartsearch
+    # build on every EXISTING install's next `up` (aborting the whole `up` on
+    # an air-gapped box), while those installs' .env files still carried the
+    # old example's explicit-empty SMARTSEARCH URLs — so the stack ran idle
+    # and unconfigured. Profile + .env default gives both: turnkey on a fresh
+    # clone, unchanged behaviour on upgrade until the operator opts in.
+    profiles: ["search"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${SEARCHDB_USER:-search}
+      POSTGRES_PASSWORD: ${SEARCHDB_PASSWORD:-search_secret}
+      POSTGRES_DB:       ${SEARCHDB_NAME:-smartsearch}
+    volumes:
+      - searchdb_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${SEARCHDB_PORT:-5434}:5432"
+    networks:
+      - vms_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SEARCHDB_USER:-search} -d ${SEARCHDB_NAME:-smartsearch}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Valkey (stream health / backoff / locks) ────────────────────────────────
+  # Valkey, not Redis: Redis relicensed at 7.4 to RSALv2 + SSPLv1, neither of
+  # which is OSI-approved, so redistributing it would make the bundle
+  # not-open-source. Valkey is the BSD-3 fork and speaks the same protocol —
+  # the service name, REDIS_URL and the redis:// scheme are unchanged.
+  #
+  # NOT a hot swap on an existing appliance: Valkey 8 refuses Redis 7.4's RDB
+  # ("Can't handle RDB format version 12") and exits. Run
+  # scripts/redis-to-valkey.sh before switching, or start from an empty volume.
+  redis:
+    image: valkey/valkey:8-alpine
+    container_name: vms_redis
+    restart: unless-stopped
+    command: ["valkey-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
+    networks:
+      - vms_internal
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MediaMTX (single camera pull → RTSP/HLS fan-out) ────────────────────────
+  mediamtx:
+    # -ffmpeg variant, same 1.9.1 server. FFmpeg is needed on PATH for the
+    # per-camera re-stamp hop the health monitor enables when a recorder emits
+    # a backward timestamp jump (services/relay.py::_restamp_command). Only
+    # flagged cameras spawn a process; the plain image would leave the hop
+    # silently dead with "runOnInit: ffmpeg: not found".
+    image: bluenviron/mediamtx:1.9.1-ffmpeg
+    container_name: vms_mediamtx
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MTX_LOGLEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./deploy/mediamtx.yml:/mediamtx.yml:ro
+    # Binds :8654 (RTSP), :8322 (RTSPS), :8988 (HLS), :9987 (API), :9988 (metrics)
+
+  # ── Keycloak DB bootstrap (one-shot, idempotent) ────────────────────────────
+  keycloak_db_init:
+    image: postgres:15-alpine
+    container_name: vms_keycloak_db_init
+    network_mode: host
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-rtsp_secret}
+    command:
+      - "sh"
+      - "-c"
+      - >
+        psql -h 127.0.0.1 -p ${POSTGRES_PORT:-5433} -U ${POSTGRES_USER:-rtsp}
+        -d ${POSTGRES_DB:-rtsp_relay}
+        -tc "SELECT 1 FROM pg_database WHERE datname='keycloak'" | grep -q 1 ||
+        createdb -h 127.0.0.1 -p ${POSTGRES_PORT:-5433} -U ${POSTGRES_USER:-rtsp} keycloak
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Keycloak (OIDC identity provider — the single login) ────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: vms_keycloak
+    restart: unless-stopped
+    network_mode: host
+    # PRODUCTION mode ("start", not "start-dev"). start-dev enables Keycloak's
+    # development profile — relaxed hostname handling, dev-only caching, and a
+    # banner telling you not to run it in production — which is not what should
+    # be authenticating a compliance appliance, however well it happens to work.
+    # Plain HTTP is still allowed on purpose (KC_HTTP_ENABLED below): this is a
+    # LAN appliance reached by IP, and demanding TLS by default would lock an
+    # operator out of a box they just installed. See HARDENING.md for the TLS
+    # path (the `tls` Caddy profile) and for what that default costs.
+    command: ["start", "--import-realm", "--http-port=${KEYCLOAK_PORT:-8085}"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB:          postgres
+      KC_DB_URL:      jdbc:postgresql://127.0.0.1:${POSTGRES_PORT:-5433}/keycloak
+      KC_DB_USERNAME: ${POSTGRES_USER:-rtsp}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-rtsp_secret}
+      KC_HTTP_ENABLED:      "true"
+      KC_HOSTNAME_STRICT:   "false"
+      KC_PROXY_HEADERS:     "xforwarded"
+      KC_HEALTH_ENABLED:    "true"
+      # Host-networked: default mgmt port 9000 collides with MinIO; move it (2026-08-03)
+      KC_HTTP_MANAGEMENT_PORT: "9005"
+    volumes:
+      - ./deploy/keycloak/realm-vms.json:/opt/keycloak/data/import/realm-vms.json:ro
+      - ./deploy/keycloak/themes:/opt/keycloak/themes:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak_db_init:
+        condition: service_completed_successfully
+
+  # ── Keycloak client sync (one-shot, idempotent, runs on every `up`) ─────────
+  # Realm import happens only on Keycloak's FIRST boot, so deployments that
+  # imported an older realm-vms.json keep its client config forever (e.g. the
+  # webOrigins="+" combo whose broken CORS surfaces as "Login failed:
+  # undefined"). This re-asserts the vms-web client's redirect/origin settings
+  # against the RUNNING Keycloak; non-fatal and a no-op when already in sync.
+  keycloak_client_sync:
+    image: python:3.11-slim
+    container_name: vms_keycloak_client_sync
+    network_mode: host
+    environment:
+      KC_URL:                  http://127.0.0.1:${KEYCLOAK_PORT:-8085}
+      KEYCLOAK_ADMIN:          ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Same BRAND_NAME the SPA is built with. The login page renders the
+      # REALM's displayName, which realm-vms.json only sets on a first-boot
+      # import — so an existing realm keeps the old name forever unless this
+      # sync reconciles it on every `up`. Unset = leave the realm alone.
+      BRAND_NAME:              ${BRAND_NAME:-}
+      # The SEEDED APPLICATION LOGINS. realm-vms.json has to ship a working
+      # user or a fresh appliance cannot be signed into at all; these retire
+      # its hardcoded `admin`/`admin` and `operator`/`operator` on the first
+      # `up`. Generated by scripts/gen-secrets.sh — see sync_seed_passwords().
+      VMS_ADMIN_PASSWORD:      ${VMS_ADMIN_PASSWORD:-}
+      VMS_OPERATOR_PASSWORD:   ${VMS_OPERATOR_PASSWORD:-}
+    volumes:
+      - ./deploy/keycloak/sync-client.py:/sync-client.py:ro
+    command: ["python3", "/sync-client.py"]
+    depends_on:
+      keycloak:
+        condition: service_started
+    restart: "no"
+
+  # ── Camera-management API + unified SPA ─────────────────────────────────────
+  api:
+    build:
+      # Context is the repo root so the build can copy both the backend
+      # (services/camera-mgmt) and the unified SPA (frontend/ at the top level).
+      context: .
+      dockerfile: services/camera-mgmt/Dockerfile.backend
+      network: host
+      # Branding is compiled INTO the SPA bundle, so it has to be a build arg —
+      # setting these in `environment:` below would reach the running container
+      # long after Vite has finished. Change BRAND_NAME in .env, then rebuild
+      # (`./vms build api`) for it to take effect in the UI. The login page
+      # tracks the same value at runtime via keycloak_client_sync.
+      args:
+        VITE_BRAND_NAME: ${BRAND_NAME:-}
+        VITE_BRAND_SITE: ${BRAND_SITE:-}
+        VITE_SOURCE_URL: ${SOURCE_URL:-}
+    container_name: vms_api
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SERVER_IP:               ${SERVER_IP:-127.0.0.1}
+      RTSP_PORT:               ${RTSP_PORT:-8654}
+      API_PORT:                ${API_PORT:-8091}
+      DATABASE_URL:            ${DATABASE_URL:-postgresql+asyncpg://rtsp:rtsp_secret@127.0.0.1:5433/rtsp_relay}
+      REDIS_URL:               ${REDIS_URL:-redis://127.0.0.1:6380/0}
+      MEDIAMTX_API_URL:        ${MEDIAMTX_API_URL:-http://127.0.0.1:9987}
+      RELAY_INTERNAL_HOST:     ${RELAY_INTERNAL_HOST:-127.0.0.1}
+      MAX_TRANSCODE_WORKERS:   ${MAX_TRANSCODE_WORKERS:-8}
+      LOG_LEVEL:               ${LOG_LEVEL:-info}
+      HEALTH_POLL_INTERVAL:    ${HEALTH_POLL_INTERVAL:-30}
+      # Local wall clock for recording-schedule windows and report timestamps
+      # (must match the NVR's TZ so schedules line up with segment filenames).
+      TZ:                      ${TZ:-UTC}
+      # ── Identity (OIDC / Keycloak) ──
+      DEV_AUTH:                ${DEV_AUTH:-false}
+      OIDC_ISSUER:             ${OIDC_ISSUER:-http://localhost:8085/realms/vms}
+      # Empty = SPA derives Keycloak's URL from the browser host (turnkey).
+      OIDC_PUBLIC_URL:         ${OIDC_PUBLIC_URL:-}
+      # Per-front-door Keycloak URLs (app_host=auth_url,…) for reverse-proxy /
+      # tunnel access where :8085 isn't forwarded. Empty = turnkey everywhere.
+      OIDC_PUBLIC_HOSTS:       ${OIDC_PUBLIC_HOSTS:-}
+      KEYCLOAK_PORT:           ${KEYCLOAK_PORT:-8085}
+      OIDC_JWKS_URL:           ${OIDC_JWKS_URL:-http://127.0.0.1:8085/realms/vms/protocol/openid-connect/certs}
+      OIDC_CLIENT_ID:          ${OIDC_CLIENT_ID:-vms-web}
+      OIDC_AUDIENCE:           ${OIDC_AUDIENCE:-}
+      CORS_ORIGINS:            ${CORS_ORIGINS:-}
+      # ── Camera discovery (native ONVIF scan/probe, /api/discovery/*) ──
+      DISCOVERY_SECRET_KEY:    ${DISCOVERY_SECRET_KEY:-dev-insecure-change-me}
+      # Rare escape hatch: extra auto-scan sweep CIDRs for routed camera VLANs
+      # no automatic source (interfaces, camera registry) can see. Normally empty.
+      DISCOVERY_SUBNETS:       ${DISCOVERY_SUBNETS:-}
+      # ── NVR service (proxied behind the single login) ──
+      NVR_API_URL:             ${NVR_API_URL:-http://127.0.0.1:8009}
+      NVR_RECORD_HOST:         ${NVR_RECORD_HOST:-127.0.0.1}
+      NVR_DEFAULT_RETENTION_DAYS: ${NVR_DEFAULT_RETENTION_DAYS:-30}
+      NVR_SYNC_ENABLED:        ${NVR_SYNC_ENABLED:-true}
+      NVR_SYNC_INTERVAL:       ${NVR_SYNC_INTERVAL:-60}
+      # ── Motion service (proxied behind the single login) ──
+      MOTION_API_URL:          ${MOTION_API_URL:-http://127.0.0.1:8012}
+      MOTION_SYNC_ENABLED:     ${MOTION_SYNC_ENABLED:-true}
+      # ── Frame broker and analytics (--profile frames / --profile analytics) ──
+      # WHAT TURNS THE SYNC ON. The broker's camera set is in-memory and
+      # nothing pushes to it by default, so without these URLs it decodes
+      # nothing and every consumer waits on notices that never arrive — the
+      # analytics detector included. Setting them starts the registry->broker
+      # and registry->analytics reconcile loops alongside the NVR, motion and
+      # Smart Search ones.
+      #
+      # Harmless when those profiles are not running: each loop reports the
+      # service unreachable and retries, exactly as the others do.
+      FRAMES_API_URL:          ${FRAMES_API_URL:-http://127.0.0.1:8014}
+      ANALYTICS_API_URL:       ${ANALYTICS_API_URL:-http://127.0.0.1:8015}
+      # ── Smart Search index (proxied behind the single login) ──
+      # Defaults to the co-located smartsearch service below, so a first start
+      # is searchable out of the box. `${VAR-default}` (unset-only), NOT
+      # `${VAR:-default}`: an EXPLICIT empty value in .env still means "this
+      # VMS has no index" — a supported deployment (the Smart Search page says
+      # so and the rest of the product is unaffected) — while merely not
+      # mentioning the variable gets the turnkey default. Unlike motion/nvr the
+      # index need not be co-located; on some sites it is a separate GPU host,
+      # so this may be a remote URL.
+      SMARTSEARCH_API_URL:     ${SMARTSEARCH_API_URL-http://127.0.0.1:8013}
+      SMARTSEARCH_API_KEY:     ${SMARTSEARCH_API_KEY:-}
+      # The WRITE side — which index this VMS feeds cameras to. Same
+      # unset-vs-empty rule as the query URL above.
+      SMARTSEARCH_INDEX_URL:   ${SMARTSEARCH_INDEX_URL-http://127.0.0.1:8013}
+      # ── User management (Keycloak Admin REST API) ──
+      KEYCLOAK_ADMIN_URL:      ${KEYCLOAK_ADMIN_URL:-http://127.0.0.1:8085}
+      KEYCLOAK_ADMIN_USER:     ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      INTERNAL_API_KEY:        ${INTERNAL_API_KEY:-dev-internal-key-change-me}
+      # ── DeepStream analytics pipeline (same appliance, shared directory) ──
+      # This API projects one <slug>.json per camera into the directory below,
+      # which the pipeline container mounts as its config/camera_config and
+      # scans on boot. Nothing is pushed over the network: set DEEPSTREAM_HOME
+      # in .env to the pipeline checkout's root and the two stay in step.
+      # That variable is the ONLY thing to change if the pipeline moves — no
+      # path here is specific to any one install.
+      # OFF: AI activities execute on the CPU Activity Engine in `analytics`.
+      # DeepStream stays in the tree; set true to project configs to it again.
+      DEEPSTREAM_PROJECTION_ENABLED:  ${DEEPSTREAM_PROJECTION_ENABLED:-false}
+      DEEPSTREAM_CONFIG_DIR:          /deepstream-config
+      DEEPSTREAM_PROJECTION_INTERVAL: ${DEEPSTREAM_PROJECTION_INTERVAL:-300}
+      # Where the pipeline sees those same files, and its REST API. Written
+      # configs are pushed to it so edits go live immediately instead of at
+      # the pipeline's next restart. Loopback: both are host-networked.
+      DEEPSTREAM_PIPELINE_CONFIG_DIR: ${DEEPSTREAM_PIPELINE_CONFIG_DIR:-/apps/deepstream-yolo-e2e/config/camera_config}
+      DEEPSTREAM_API_URL:             ${DEEPSTREAM_API_URL:-http://127.0.0.1:8081}
+    volumes:
+      # Read-write: this API is the sole writer of the pipeline's camera
+      # configs (see services/deepstream_projection.py). The pipeline reads
+      # them and must not write here.
+      #
+      # Derived from DEEPSTREAM_HOME (the pipeline checkout root) so relocating
+      # the pipeline is a one-line edit in .env rather than a change to this
+      # file. DEEPSTREAM_CONFIG_DIR_HOST overrides the derived path outright,
+      # for the rare install whose config dir sits outside the checkout. The
+      # /opt/deepstream fallback is a placeholder, not a working default: with
+      # neither variable set the bind mount resolves to an empty directory, the
+      # projection writes into it harmlessly, and the reconcile loop logs the
+      # pipeline as unreachable.
+      - ${DEEPSTREAM_CONFIG_DIR_HOST:-${DEEPSTREAM_HOME:-/opt/deepstream}/config/camera_config}:/deepstream-config
+      # Built evidence packages + the appliance evidence-signing key persist here.
+      # Bytes are video-sized, so on a volume, not Postgres.
+      - evidence_data:/evidence-exports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    command: ["/bin/sh", "-c", "python -m backend.migrate && uvicorn backend.main:app --host 0.0.0.0 --port ${API_PORT:-8091} --workers 4 --loop uvloop --access-log"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:${API_PORT:-8091}/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── NVR (recording + retrieval) ─────────────────────────────────────────────
+  # Records every enabled camera FROM THE RELAY (rtsp://<host>:8654/<slug>) so
+  # each physical camera is still pulled exactly once. Cameras are synced into
+  # it at runtime by the camera-mgmt API (create/delete + 60s reconcile) — do
+  # not hand-edit cameras.yaml for registry cameras.
+  # SECURITY: the NVR has no auth of its own; it binds to 127.0.0.1 only and is
+  # reached by users exclusively through the API's authenticated /api/nvr proxy.
+  nvr:
+    build:
+      context: ./services/nvr
+      network: host
+    container_name: vms_nvr
+    restart: unless-stopped
+    network_mode: host
+    # Default bind is loopback (users go through the authenticated /api/nvr
+    # proxy). Set NVR_BIND_HOST=0.0.0.0 ONLY if legacy LAN consumers (e.g. a
+    # clip-service on another host/bridge network) must call the NVR directly —
+    # that re-exposes the unauthenticated NVR API to the LAN.
+    command: ["--config", "config/cameras.yaml", "--host", "${NVR_BIND_HOST:-127.0.0.1}", "--port", "${NVR_PORT:-8009}"]
+    environment:
+      TZ: ${TZ:-UTC}
+      # Hard cap on total footage (GB); oldest segments are deleted once
+      # exceeded. Empty = uncapped (age-based retention only).
+      NVR_MAX_STORAGE_GB: ${NVR_MAX_STORAGE_GB:-}
+      # State-change notifications for disk/cap pressure. Empty = log only.
+      # Kill switch for the GPU encoder (api/encoders.py). Documented there but
+      # previously unreachable from compose, so the CPU fallback could not be
+      # exercised on a box that has a working GPU. Set to 1 to force libx264.
+      NVR_DISABLE_NVENC:          ${NVR_DISABLE_NVENC:-}
+      NVR_ALERT_WEBHOOK_URL:      ${NVR_ALERT_WEBHOOK_URL:-}
+      NVR_ALERT_INTERVAL_SECONDS: ${NVR_ALERT_INTERVAL_SECONDS:-60}
+    volumes:
+      - nvr_data:/data/nvr
+      - ./services/nvr/config:/app/config:ro
+    depends_on:
+      - mediamtx
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Frame broker (Phase 1 — OPT-IN, nothing consumes it yet) ───────────────
+  #   ./vms --profile frames up -d frames
+  #
+  # Decodes each camera ONCE, writes the frame to shared memory, runs the
+  # CANONICAL motion analysis, and publishes a notice per frame. Both the
+  # Motion service and SmartSearch are meant to become consumers, so they see
+  # the SAME pixels — which two independent decoders can never guarantee, and
+  # which is why regions computed by one cannot be trusted by the other.
+  #
+  # BEHIND A PROFILE ON PURPOSE. Phase 1 ships the producer only: it runs
+  # beside the existing stack, changes nothing, and is verified by
+  # services/frames/scripts/parity.py reproducing the SmartSearch gate's
+  # regions exactly on the same frames. Consumers switch over in later phases.
+  frames:
+    build:
+      context: ./services/frames
+      network: host
+    container_name: vms_frames
+    profiles: ["frames"]
+    restart: unless-stopped
+    environment:
+      FRAMES_BIND_HOST: 127.0.0.1
+      FRAMES_PORT: ${FRAMES_PORT:-8014}
+      # The one place the sample rate is decided, once consumers read from here.
+      FRAMES_SAMPLE_FPS: ${FRAMES_SAMPLE_FPS:-5}
+      FRAMES_RING_SLOTS: ${FRAMES_RING_SLOTS:-4}
+      REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6380/0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Where the rings are written. See the volumes block for why this is a
+      # shared tmpfs volume and not this container's own /dev/shm.
+      FRAMES_SHM_DIR: /frames
+    # SHARED MEMORY IS THE POINT. Consumers mount the same volume at the same
+    # path. A container's own /dev/shm cannot serve: it is private, and
+    # joining the broker's IPC namespace to share it does not survive the
+    # broker restarting.
+    volumes:
+      - frames_shm:/frames
+    depends_on:
+      redis:
+        condition: service_healthy
+    # HOST NETWORKING, like every other service the api has to reach. On the
+    # vms_internal bridge this bound 127.0.0.1 INSIDE its own namespace and
+    # published no ports, so nothing could reach it — not the api on the host
+    # netns, and not analytics on the same bridge. The registry->broker sync
+    # therefore never ran and the broker decoded nothing, which is what left
+    # Smart Search with an empty index while every container reported healthy.
+    # The bridge overlay resets this (see docker-compose.bridge.yml).
+    network_mode: host
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8014/health',timeout=4).status==200 else 1)\""]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+
+  # ── Analytics (--profile analytics) ─────────────────────────────────────────
+  #   ./vms --profile analytics --profile frames up -d analytics
+  #
+  # DETECTION, PLATES, TRACKING. Objects and number plates are found here, and
+  # the indexing policy decides which observations deserve a record. It
+  # produces crops and metadata; embedding, deduplication, storage and search
+  # stay in Smart Search, which is what keeps that service to one job.
+  #
+  # WHY A SEPARATE IMAGE. This one carries ultralytics, OpenVINO and the plate
+  # models; Smart Search carries the CLIP encoder. Split, neither pays for the
+  # other's weights, and a future AI feature lands here without touching the
+  # index.
+  #
+  # PHASE A SHIPS IT WITH NO SINK. ANALYTICS_SINK_URL is empty, so it detects,
+  # tracks and decides, reports the counts on /health, and sends nothing
+  # anywhere. That is what makes it safe to run beside the pipeline it will
+  # eventually take over from.
+  analytics:
+    build:
+      context: ./services/analytics
+      network: host
+    container_name: vms_analytics
+    profiles: ["analytics"]
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      ANALYTICS_BIND_HOST: ${ANALYTICS_BIND_HOST:-127.0.0.1}
+      ANALYTICS_PORT: ${ANALYTICS_PORT:-8015}
+      # broker | sampler. Broker is the default: this service is new, so there
+      # is no legacy decoder to preserve.
+      ANALYTICS_FRAME_SOURCE: ${ANALYTICS_FRAME_SOURCE:-broker}
+      ANALYTICS_SHM_DIR: /frames
+      REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6380/0}
+      ANALYTICS_DETECTOR_BACKEND: ${ANALYTICS_DETECTOR_BACKEND:-auto}
+      # ONE OBJECT MUST NOT BECOME TWO. Same-domain boxes nested inside one
+      # another — a torso inside a full body — are collapsed to the outer box
+      # before the tracker or appearance dedup can treat them as two objects.
+      # This is the containment at which that happens; 0 turns it off so an
+      # operator can compare without a rebuild.
+      #
+      # It has to be passed through HERE or that off switch does not exist:
+      # the service reads its own environment, and there is no env_file, so a
+      # value set in .env reached nothing. The default mirrors
+      # services/analytics/config.yaml — change both together, which
+      # tests/test_compose_defaults.py enforces.
+      ANALYTICS_NESTED_CONTAINMENT: ${ANALYTICS_NESTED_CONTAINMENT:-0.9}
+      # WHERE ACCEPTED OBSERVATIONS GO. Defaulted ON, and the pairing that
+      # governs it is the reason why.
+      #
+      # The sink and Smart Search's own detector are a PAIR: with both live,
+      # every object is recorded TWICE — once by each path — and appearance
+      # dedup absorbs some of that and not all, because the two carry
+      # different tracker ids. That is why this shipped empty.
+      #
+      # It no longer holds. SEARCH_FRAME_SOURCE now defaults to `none` (see
+      # the smartsearch service below), so Smart Search does NOT detect by
+      # default and analytics is the only detector there is. Leaving the sink
+      # empty then means the other half of the pair — nothing detects at all,
+      # the index never grows, and every service still reports healthy. That
+      # is exactly what a clean install did.
+      #
+      # If you deliberately switch Smart Search's own detector back on
+      # (SEARCH_FRAME_SOURCE=broker), clear this in the same change.
+      ANALYTICS_SINK_URL: ${ANALYTICS_SINK_URL:-http://127.0.0.1:8013}
+      # HOW LONG THE WEIGHTS SURVIVE WITH NO CAMERA ASKING FOR DETECTION.
+      # The detector and the plate reader are ingest-only: they load on the
+      # first camera and go when the last one does, so switching Person,
+      # Vehicles and ANPR off across the fleet actually gives the memory back.
+      # The timer is a DEBOUNCE — camera-mgmt reconciles from every uvicorn
+      # worker and a domain change is a remove followed by an add, so the
+      # count touches zero on ordinary traffic. 0 = load once, hold for ever.
+      ANALYTICS_IDLE_TIMEOUT_SECONDS: ${ANALYTICS_IDLE_TIMEOUT_SECONDS:-300}
+      # WHERE CPU ACTIVITY EVENTS GO. The activity engine (analytics/activities/)
+      # runs on this service's detections and tracks and POSTs every event to
+      # the VMS ingest, /api/analytics/events on the api — the table the Events
+      # page reads. The API root, host-networked like this service; the key is
+      # the api's own INTERNAL_API_KEY, so the two always agree.
+      ANALYTICS_EVENTS_URL: ${ANALYTICS_EVENTS_URL:-http://127.0.0.1:${API_PORT:-8091}}
+      ANALYTICS_INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      # The same weights Smart Search already downloaded. Sharing the volume
+      # means the detector is not fetched twice.
+      - search_models:/models
+      # Frames from the broker. Same tmpfs both sides mount, never an IPC
+      # namespace — see the volumes block.
+      - frames_shm:/frames
+    depends_on:
+      redis:
+        condition: service_healthy
+    # HOST NETWORKING — see the frames service. Analytics additionally has to
+    # POST observations to Smart Search, which is host-networked, so on the
+    # bridge it could not reach its own sink even once the sink was configured.
+    network_mode: host
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8015/health',timeout=4).status==200 else 1)\""]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 40s
+
+  # ── Motion detection (CPU-only, analyses relay streams) ─────────────────────
+  # Watches cameras with motion_detection=true FROM THE RELAY — zero extra load
+  # on the physical camera, no camera credentials. Cameras are synced in at
+  # runtime by the camera-mgmt API (update hooks + 60s reconcile); state is
+  # in-memory and self-heals after a restart.
+  # SECURITY: no auth of its own; binds 127.0.0.1 and is reached by users
+  # exclusively through the API's authenticated /api/motion proxy.
+  motion:
+    build:
+      context: ./services/motion
+      network: host
+    container_name: vms_motion
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: ${TZ:-UTC}
+      MOTION_BIND_HOST: ${MOTION_BIND_HOST:-127.0.0.1}
+      MOTION_PORT: ${MOTION_PORT:-8012}
+      # capture (default) or broker — see .env.example. Operator-visible
+      # behaviour is identical either way; only the source of the
+      # changed-pixel fraction differs. docker-compose.broker.yml sets this
+      # too, and this line is what makes the .env switch work on its own.
+      MOTION_FRAME_SOURCE: ${MOTION_FRAME_SOURCE:-capture}
+      REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6380/0}
+    volumes:
+      - ./services/motion/config.yaml:/app/config.yaml:ro
+    depends_on:
+      - mediamtx
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8012/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Smart Search index (forensic person/vehicle search) ─────────────────────
+  # Samples relay streams at up to 1 FPS, deduplicates by appearance and indexes
+  # crops into searchdb. Same posture as motion: no camera credentials, cameras
+  # pushed in at runtime by camera-mgmt's reconcile loop, in-memory state that
+  # self-heals after a restart. Serves the query API the api's /api/search
+  # routes proxy (person, vehicles, plates).
+  #
+  # Started by default ON NEW INSTALLS via COMPOSE_PROFILES=search in
+  # .env.example (see searchdb's comment for why the profile itself stays):
+  # since the hosted index was removed (c36ee88), a first start with no local
+  # service showed "Smart Search is not configured", and the turnkey posture
+  # is that every install can search its own footage. Existing installs keep
+  # their prior behaviour until they add COMPOSE_PROFILES=search to .env; a
+  # site that does not want the index (or uses a remote GPU host) leaves the
+  # profile off and sets SMARTSEARCH_API_URL / SMARTSEARCH_INDEX_URL as
+  # documented in .env.example.
+  #
+  # Built CPU-only by default (~2.4 GB measured). For GPU:
+  #   docker compose build --build-arg TORCH_VARIANT=cu121 smartsearch
+  # and the ./vms wrapper layers docker-compose.gpu-cdi.yml automatically.
+  smartsearch:
+    build:
+      context: ./services/smartsearch
+      network: host
+    container_name: vms_smartsearch
+    profiles: ["search"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: ${TZ:-UTC}
+      SMARTSEARCH_BIND_HOST: ${SMARTSEARCH_BIND_HOST:-127.0.0.1}
+      SMARTSEARCH_PORT: ${SMARTSEARCH_PORT:-8013}
+      SEARCHDB_URL: ${SEARCHDB_URL:-postgresql://search:search_secret@127.0.0.1:5434/smartsearch}
+      SEARCH_CROP_DIR: ${SEARCH_CROP_DIR:-/data/search/crops}
+      SEARCH_RETENTION_DAYS: ${SEARCH_RETENTION_DAYS:-30}
+      # How often the service deletes expired rows and their crop files.
+      # 0 disables the sweep; reads stay filtered to unexpired rows either way,
+      # so the cost of disabling is disk, not wrong answers.
+      SEARCH_RETENTION_SWEEP_SECONDS: ${SEARCH_RETENTION_SWEEP_SECONDS:-3600}
+      SEARCH_RETENTION_ORPHAN_EVERY_N: ${SEARCH_RETENTION_ORPHAN_EVERY_N:-24}
+      # Reconcile the index against what the NVR still holds, every Nth sweep.
+      # Age is not the only way the index outlives its footage: the recorder and
+      # the indexer restart independently, so detections accumulate over dead
+      # air and their playback 404s. 0 disables it, and so does an empty
+      # NVR_URL — coverage is the only thing that makes deleting by it safe, so
+      # "no recorder configured" must mean "do not sweep", never "nothing is
+      # recorded". A pass that would take most of one camera's rows refuses
+      # itself; scripts/purge_unrecorded.py --force is the deliberate override.
+      NVR_URL: http://127.0.0.1:${NVR_PORT:-8009}
+      SEARCH_RETENTION_COVERAGE_EVERY_N: ${SEARCH_RETENTION_COVERAGE_EVERY_N:-24}
+      # Empty = CUDA when the container can see a GPU, CPU otherwise. Set "cpu"
+      # to force the fallback on a GPU host.
+      SEARCH_DEVICE: ${SEARCH_DEVICE:-}
+      SEARCH_INGEST_ENABLED: ${SEARCH_INGEST_ENABLED:-true}
+      # Seconds with no camera registered before the detector, encoder and plate
+      # reader are released. The service keeps serving searches throughout and
+      # reloads in ~1.7s when a camera comes back. 0 = never release.
+      SEARCH_IDLE_TIMEOUT: ${SEARCH_IDLE_TIMEOUT:-300}
+      SEARCH_MOTION_GATE: ${SEARCH_MOTION_GATE:-true}
+      # Square-letterbox the detector input, so an exported backend (ONNX,
+      # OpenVINO) detects the same objects torch does. It also changes what the
+      # CURRENT torch path detects: measured, more marginal detections at the
+      # frame edge, therefore more crops, embeddings and stored rows. Set false
+      # to restore the previous behaviour without a rebuild.
+      # Index an object once per window rather than once per sampled second.
+      # Runs before the CLIP encoder, so it removes the embedding as well as
+      # the row. Measured ~80% fewer index entries at 1.1% of distinct objects
+      # left unindexed. 0 disables it.
+      # Sampling, tracking and indexing. Nothing here samples any more
+      # (SEARCH_FRAME_SOURCE=none below): this is the rate the frame source —
+      # the frames broker — is expected to run at, and /health reports it as
+      # `expected_source_fps` so that a real mismatch shows up in one place.
+      # It must therefore equal FRAMES_SAMPLE_FPS on the frames service;
+      # tests/test_compose_defaults.py checks that it does. 5 FPS is for the
+      # tracker, not for coverage: it keeps identities, it does not find more
+      # objects.
+      SEARCH_SAMPLE_FPS: ${SEARCH_SAMPLE_FPS:-5}
+      # sampler | broker. Leave as sampler unless the frames service is up:
+      # broker mode makes indexing depend on it. See services/frames.
+      # `none` is the only value now: detection moved to services/analytics,
+      # which posts finished observations here. Kept as a variable rather than
+      # deleted so an existing .env carrying `sampler` fails with an
+      # explanation at startup instead of indexing nothing quietly.
+      SEARCH_FRAME_SOURCE: ${SEARCH_FRAME_SOURCE:-none}
+      SEARCH_TRACKING_ENABLED: ${SEARCH_TRACKING_ENABLED:-true}
+      SEARCH_TRACK_MAX_COST: ${SEARCH_TRACK_MAX_COST:-1.75}
+      SEARCH_TRACK_MAX_AGE: ${SEARCH_TRACK_MAX_AGE:-3}
+      # The escape hatch: false indexes every observation of every track.
+      SEARCH_INDEX_SUPPRESSION_ENABLED: ${SEARCH_INDEX_SUPPRESSION_ENABLED:-true}
+      SEARCH_INDEX_DISPLACEMENT: ${SEARCH_INDEX_DISPLACEMENT:-1.5}
+      # 0 = off, on evidence: it fired once in 322 observations over 14
+      # minutes of continuous footage. Mechanism intact; set >0 to re-enable.
+      SEARCH_INDEX_HEARTBEAT: ${SEARCH_INDEX_HEARTBEAT:-0}
+      # Detector implementation: auto | openvino | torch. AUTO is OpenVINO on
+      # CPU (measured p50 17.6ms against torch's 40.8ms on live 1080p frames)
+      # and torch on CUDA. A failed OpenVINO load falls through to torch within
+      # the same warm-up, so it never costs indexing.
+      SEARCH_DETECTOR_BACKEND: ${SEARCH_DETECTOR_BACKEND:-auto}
+      SEARCH_BACKEND_ATTEMPTS: ${SEARCH_BACKEND_ATTEMPTS:-3}
+      SEARCH_SQUARE_LETTERBOX: ${SEARCH_SQUARE_LETTERBOX:-true}
+      # The same for the plate localiser, and deliberately OFF by default: the
+      # two-line ANPR thresholds were fitted under rectangular preprocessing,
+      # so this is the switch for RUNNING that validation, not for turning the
+      # change on before it has been done.
+      SEARCH_PLATE_SQUARE_LETTERBOX: ${SEARCH_PLATE_SQUARE_LETTERBOX:-false}
+      # Site-tuned plate-DETECTION weights (a .pt mounted into the models
+      # volume). Empty = the open-baseline detector below; set = it wins.
+      SEARCH_PLATE_WEIGHTS: ${SEARCH_PLATE_WEIGHTS:-}
+      # The open-baseline plate detector (open-image-models, MIT, ONNX,
+      # auto-downloads) — what makes plate reading work on a first start.
+      # `${VAR-default}` (unset-only) so an EXPLICIT empty in .env disables
+      # plate reading rather than silently restoring the default.
+      SEARCH_PLATE_MODEL: ${SEARCH_PLATE_MODEL-yolo-v9-t-384-license-plate-end2end}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - search_crops:/data/search/crops
+      # Model weights are downloaded on first run, never baked into the image:
+      # the packaging harness fails on any binary it cannot account for, and a
+      # .pt file is exactly that. The volume keeps the download to once.
+      - search_models:/models
+    depends_on:
+      - mediamtx
+      - searchdb
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Caddy TLS front door (OPT-IN: docker compose --profile tls up -d caddy) ─
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2.8-alpine
+    container_name: vms_caddy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Caddyfile reads {$API_PORT:8091} to reverse-proxy the API front door.
+      API_PORT: ${API_PORT:-8091}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # gen-certs.sh (repo-root scripts/) writes deploy/certs
+      - ./deploy/certs:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - keycloak

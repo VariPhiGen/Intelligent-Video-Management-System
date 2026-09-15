@@ -1,0 +1,12 @@
+# Issue-form routing. Blank issues stay enabled — questions and discussion
+# starters are welcome as issues; forcing every report into a form loses the
+# ones that don't fit it. The one thing that must NOT arrive here is a
+# vulnerability, so that link goes first.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/VariPhiGen/Intelligent-Video-Management-System/security/advisories/new
+    about: >-
+      Never open a public issue for a suspected vulnerability. This link opens
+      a private advisory visible only to you and the maintainers — see
+      SECURITY.md for what to include and what to expect.

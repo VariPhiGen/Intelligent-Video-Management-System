@@ -1,0 +1,8 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+opencv-python-headless>=4.9,<4.12
+numpy>=1.26,<3
+pyyaml>=6.0,<7
+# Notices only — the frames themselves never touch it. Same pin as
+# camera-mgmt, which already depends on this client.
+redis==5.2.1

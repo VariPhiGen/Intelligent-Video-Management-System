@@ -1,0 +1,36 @@
+{
+	# No public ACME — we use the locally-generated cert (air-gapped).
+	auto_https disable_redirects
+	admin off
+}
+
+# ── App front door: SPA + API + HLS preview, one HTTPS origin ────────────────
+:443 {
+	tls /certs/server.crt /certs/server.key
+
+	# Live HLS preview → MediaMTX (strip /hls so MediaMTX sees /<slug>/index.m3u8).
+	handle_path /hls/* {
+		reverse_proxy 127.0.0.1:8988
+	}
+
+	# Everything else → FastAPI (serves the SPA, /api/*, /docs).
+	# Port follows $API_PORT (passed by compose); defaults to 8091.
+	reverse_proxy 127.0.0.1:{$API_PORT:8091}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "same-origin"
+	}
+}
+
+# ── Keycloak front door (separate TLS vhost, root path) ──────────────────────
+# Port 8444 (not 8443) — nvr-api already owns 8443 on this host.
+:8444 {
+	tls /certs/server.crt /certs/server.key
+	reverse_proxy 127.0.0.1:8085 {
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-Port 8444
+	}
+}

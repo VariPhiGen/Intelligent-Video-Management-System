@@ -1,0 +1,196 @@
+# Third-party attribution — keeping THIRD-PARTY-NOTICES.md honest.
+#
+# DELIBERATELY NOT a "rebuild the images and diff on every PR" check.
+#
+# The base images are moving tags (python:3.11-slim, python:3.12-slim,
+# node:22-slim), so the same Dockerfile produces different package contents on
+# different days. A PR job that rebuilt and compared would go red whenever Debian
+# shipped an unrelated package update — failing on changes that had nothing to do
+# with it. A check that fails for reasons outside the author's change is one
+# people learn to ignore, which is worse than no check at all.
+#
+# So the work is split by what each moment can actually prove:
+#
+#   remind   (pull_request)      cheap, no Docker, no false positives. Catches
+#                                the common human error: bumping a dependency and
+#                                forgetting the notices.
+#   drift    (schedule)          rebuilds weekly and reports base-image drift as
+#                                its own signal, where it belongs, instead of
+#                                inside someone else's pull request.
+#   verify   (workflow_call)     the real one. A release must call this: it is
+#                                the only point where the file can be correct BY
+#                                CONSTRUCTION, because it describes the exact
+#                                images being published.
+#
+# See NOTICE §2 — the written offer obliges us to reproduce the source we
+# shipped. That is only possible if releases pin base images by digest.
+
+name: Third-party notices
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: "17 4 * * 1"      # Mondays, early — drift is not urgent
+  workflow_call:               # for the release workflow to invoke
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Cheap reminder — seconds, no images built ─────────────────────────────
+  remind:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Dependency changes must be reflected in the notices
+        run: |
+          set -euo pipefail
+          base="origin/${GITHUB_BASE_REF}"
+          git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}" || true
+
+          changed=$(git diff --name-only "${base}...HEAD" || true)
+
+          # Files that can change what a published image contains.
+          deps=$(printf '%s\n' "$changed" | grep -E \
+            'Dockerfile|requirements\.txt$|package-lock\.json$|package\.json$' || true)
+
+          if [ -z "$deps" ]; then
+            echo "No dependency-defining files touched — nothing to check."
+            exit 0
+          fi
+
+          echo "Dependency-defining files changed:"
+          printf '  %s\n' $deps
+
+          if printf '%s\n' "$changed" | grep -qx 'THIRD-PARTY-NOTICES.md'; then
+            echo "THIRD-PARTY-NOTICES.md was updated too."
+            exit 0
+          fi
+
+          # ── The one exemption: a frontend devDependency ──────────────────
+          # The SPA is built in a throwaway stage and only `dist/` crosses into
+          # the runtime image (Dockerfile.backend), so node and every
+          # devDependency — vitest, jsdom, Testing Library, typescript — are
+          # discarded with it. Adding a test framework cannot change what the
+          # notices describe, and failing the PR for it is this job going red
+          # for a reason outside the author's change: the thing the header of
+          # this file says a check must never do.
+          #
+          # NOT a trust of the `devDependencies` block. A lockfile can move a
+          # TRANSITIVE runtime version with no package.json edit at all, and
+          # that does change the image. So the exemption is granted only when
+          # the runtime CLOSURE of the lockfile is byte-identical across the
+          # merge base — computed by scripts/npm_runtime_closure.py, which
+          # reads the lock's own dev markers. Anything that ships differently,
+          # in any direction, falls straight through to the failure below.
+          #
+          # Deliberately narrow: it applies only when the frontend node files
+          # are the ONLY dependency-defining files touched. A Dockerfile or a
+          # requirements.txt in the same PR keeps the strict path.
+          others=$(printf '%s\n' "$deps" | grep -vE \
+            '^frontend-react/package(-lock)?\.json$' || true)
+
+          if [ -z "$others" ]; then
+            echo "Only the frontend node manifests changed — comparing the runtime closure."
+            if git show "${base}:frontend-react/package-lock.json" \
+                 > /tmp/base-lock.json 2>/dev/null; then
+              python3 scripts/npm_runtime_closure.py < /tmp/base-lock.json > /tmp/base-closure.txt
+              python3 scripts/npm_runtime_closure.py < frontend-react/package-lock.json > /tmp/head-closure.txt
+              if diff -u /tmp/base-closure.txt /tmp/head-closure.txt > /tmp/closure.diff; then
+                echo "Runtime closure unchanged — devDependency-only change, notices unaffected."
+                exit 0
+              fi
+              echo "Runtime dependencies changed:"
+              cat /tmp/closure.diff
+            else
+              echo "No lockfile on the base revision — cannot prove the closure is unchanged."
+            fi
+          fi
+
+          cat >&2 <<'MSG'
+
+          These changes can alter what a published image contains, but
+          THIRD-PARTY-NOTICES.md was not updated.
+
+          Regenerate it (requires Docker and ALL the shipped images — the
+          generator refuses to write a partial file if any is missing):
+
+              ./vms build api nvr motion frames analytics smartsearch
+              scripts/gen-notice.sh
+
+          If the regenerated file is genuinely identical, commit nothing and say
+          so on the PR — this job cannot tell "unchanged" from "not run".
+          MSG
+          exit 1
+
+  # ── The real verification — builds what would actually ship ───────────────
+  verify:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ALL SIX SHIPPED IMAGES. This built three until 2026-09-09, which meant
+      # the "real" verification was blind to exactly the same services
+      # gen-notice.sh was: analytics (ultralytics, AGPL-3.0), frames and
+      # smartsearch (torch). A check that shares the generator's blind spot
+      # cannot catch the generator's mistake. gen-notice.sh now refuses outright
+      # if any of them is missing, so this list and its IMAGES list have to
+      # agree or the job fails loudly rather than under-reporting.
+      - name: Build the service images
+        run: |
+          set -euo pipefail
+          docker build -t variphi-vms-api         -f services/camera-mgmt/Dockerfile.backend .
+          docker build -t variphi-vms-nvr         -f services/nvr/Dockerfile         services/nvr
+          docker build -t variphi-vms-motion      -f services/motion/Dockerfile      services/motion
+          docker build -t variphi-vms-frames      -f services/frames/Dockerfile      services/frames
+          docker build -t variphi-vms-analytics   -f services/analytics/Dockerfile   services/analytics
+          docker build -t variphi-vms-smartsearch -f services/smartsearch/Dockerfile services/smartsearch
+
+      # gen-notice.sh refuses outright if any image carries an ffmpeg built
+      # --enable-nonfree. That is not an attribution problem: such a binary
+      # cannot be redistributed at all. Failing the build is the point.
+      - name: Regenerate notices
+        run: scripts/gen-notice.sh
+
+      - name: Report drift
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- THIRD-PARTY-NOTICES.md; then
+            echo "Notices match the freshly built images."
+          else
+            echo "::warning::THIRD-PARTY-NOTICES.md drifted from a fresh build."
+            git diff --stat -- THIRD-PARTY-NOTICES.md
+            echo "--- first 60 lines of the diff ---"
+            git diff -- THIRD-PARTY-NOTICES.md | head -60
+          fi
+
+      - name: Flag components with no determinable licence
+        run: |
+          set -euo pipefail
+          # MATCH INVENTORY ROWS ONLY. The plain string `| UNDETERMINED |` also
+          # occurs in the "Licence families" summary table, so the old count was
+          # always one too high — it reported 2 when a single component (
+          # setuptools) was actually unresolved. A check that overstates is
+          # still a check people learn to discount, so it is pinned to the row
+          # shape: a backticked component name in the first column.
+          n=$(grep -cE '^\| `[^`]+` \|.*\| UNDETERMINED \|' THIRD-PARTY-NOTICES.md || true)
+          echo "UNDETERMINED components: ${n}"
+          # Surfaced, not fatal. These need a human to look up a licence, which
+          # is not something a release should block on at 3am — but it must never
+          # be silent either.
+          [ "${n}" -eq 0 ] || echo "::warning::${n} component(s) have no determinable licence — resolve before publishing"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: |
+            NOTICE
+            THIRD-PARTY-NOTICES.md
+          if-no-files-found: error

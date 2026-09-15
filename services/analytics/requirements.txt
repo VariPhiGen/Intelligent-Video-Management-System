@@ -1,0 +1,29 @@
+fastapi==0.115.5
+# Frame-broker notices only — frames themselves travel through shared memory,
+# never through this. Same pin as camera-mgmt, services/frames and smartsearch.
+redis==5.2.1
+uvicorn[standard]==0.32.1
+pyyaml>=6.0,<7
+opencv-python-headless>=4.9,<4.12
+numpy>=1.26,<3
+pillow>=10,<12
+# Object detection. AGPL-3.0 — compatible only while this ships in tier 1. See
+# the note at the top of analytics/detector.py before moving this feature
+# behind a paid tier.
+ultralytics>=8.3,<9
+# CPU inference for the detector, and the toolchain that builds its artifact.
+# THE DEFAULT ON A CPU DEPLOYMENT, because it is measurably the fastest thing
+# here: on live 1920x1080 camera frames, p50 17.6 ms against torch's 40.8 ms
+# and a p95 (21.8 ms) better than torch's median.
+openvino>=2024.0
+onnx>=1.16
+onnxslim>=0.1.30
+# Plate recognition. MIT and ONNX (~3 MB), deliberately NOT the AGPL half.
+fast-plate-ocr[onnx]>=1.1,<2
+# Plate DETECTION — the open-baseline localiser (same author, MIT, ONNX).
+open-image-models>=0.2,<1
+
+# NOT HERE, AND THAT IS THE POINT OF THE SPLIT:
+#   open_clip_torch   the CLIP encoder is Smart Search's job. This service
+#                     produces crops; it never embeds them.
+#   psycopg           this service writes no rows. Smart Search owns the store.

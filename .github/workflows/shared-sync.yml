@@ -1,0 +1,51 @@
+# One owner per shared module — keeping the vendored copies honest.
+#
+# There is exactly one motion implementation: services/frames/broker/motion.py.
+# Three services run it, and each builds from its own directory as its Docker
+# context, so none can import a file outside itself. The file is therefore
+# COPIED into the two consumers by scripts/sync_shared.py, and a copy that
+# drifts is the duplication this replaced quietly coming back — two
+# implementations that agree until one of them is tuned.
+#
+# DELIBERATELY THE CHEAP HALF OF THE GUARD. This is a file comparison: no
+# Docker, no models, seconds, and it cannot produce a false positive, because
+# the only way it fails is that a tracked file differs from its source.
+#
+# The half that matters is elsewhere and needs nothing from CI: each service
+# carries tests/golden_motion.json — what the ORIGINAL implementations produced
+# on 220 deterministic frames, captured before they were replaced — and
+# replays it in its own suite. That catches a copy that drifts in BEHAVIOUR,
+# in the container that ships it. This job catches it one step earlier, when
+# it is still a one-line fix.
+name: shared-sync
+
+on:
+  pull_request:
+    paths:
+      - "services/frames/broker/motion.py"
+      - "services/frames/tests/golden_frames.py"
+      - "services/frames/tests/golden_motion.json"
+      - "services/smartsearch/index/canonical_motion.py"
+      - "services/smartsearch/index/backends.py"
+      - "services/smartsearch/index/hardware.py"
+      - "services/analytics/analytics/*.py"
+      - "services/*/tests/golden_*"
+      - "scripts/sync_shared.py"
+      - ".github/workflows/shared-sync.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # No dependencies on purpose: sync_motion.py is stdlib only, so this job
+      # cannot go red because a wheel moved.
+      - name: Vendored copies match their source
+        run: python3 scripts/sync_shared.py --check

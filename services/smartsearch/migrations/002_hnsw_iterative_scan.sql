@@ -1,0 +1,31 @@
+-- 002 — make filtered vector search return the rows it is supposed to.
+--
+-- THIS IS A CORRECTNESS FIX, not a tuning knob.
+--
+-- Every real query is scoped: the API refuses to search unscoped, so the hot
+-- path is always `ORDER BY embedding <=> $q WHERE sensor_id = ANY($cameras)`.
+-- With HNSW that is POST-filtering — the index yields ef_search (default 40)
+-- candidates by distance, and only then is the camera filter applied. If none
+-- of those 40 belong to the requested cameras, the query returns NOTHING and
+-- reports success.
+--
+-- Measured on this database, 100,068 rows, filter selecting 5 of 21 cameras:
+--
+--   iterative_scan = off       ->  0 rows   (40 scanned, 40 filtered away)
+--   iterative_scan = relaxed   -> 24 rows   (179 scanned, 155 filtered away)
+--
+-- Zero results from a search that should have returned a full page is the worst
+-- shape a defect can take here: it looks exactly like "this person was never
+-- recorded", which is the answer an operator acts on.
+--
+-- Set on the DATABASE rather than by the client, so a new connection, a psql
+-- session or a future code path cannot silently opt out of correctness.
+-- relaxed_order (not strict_order): results may be slightly out of distance
+-- order at the tail, which costs nothing here because the API re-ranks and
+-- score-thresholds on its own side anyway.
+ALTER DATABASE smartsearch SET hnsw.iterative_scan = relaxed_order;
+
+-- Bound the extra work an iterative scan may do before giving up. The default
+-- (20000) is fine for this corpus; named here so it is visible and versioned
+-- rather than inherited silently.
+ALTER DATABASE smartsearch SET hnsw.max_scan_tuples = 20000;

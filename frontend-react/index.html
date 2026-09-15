@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Substituted at build time by the brandHtml() plugin in vite.config.ts,
+       from the same VITE_BRAND_NAME that drives BRAND.name. Static HTML cannot
+       read a TS constant, so this placeholder is how the tab title stays in
+       step with the rest of the app. -->
+  <title>%VITE_BRAND_NAME% · Camera Management</title>
+  <script>/* pre-paint theme restore — avoids a light flash for dark-theme users.
+    localStorage is this origin's own memory; the vms-theme cookie is the shared
+    channel with the login page, so honour it when localStorage is empty (e.g.
+    the theme was last chosen on the login screen). Default light. */
+    try {
+      var t = localStorage.getItem('vms-theme');
+      if (!t) { var m = document.cookie.match(/(?:^|;\s*)vms-theme=(dark|light)(?:;|$)/); if (m) t = m[1]; }
+      document.documentElement.dataset.theme = t || 'light';
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

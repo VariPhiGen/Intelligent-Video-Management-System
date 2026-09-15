@@ -1,0 +1,45 @@
+# Variphi VMS appliance — boot unit.
+#
+# Why this exists: compose's `restart: unless-stopped` restarts a container that
+# *crashed*, but it does NOT retry a container that FAILED TO START. A start
+# failure leaves the container Exited and Docker never touches it again — not on
+# the next boot either, because Docker only auto-starts containers that were
+# running when the daemon last stopped. One bad boot and the appliance stays
+# down until a human runs `./vms up -d`.
+#
+# That is not hypothetical: it happened on 2026-08-26. Docker loaded containers
+# before the NVIDIA CDI spec existed, `api` failed with "CDI device injection
+# failed: unresolvable CDI devices nvidia.com/gpu=all" (exit 255), and it stayed
+# dead across two further reboots. Recording continued; the API, the UI and
+# every schedule did not.
+#
+# `up -d` is idempotent: it starts what is down, leaves what is healthy running,
+# and recreates only what the compose config actually changed. Ordering after
+# nvidia-cdi-refresh.service closes the specific race; running at all closes the
+# general one, whatever the cause of a failed start.
+#
+# NOTE: this deliberately overrides a manual `docker stop`. On an appliance
+# whose job is to be recording, "it is booted, therefore it is running" is the
+# correct rule. Use `systemctl stop vms` to take the stack down for real.
+
+[Unit]
+Description=Variphi VMS appliance (docker compose stack)
+Requires=docker.service
+After=docker.service
+# Ordering only — Wants, not Requires: a CPU-only box has no such unit and must
+# still boot the stack. `./vms` detects the absence of a GPU on its own.
+After=nvidia-cdi-refresh.service
+Wants=nvidia-cdi-refresh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@VMS_DIR@
+ExecStart=@VMS_DIR@/vms up -d
+ExecStop=@VMS_DIR@/vms stop
+# Pulling images on a cold first boot is slow and must not be killed halfway.
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

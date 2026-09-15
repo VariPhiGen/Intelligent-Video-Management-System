@@ -1,0 +1,55 @@
+# What the suites need to RUN — deliberately not what the services need to work.
+#
+# Four of the six services (analytics, frames, motion, smartsearch) declare heavy
+# inference dependencies: ultralytics, openvino, onnx, open_clip_torch (torch).
+# Installing those to run the tests would cost gigabytes and several minutes on
+# every pull request, and it would buy exactly two tests — the ones that call
+# `pytest.importorskip("torch")` and skip themselves when it is absent.
+#
+# It would also make the job fragile in the way this repository has already
+# decided it will not tolerate (see notices.yml: "A check that fails for reasons
+# outside the author's change is one people learn to ignore"). Those four
+# services pin their ML dependencies as RANGES, so a full install resolves
+# differently from one day to the next and can go red on a PR that touched
+# nothing near it.
+#
+# So the PR job installs this file, and a scheduled job installs the real
+# requirements weekly, where resolver drift is its own signal instead of
+# somebody else's build failure.
+#
+# camera-mgmt and nvr are NOT covered here — their requirements.txt is pinned
+# exactly and carries no ML, so their jobs install the real thing and this file
+# would only be a second copy to drift.
+#
+# Verified 2026-09-10: with this set,
+#   analytics 160 passed / 1 skipped   frames  57 passed
+#   motion     19 passed               smartsearch 298 passed / 1 skipped
+# The skips are the torch-gated tests, and they are the whole trade.
+#
+# Local use, if you don't want the full service environments:
+#   python -m pip install -r tests/requirements-test.txt
+
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
+
+# Version ranges below are copied from the services' own requirements.txt on
+# purpose — a narrower pin here could resolve to something the service forbids.
+pyyaml>=6.0,<7
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<4.12
+pillow>=10,<12
+psycopg[binary,pool]>=3.1,<4
+
+# The HTTP layer of smartsearch's own API, driven in-process by
+# `fastapi.testclient.TestClient` — no server, no port, no network.
+#
+# `python-multipart` is NOT optional here and its absence does not look like a
+# missing dependency. FastAPI needs it to parse a multipart body, and without it
+# `POST /observations` — the ingest endpoint, the only multipart route in the
+# product — answers 500 instead of the 422 the validation tests assert. Every
+# one of those tests then fails with a status-code mismatch that reads like a
+# product regression. Installed here rather than left to the service's own
+# requirements because this file is what the pull-request job installs.
+fastapi==0.115.5
+httpx>=0.27,<0.29
+python-multipart>=0.0.9,<0.1

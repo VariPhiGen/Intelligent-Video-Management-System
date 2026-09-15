@@ -1,0 +1,59 @@
+# Motion service defaults. Cameras are NOT configured here — the camera-mgmt
+# registry pushes them at runtime (POST /cameras/{slug}) and re-asserts them
+# via its reconcile loop, exactly like the NVR.
+
+detection:
+  sample_interval_seconds: 0.5      # decode + compare cadence (2 fps analysis)
+  noise_floor_threshold: 10         # pixel diffs <= this are zeroed (sensor noise)
+  confirm_window_seconds: 3.0       # rolling window for sustained-motion check
+  confirm_ratio: 0.6                # fraction of window samples that must show motion
+  retrigger_cooldown_seconds: 30    # TRIGGERED auto re-arms after this; 0 = sticky
+  # Sensitivity presets = pixel_change_threshold (fraction of changed pixels).
+  # Lower threshold = more sensitive. See SETUP notes in the original gateway
+  # for environment-by-environment guidance.
+  sensitivity_presets:
+    low: 0.015
+    medium: 0.005
+    high: 0.002
+  default_sensitivity: medium
+
+capture:
+  frame_width: 320                  # analysis resolution (not the stream's)
+  frame_height: 180
+  rtsp_buffer_size: 1
+  open_timeout_ms: 5000
+  read_timeout_ms: 5000
+  reconnect_backoff_initial_seconds: 2.0
+  reconnect_backoff_max_seconds: 60.0
+
+source:
+  # Where the motion signal comes from.
+  #
+  #   capture  open our own RTSP session per camera and difference the frames
+  #            ourselves. What has always shipped, and the default.
+  #   broker   take the changed-pixel fraction the vms_frames service already
+  #            computed, on a frame it decoded ONCE for every consumer.
+  #
+  # EVENT SEMANTICS ARE IDENTICAL EITHER WAY. Both paths call the same
+  # worker.apply_feature: same 3 s confirmation window, same 60% ratio, same
+  # TRIGGERED/MONITORING machine, same 30 s cooldown, same Events API. Only
+  # where `feature` comes from changes.
+  #
+  # THIS SERVICE NEVER NEEDS PIXELS, which is why broker mode needs no shared
+  # memory and no IPC namespace — unlike SmartSearch, which crops and embeds
+  # frames. One float per sample was always all this service used, and paying
+  # a full 1080p decode to produce it was the duplication being removed.
+  #
+  # Only set broker with the frames service running: with no notices this
+  # service reports CONNECTING and raises nothing, which is the honest failure
+  # for something whose job is to say when it saw movement.
+  frame_source: capture
+  broker_url: "redis://127.0.0.1:6379/0"     # overridden by REDIS_URL
+  broker_channel_prefix: "vms.frames"
+
+api:
+  host: "127.0.0.1"                 # loopback: reached only via the api proxy
+  port: 8012
+
+logging:
+  level: "INFO"                     # DEBUG logs per-sample pixel_feature values

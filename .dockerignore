@@ -1,0 +1,21 @@
+# Build context for the api image (services/camera-mgmt/Dockerfile.backend) is
+# the repo root — keep the context down to what that image actually copies:
+# services/camera-mgmt/{requirements.txt,alembic.ini,migrations,backend} and
+# frontend/. Everything else (product infra, ops scripts, sibling services)
+# stays out of the context.
+.git
+docs
+*.md
+# Secrets must never enter the build context (compose injects env at runtime).
+.env
+*/**/.env
+deploy
+scripts
+services/nvr
+services/camera-mgmt/scripts
+
+# React workspace: the ui-build stage needs sources but never node_modules or
+# a stale local dist (both are rebuilt inside the stage).
+frontend-react/node_modules
+frontend-react/dist
+services/motion

@@ -1,0 +1,25 @@
+# Scoped to the NVR tree on purpose — these patterns are dangerous at the repo
+# root (*.ts would ignore TypeScript, *.jpg would ignore image assets).
+# Generic Python/IDE/env ignores live in the root .gitignore.
+
+# ─── Recording data ───────────────────────────────────────────────────────────
+# Never commit recorded footage or the segment index.
+/data/
+*.ts
+*.db
+*.db-wal
+*.db-shm
+segments.csv
+nvr-data/
+
+# Extracted clips and snapshots (runtime-generated)
+clips/
+*.mp4
+*.jpg
+*.jpeg
+
+# ─── Camera configuration ─────────────────────────────────────────────────────
+# In the Variphi product, config/cameras.yaml is TRACKED: it contains no
+# credentials (cameras: [] — the registry sync owns cameras at runtime, using
+# credential-free relay URLs). The container mounts this dir and crashes
+# without the file, so it must ship with the repo.

@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MediaMTX v1.9.x Configuration
+# Runtime path management is done via the REST API (port 9987).
+# Paths added via the API are NOT persisted here — they live in PostgreSQL and
+# are re-registered by the FastAPI startup event after every restart.
+# ─────────────────────────────────────────────────────────────────────────────
+
+logLevel: info
+logDestinations: [stdout]
+
+# ── Runtime REST API ─────────────────────────────────────────────────────────
+# NOTE: non-default ports (9987/9988, 8654, 8988) so this MediaMTX can coexist
+# with another instance (e.g. nvr-mediamtx) already holding 9997/9998/8554/8888
+# on the host. Keep MEDIAMTX_API_URL, RTSP_PORT, and the SPA's HLS_PORT in sync.
+#
+# Bound to loopback: the control API mutates the relay (add/remove/redirect
+# paths) and its only caller is this appliance's camera-mgmt backend over
+# 127.0.0.1. Left on all interfaces it let anyone on the LAN reconfigure the
+# relay (a DPDP Rule 6 access-control failure — the port bind is the fix, the
+# auth block below is defence in depth).
+api: yes
+apiAddress: 127.0.0.1:9987
+
+# ── Metrics (Prometheus) ─────────────────────────────────────────────────────
+# Loopback only: metrics leak the live camera/path inventory. A host-local
+# Prometheus scrapes 127.0.0.1; nothing off-box has any business reading them.
+metrics: yes
+metricsAddress: 127.0.0.1:9988
+
+# ── Authentication ───────────────────────────────────────────────────────────
+# Valid values: internal | http | jwt  (verified on v1.9.1)
+#
+# Two entries, matched by source IP (empty `ips` = any):
+#  1. Loopback service account — every real consumer (NVR recorder, motion,
+#     DeepStream, and this API's relay-control + HLS proxy) runs on the same
+#     appliance and connects over 127.0.0.1. Full access, loopback only.
+#  2. Anonymous LAN — read/playback only, for the browser's HLS live preview.
+#     RTSP/RTSPS/API/metrics are bound to loopback above, so this grant can
+#     physically only reach the HLS port (a low-rate preview) — never the
+#     full-rate RTSP stream or the control API.
+# The loopback entry is listed first so same-host requests match it (and its
+# wider permissions) before the anonymous fallback.
+#
+# 172.16.0.0/12 (Docker bridge range) is in the full-access list ONLY for the
+# macOS/Windows Docker-Desktop bridge overlay (docker-compose.bridge.yml), where
+# the API/NVR/motion containers reach mediamtx over the vms_internal bridge, not
+# loopback. On Linux (base file, host networking) every listener below is bound
+# to 127.0.0.1, so a 172.x source can never open the socket — the CIDR is inert
+# there and changes nothing about the audited loopback posture.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: [127.0.0.1/8, '::1/128', 172.16.0.0/12]
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+      - action: api
+        path:
+      - action: metrics
+        path:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+        path:
+      - action: playback
+        path:
+
+# ── RTSP ─────────────────────────────────────────────────────────────────────
+# Loopback only: RTSP carries the full-rate camera stream. Every legitimate
+# reader (NVR recorder, motion, DeepStream) runs on this appliance and pulls
+# from 127.0.0.1 (nvr_record_host / DeepStream's local_rtsp_url both resolve to
+# loopback on the single-box deployment). Binding here removes the LAN attack
+# surface entirely — an off-box client cannot even open the socket, let alone
+# pull 1080p footage unauthenticated. Operators who need RTSP off-box should go
+# through an authenticated, TLS-terminated path, not a raw open port.
+rtsp: yes
+protocols: [tcp, udp, multicast]
+rtspAddress: 127.0.0.1:8654
+rtspsAddress: 127.0.0.1:8322
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+
+# ── HLS (useful for browser thumbnails and live preview) ─────────────────────
+hls: yes
+hlsAddress: :8988
+hlsAlwaysRemux: no
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50M
+hlsAllowOrigin: "*"
+
+# ── WebRTC (disabled) ────────────────────────────────────────────────────────
+webrtc: no
+
+# ── SRT (disabled) ───────────────────────────────────────────────────────────
+srt: no
+
+# ── RTMP (disabled) ──────────────────────────────────────────────────────────
+rtmp: no
+
+# ── Path defaults — applied to all dynamically added paths ──────────────────
+# Individual paths are added at runtime via POST /v3/config/paths/add/{name}.
+# They inherit these defaults unless overridden in the API call.
+paths: {}

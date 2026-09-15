@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# vms — docker compose wrapper that picks the right network stack for this host.
+#
+#   ./vms up -d          ./vms ps          ./vms logs -f api      (any compose args)
+#
+# Why: the base compose uses network_mode: host (required on Linux for ONVIF
+# WS-Discovery multicast and zero-NAT RTSP), but under Docker Desktop
+# (macOS / Windows / Docker Desktop for Linux) "host" is a hidden Linux VM the
+# browser can't reach — those hosts need the bridge overlay instead.
+#
+# Detection keys off the DAEMON, not the OS: `docker info` reports
+# "Docker Desktop" for the VM-based engine and the distro name for a native
+# Linux engine. Override with VMS_NETWORK=host|bridge if ever needed.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+mode="${VMS_NETWORK:-auto}"
+if [ "$mode" = "auto" ]; then
+  os="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
+  case "$os" in
+    *"Docker Desktop"*) mode=bridge ;;
+    "")
+      echo "vms: docker daemon not reachable — is Docker running?" >&2
+      exit 1
+      ;;
+    *) mode=host ;;
+  esac
+fi
+
+files=(-f docker-compose.yml)
+if [ "$mode" = "bridge" ]; then
+  files+=(-f docker-compose.bridge.yml)
+elif [ "$mode" != "host" ]; then
+  echo "vms: VMS_NETWORK must be 'host' or 'bridge' (got '$mode')" >&2
+  exit 1
+fi
+
+# GPU overlay — same conditional-composition trick as the network mode above.
+# Keyed off the DAEMON's capabilities, not the host having a card: what decides
+# whether `api` can start with a device reservation is the NVIDIA container
+# toolkit being installed, and a box can have a GPU without it. Without the
+# overlay the API reports "no GPU" and the topbar hides the gauge.
+#
+# Two GPU paths, tried in order:
+#   cdi    — devices declared in the OCI spec; survives `systemctl daemon-reload`
+#            (see docker-compose.gpu-cdi.yml for why that matters)
+#   legacy — nvidia runtime hook; works on older docker/toolkit but loses GPU
+#            access on the next daemon-reload until the container is recreated
+gpu="${VMS_GPU:-auto}"
+if [ "$gpu" = "auto" ]; then
+  gpu=off
+  # CDI first: the daemon advertises its spec dirs only when it supports CDI,
+  # and a dir only contains an nvidia.com/gpu spec if the toolkit generated
+  # one for an actual card (nvidia-cdi-refresh keeps it current across boots
+  # and driver upgrades).
+  for d in $(docker info --format '{{range .CDISpecDirs}}{{println .}}{{end}}' 2>/dev/null); do
+    if grep -qs 'nvidia.com/gpu' "$d"/*.yaml "$d"/*.json 2>/dev/null; then
+      gpu=cdi
+      break
+    fi
+  done
+  if [ "$gpu" = "off" ] && docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
+    gpu=legacy
+  fi
+fi
+case "$gpu" in
+  cdi) files+=(-f docker-compose.gpu-cdi.yml) ;;
+  legacy | on) files+=(-f docker-compose.gpu.yml) ;;  # "on" = old name, kept working
+  off) ;;
+  *)
+    echo "vms: VMS_GPU must be 'cdi', 'legacy', 'on', 'off' or 'auto' (got '$gpu')" >&2
+    exit 1
+    ;;
+esac
+
+# ── Overlays follow the profiles, so one command does the whole job ──────────
+# Passing these by hand is where deployments go wrong, and both failures are
+# silent. Layer the broker overlay but forget the analytics one and analytics
+# detects with nowhere to send, so the index stops growing while every
+# container reports healthy. Forget them on `down` and containers are left
+# behind holding the network, breaking the next `up` with "network not found".
+#
+# COMPOSE_PROFILES in .env decides which services exist; these decide how they
+# are wired, so reading the profiles is the honest way to pick them. Set
+# VMS_NO_OVERLAYS=1 to opt out and pass -f yourself.
+if [ -z "${VMS_NO_OVERLAYS:-}" ]; then
+  _profiles="${COMPOSE_PROFILES:-}"
+  if [ -z "$_profiles" ] && [ -f .env ]; then
+    _profiles=$(sed -n 's/^[[:space:]]*COMPOSE_PROFILES[[:space:]]*=[[:space:]]*//p' .env | head -1)
+  fi
+  # The broker overlay points the motion service at vms_frames rather than its
+  # own decoder. Only meaningful when the frames service runs.
+  case ",$_profiles," in
+    *,frames,*)
+      [ -f docker-compose.broker.yml ] && files+=(-f docker-compose.broker.yml) ;;
+  esac
+  # The analytics overlay hands analytics a sink URL. WITHOUT IT ANALYTICS
+  # PRODUCES NOTHING, which is the outage this guard exists to prevent.
+  case ",$_profiles," in
+    *,analytics,*)
+      [ -f docker-compose.analytics.yml ] && files+=(-f docker-compose.analytics.yml) ;;
+  esac
+fi
+
+echo "vms: network mode = $mode, gpu = $gpu" >&2
+
+# ── Boot-resilience preflight (CDI hosts only) ──────────────────────────────
+# The toolkit's nvidia-cdi-refresh.service writes the CDI spec to
+# /var/run/cdi/nvidia.yaml — tmpfs, wiped every boot — and is ordered
+# `After=multi-user.target`. docker.service is WantedBy that same target, so
+# the refresh is GUARANTEED to run after dockerd has already tried to restart
+# containers. dockerd then logs "CDI directory does not exist, skipping" and
+# every container holding a CDI device reservation dies with
+#   CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all
+# Worse, `restart: unless-stopped` does NOT retry a container that failed to
+# START, so it stays dead until a human runs `./vms up -d` — across reboots.
+# Measured on the reference appliance: 5 boots, 5 failures, 0 recoveries.
+#
+# The fix is to keep the spec in /etc/cdi (on disk, one of dockerd's two
+# default spec dirs), which NVIDIA supports directly via
+# NVIDIA_CTK_CDI_OUTPUT_FILE_PATH. That needs root exactly once.
+#
+# This runs here rather than in a separate script the operator must know to
+# run, because README's whole install is "cp .env.example .env && ./vms up -d"
+# — anything outside that path is, in practice, never run.
+#   VMS_SKIP_PREFLIGHT=1  to bypass entirely.
+preflight_boot() {
+  [ "${VMS_SKIP_PREFLIGHT:-0}" = "1" ] && return 0
+  [ "$gpu" = "cdi" ] || return 0
+
+  local fixer; fixer="$(dirname "$0")/scripts/install-boot-resilience.sh"
+  [ -x "$fixer" ] || return 0
+
+  # A persistent spec means the race is already closed. The other half
+  # (vms.service) is opt-in and documented in the README quick start, so don't
+  # nag about it on every `up` once the hard failure is gone.
+  if compgen -G "/etc/cdi/*.yaml" >/dev/null 2>&1 \
+     || compgen -G "/etc/cdi/*.json" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Already privileged, or can become so without asking: close the race outright
+  # but install ONLY the spec fix. Writing one file is not the same commitment as
+  # a systemd unit that takes over the stack's lifecycle, and an unattended run
+  # has nobody to ask. The unit stays a deliberate choice.
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "vms: CDI spec is on tmpfs — making it persistent" >&2
+    "$fixer" --cdi-only >&2 || true
+    return 0
+  fi
+  if sudo -n true 2>/dev/null; then
+    echo "vms: CDI spec is on tmpfs — making it persistent" >&2
+    sudo "$fixer" --cdi-only >&2 || true
+    return 0
+  fi
+
+  cat >&2 <<'WARN'
+
+  ┌─ vms: this host will not survive a reboot ────────────────────────────────
+  │ The NVIDIA CDI spec lives on tmpfs and is regenerated AFTER dockerd starts,
+  │ so at the next boot every container holding a GPU reservation fails with
+  │ "CDI device injection failed" — and a failed START is never retried, so it
+  │ stays down until someone runs `./vms up -d` by hand.
+  │
+  │ Two fixes, both one-time and neither restarts anything running:
+  │   --cdi-only  persistent /etc/cdi spec — closes exactly this race
+  │   --all       the above, plus vms.service, which re-runs `up -d` at boot so
+  │               ANY failed start recovers, not just this one
+  │
+  │ Manually:  sudo scripts/install-boot-resilience.sh --all
+  │ Silence:   VMS_SKIP_PREFLIGHT=1
+  └───────────────────────────────────────────────────────────────────────────
+WARN
+
+  if [ -t 0 ] && [ -t 2 ]; then
+    local reply=""
+    read -r -p "  Install both now with sudo? [Y/n/c=cdi-only] " reply </dev/tty || true
+    case "${reply:-Y}" in
+      [Yy]* | "") sudo "$fixer" --all >&2 || true ;;
+      [Cc]*)      sudo "$fixer" --cdi-only >&2 || true ;;
+      *)          echo "  skipped — see \"Boot resilience\" in the README" >&2 ;;
+    esac
+  fi
+}
+
+# ── First-run bootstrap ─────────────────────────────────────────────────────
+# README's quickstart is `cp -n .env.example .env && ./vms up -d`. That stopped
+# working: backend/main.py now refuses to boot when dev_auth=False and any of
+# INTERNAL_API_KEY / DISCOVERY_SECRET_KEY / KEYCLOAK_ADMIN_PASSWORD is still at a
+# shipped default — and .env.example ships all three as placeholders. So a clean
+# clone crash-looped on the very first command, which is the worst possible place
+# for a project to fail a newcomer.
+#
+# Rather than weaken the guard (the alternative was DEV_AUTH=true by default,
+# which makes every caller a full admin on a video recorder), generate real
+# secrets here. gen-secrets.sh --fresh verifies there are no stored camera
+# credentials before touching DISCOVERY_SECRET_KEY, and refuses otherwise.
+bootstrap_env() {
+  [ -f .env ] && return 0
+  [ -f .env.example ] || { echo "vms: no .env and no .env.example — wrong directory?" >&2; exit 1; }
+
+  echo "vms: first run — creating .env from .env.example" >&2
+  cp .env.example .env
+  chmod 600 .env
+
+  if [ ! -x scripts/gen-secrets.sh ]; then
+    echo "vms: WARNING scripts/gen-secrets.sh missing; .env still holds placeholder" >&2
+    echo "vms:         secrets and the api will refuse to start." >&2
+    return 0
+  fi
+
+  echo "vms: generating secrets (the shipped defaults are refused at startup)" >&2
+  if ! scripts/gen-secrets.sh --fresh; then
+    # Only reachable if .env vanished from an appliance that already has data —
+    # exactly the case where silently generating a new key destroys credentials.
+    echo "vms:" >&2
+    echo "vms: could not generate secrets safely. .env has been created from the" >&2
+    echo "vms: example but still holds placeholders, so the api will not start." >&2
+    echo "vms: This machine appears to have existing data — see the message above" >&2
+    echo "vms: and use scripts/rotate-secrets.sh instead." >&2
+    exit 1
+  fi
+}
+
+# Which compose subcommand is this? SCANNED, not read from $1: compose's global
+# flags come BEFORE the subcommand (`./vms -p other up -d`, `./vms -f extra.yml
+# up`). Reading $1 meant any such invocation silently skipped BOTH the first-run
+# .env bootstrap and the boot-resilience preflight — a clean clone then
+# crash-looped on the secrets guard saying only that three secrets were at their
+# shipped defaults, with no hint that .env had never been created. Found by the
+# clean-box test on 2026-08-31, on the very failure mode bootstrap_env exists to
+# prevent.
+subcmd=""
+skip_next=0
+for a in "$@"; do
+  if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+  case "$a" in
+    # global flags that take a value — the next argument is not the subcommand
+    -f | --file | -p | --project-name | --profile | --project-directory \
+       | --env-file | --parallel | --progress | --ansi) skip_next=1 ;;
+    -*) ;;                       # valueless global flag
+    *) subcmd="$a"; break ;;
+  esac
+done
+
+case "$subcmd" in
+  up | start | restart) bootstrap_env; preflight_boot ;;
+esac
+
+exec docker compose "${files[@]}" "$@"

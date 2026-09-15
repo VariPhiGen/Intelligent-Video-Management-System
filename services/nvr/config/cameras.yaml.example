@@ -1,0 +1,29 @@
+# Smart NVR — Camera Configuration
+# Copy this file to cameras.yaml and fill in your real values.
+# cameras.yaml is gitignored to prevent RTSP credentials from being committed.
+
+cameras:
+  - name: entrance           # Must match nvr_camera_name in the DeepStream pipeline
+    rtsp_url: "rtsp://admin:password@192.168.1.10:554/Streaming/Channels/101"
+    retention_days: 7
+
+  - name: office-cam01
+    rtsp_url: "rtsp://admin:password@192.168.1.11:554/Streaming/Channels/101"
+    retention_days: 7
+
+  # Add more cameras here:
+  # - name: parking-lot
+  #   rtsp_url: "rtsp://admin:password@192.168.1.12:554/Streaming/Channels/101"
+  #   retention_days: 14
+
+recording:
+  segment_duration: 60         # seconds per segment file (1 440 files/day/camera)
+  storage_path: /data/nvr      # base path for recorded segments
+  clips_path: /data/nvr/clips  # temp path for extracted clips served via API
+  clip_ttl_minutes: 30         # auto-delete extracted clips after this many minutes
+
+ffmpeg:
+  rtsp_transport: tcp          # tcp is more reliable than udp for most LAN setups
+  reconnect_delay: 5           # base seconds before reconnecting after stream drop
+  max_reconnect_attempts: 0    # 0 = unlimited retries
+  loglevel: warning            # ffmpeg log verbosity: quiet / warning / info / debug

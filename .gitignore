@@ -1,0 +1,60 @@
+# ─── Local docs / notes (kept out of the repo) ────────────────────────────────
+/docs/
+services/camera-mgmt/docs/
+
+# ─── Environment / secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.secret
+certs/
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── IDE / OS / tooling ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Node / React frontend (frontend-react) ──────────────────────────────────
+# Dependencies restore via `npm ci` (package-lock.json is committed); the
+# production bundle is built inside the api image's node stage — neither
+# belongs in git.
+node_modules/
+frontend-react/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Playwright MCP scratch. NOT just noise: it accumulates real camera footage,
+# exported audit logs and compliance reports from UI testing.
+# It was staged by accident on 2026-08-27 by a `git add -A` whose pathspec
+# exclusion silently matched nothing because the shell was in a subdirectory.
+# Ignoring it removes the possibility rather than relying on remembering.
+.playwright-mcp/
+
+# Model weights: downloaded at runtime, never committed (see services/smartsearch).
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors

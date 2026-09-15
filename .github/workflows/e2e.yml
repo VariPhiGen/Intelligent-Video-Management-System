@@ -1,0 +1,159 @@
+# The J1-J9 browser journeys, on a schedule rather than on every pull request.
+#
+# WHY NOT ON PRs. The suite takes ~36 minutes against a fourteen-container
+# stack, needs exclusive use of host port 8988, and must run as a single
+# Playwright process against one clean appliance. None of that belongs on a
+# change-by-change gate — tests.yml stays fast and this runs nightly, with
+# workflow_dispatch for when someone wants it now.
+#
+# THE CONSTRAINTS BELOW ARE THE TEST, NOT PREFERENCES. They are set in
+# e2e/playwright.config.ts and e2e/.env.e2e and are NOT overridden here:
+#
+#   workers: 1, retries: 0, fullyParallel: false
+#       The journeys share one appliance. Parallel workers would fight over
+#       cameras, relay paths and recordings; retries would hide the flake
+#       instead of fixing it.
+#   one clean appliance
+#       up.sh pins the compose project name (vms-e2e) so the stack has its own
+#       containers, network and volumes, and down.sh -v cannot reach anything
+#       else. The concurrency group below is what stops two runs overlapping.
+#   no arbitrary sleeps
+#       up.sh waits on service state with a deadline; the specs use bounded
+#       expect.poll. Nothing here adds a sleep.
+#   synthetic cameras / ONVIF / WS-Discovery, real product services
+#       e2e/docker-compose.e2e.yml. DeepStream and Caddy are absent, no real
+#       customer cameras are involved, and nothing is published to the host
+#       except MediaMTX's HLS port, which the SPA hardcodes.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# KNOWN LIMITATION — READ BEFORE TRUSTING A FIRST RUN ON A HOSTED RUNNER
+#
+# Smart Search does not bake its model weights into the image. Its Dockerfile
+# says so explicitly ("Model weights are NOT baked in ... They download on first
+# run into this directory, which is a volume in compose"), and the same is true
+# of the plate localiser and OCR. On a developer appliance the `models` volume
+# is warm, so this is invisible. On a FRESH runner it is not: the first start
+# pulls CLIP plus the plate models — hundreds of MB — from Hugging Face and
+# download.pytorch.org before ingest is ready.
+#
+# That means this workflow, as written, needs outbound network on its first run
+# and is slower and more fragile than the rest of the suite. It has NOT yet been
+# executed on GitHub Actions; the suite has only run on a developer appliance.
+# Before relying on it, pick one:
+#
+#   • run it on a self-hosted runner whose `vms-e2e_models` volume is warm
+#     (fastest, and the closest match to how the suite is actually used);
+#   • cache the models volume between runs;
+#   • or publish a pre-warmed smartsearch image to GHCR and pull it here.
+#
+# Until one of those is in place, treat a first-run failure in Smart Search
+# start-up as an environment problem rather than a product regression. J8 is the
+# only journey that needs the index; J1-J7 and J9 do not.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: e2e
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 02:30 UTC nightly — after the weekly full-deps job's usual window and
+    # well clear of working hours in IST.
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: read
+
+# ONE E2E APPLIANCE AT A TIME, GLOBALLY. Not keyed on ref: two runs on
+# different branches would still collide on the compose project name, host port
+# 8988 and the relay's path table. `cancel-in-progress: false` because killing a
+# run mid-journey leaves containers behind; let it finish and always tear down.
+concurrency:
+  group: e2e-appliance
+  cancel-in-progress: false
+
+jobs:
+  journeys:
+    runs-on: ubuntu-latest
+    # Generous because the first start builds the api image (which builds the
+    # SPA) and may warm the model cache. A hang should fail, not run forever.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      # `ci`, not `install`: the lockfile is the contract, and a browser
+      # version that drifts from it is a different test run.
+      - name: Install E2E dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright browser
+        working-directory: e2e
+        # Chromium only — playwright.config.ts defines exactly one project.
+        run: npx playwright install --with-deps chromium
+
+      - name: Free disk before building the stack
+        # The stack carries torch, OpenCV and Keycloak. Hosted runners ship
+        # several GB of toolchains this build never touches.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h /
+
+      - name: Start the E2E appliance
+        run: ./e2e/scripts/up.sh
+
+      - name: Run J1-J9
+        working-directory: e2e
+        # No -g filter and no worker override: the whole suite, exactly as the
+        # config defines it.
+        run: npx playwright test
+
+      # ── Diagnostics. `always()` so a failure is explainable, and a success
+      #    costs one small upload. ───────────────────────────────────────────
+      - name: Capture service logs
+        if: always()
+        run: |
+          mkdir -p e2e/artifacts
+          docker compose \
+            --project-name vms-e2e \
+            --env-file e2e/.env.e2e \
+            -f docker-compose.yml \
+            -f docker-compose.bridge.yml \
+            -f e2e/docker-compose.e2e.yml \
+            logs --no-color --timestamps > e2e/artifacts/compose-logs.txt 2>&1 || true
+          docker ps -a > e2e/artifacts/containers.txt 2>&1 || true
+
+      - name: Upload Playwright traces, video and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-playwright-results
+          # retain-on-failure means a green run uploads almost nothing.
+          path: |
+            e2e/test-results/
+            e2e/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload service logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-service-logs
+          path: e2e/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ALWAYS, and with -v. A runner that keeps containers or volumes poisons
+      # the next run on a self-hosted box, and the volumes are project-scoped
+      # so this cannot reach anything else.
+      - name: Tear down the E2E appliance
+        if: always()
+        run: ./e2e/scripts/down.sh -v

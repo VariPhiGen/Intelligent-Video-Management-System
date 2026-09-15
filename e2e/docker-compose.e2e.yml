@@ -1,0 +1,134 @@
+# docker-compose.e2e.yml — the third overlay, on top of base + bridge.
+#
+# WHY BRIDGE AND NOT THE LINUX DEFAULT. The base file puts most services on
+# `network_mode: host`, which on Linux is right: WS-Discovery is multicast and
+# RTSP wants zero NAT. For a TEST stack it is wrong twice over. Host networking
+# would put this stack's discovery probes on whatever LAN the developer is
+# sitting on — so a real camera in the building could turn up in a test result,
+# and the run would be sending multicast onto somebody's network, which the
+# strategy rules out under "external egress: absent". It would also make two
+# stacks on one machine collide on every port.
+#
+# The bridge overlay solves both, and multicast still works: verified before
+# this file was written, a container on a user-defined bridge receives another
+# container's datagram to 239.255.255.250:3702. So WS-Discovery is exercised for
+# real, against a simulator, inside a network that reaches nothing else.
+#
+# EPHEMERAL BY CONSTRUCTION. Volumes are named per compose PROJECT, so running
+# this as `-p vms-e2e` gives `vms-e2e_postgres_data` and friends — a different
+# set from a developer's own stack. `down -v` therefore resets this stack and
+# cannot touch theirs.
+#
+# Usage (always through the scripts, which set the project and env):
+#     e2e/scripts/up.sh
+#     e2e/scripts/down.sh
+
+services:
+
+  # ── The synthetic cameras ────────────────────────────────────────────────
+  # Two, because one camera cannot express the thing the product is most likely
+  # to get wrong: scoping. J8 needs a camera this VMS records and a camera it
+  # does not, and the second one has to be real enough to produce a stream.
+  # Build contexts are relative to the PROJECT directory (the repo root, set by
+  # the first -f file), not to this overlay's own location — hence the e2e/
+  # prefix on every path below.
+  rtsp-cam-1:
+    build:
+      context: ./e2e/fixtures/rtsp-cam
+    image: vms-e2e-rtsp-cam
+    container_name: vms-e2e-rtsp-cam-1
+    networks: [vms_internal]
+    environment:
+      CAM_NAME: e2e-cam-1
+      CAM_PROFILE: 16x9
+      CAM_FPS: 15
+      CAM_RTSP_PORT: 8554
+    restart: unless-stopped
+
+  # 4:3 on purpose. The video wall's cell-crop defect only appears on a
+  # non-16:9 camera, and a fixture set that cannot reproduce a known bug will
+  # not catch its regression either.
+  rtsp-cam-2:
+    build:
+      context: ./e2e/fixtures/rtsp-cam
+    image: vms-e2e-rtsp-cam
+    container_name: vms-e2e-rtsp-cam-2
+    networks: [vms_internal]
+    environment:
+      CAM_NAME: e2e-cam-2
+      CAM_PROFILE: 4x3
+      CAM_FPS: 15
+      CAM_RTSP_PORT: 8554
+    restart: unless-stopped
+
+  # ── The ONVIF device ─────────────────────────────────────────────────────
+  # Answers the four calls onvif_probe makes, plus GetSystemDateAndTime, and
+  # responds to WS-Discovery Probe on the bridge. Verified against the product's
+  # own onvif-zeep before this file existed: correct credentials give `ok` with
+  # two profiles, wrong credentials give `auth_failed`.
+  onvif-sim:
+    build:
+      context: ./e2e/fixtures/onvif-sim
+    image: vms-e2e-onvif-sim
+    container_name: vms-e2e-onvif-sim
+    networks: [vms_internal]
+    environment:
+      ONVIF_HTTP_PORT: "8080"
+      ONVIF_USER: "${E2E_ONVIF_USER:-admin}"
+      ONVIF_PASS: "${E2E_ONVIF_PASS:-admin123}"
+      # The stream the camera advertises is the synthetic publisher's, so a
+      # camera onboarded through discovery ends up pointed at real pixels.
+      ONVIF_RTSP_HOST: rtsp-cam-1
+      ONVIF_RTSP_PORT: "8554"
+      ONVIF_RTSP_PATH: e2e-cam-1
+      ONVIF_VENDOR: "VariPhi E2E"
+      ONVIF_MODEL: "SimCam-1000"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080').read()"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Product services: E2E-only adjustments ───────────────────────────────
+  mediamtx:
+    # ONLY the HLS port, and it has to be exactly 8988.
+    #
+    # The browser does NOT reach live video through the api's /hls proxy on
+    # plain HTTP. lib/api.ts's `hlsSrc()` is:
+    #
+    #     if (location.protocol === 'https:') return `/hls/${path}/index.m3u8`;
+    #     return `http://${location.hostname}:8988/${path}/index.m3u8`;
+    #
+    # so over http:// the SPA goes straight to <host>:8988 and the proxy is
+    # bypassed. Dropping every published port — which the first version of this
+    # file did, for isolation — left every tile with an empty <video> and a
+    # net::ERR_CONNECTION_REFUSED, and no amount of waiting fixes that.
+    #
+    # The number cannot be remapped: it is hardcoded in the frontend, so the
+    # E2E stack must own 8988 on the host while it runs. RTSP (8654) stays
+    # unpublished, which is where the collision risk actually was.
+    ports: !override
+      - "8988:8988"
+
+  api:
+    environment:
+      # The scan sweeps the compose bridge and nothing else. Without this the
+      # zero-config path derives the appliance's own subnet, which inside a
+      # container is the bridge anyway — but stating it makes the test's blast
+      # radius explicit rather than incidental.
+      DISCOVERY_SUBNETS: "${E2E_SCAN_CIDR:-}"
+    # A deterministic failure beats a hung suite: if the api cannot come up the
+    # run should say so in seconds.
+    healthcheck:
+      test: ["CMD-SHELL",
+             "curl -fsS http://127.0.0.1:${API_PORT:-19091}/health >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+networks:
+  vms_internal:
+    driver: bridge

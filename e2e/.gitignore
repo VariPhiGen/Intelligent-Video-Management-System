@@ -1,0 +1,7 @@
+# Playwright's own output. Traces and videos are megabytes each and are only
+# meaningful next to the run that produced them.
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+.playwright/

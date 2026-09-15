@@ -1,0 +1,36 @@
+name: Feature request
+description: Something the product should do and doesn't.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful requests describe an operator's problem, not a
+        solution's shape — the same need often has a better home than the one
+        it first suggests.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what stops you today? Who hits this — an operator at a console, an admin, an integrator?
+      placeholder: |
+        Night staff need to review yesterday's motion events across 12 cameras.
+        Today that's twelve separate playback sessions and hand-noted timestamps.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd propose (optional)
+      description: If you have a shape in mind. It's fine not to.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today (optional)
+      description: The workaround, if one exists — it tells us the cost of waiting.
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to build this myself with maintainer guidance (see CONTRIBUTING.md — open the design conversation here first).

@@ -1,0 +1,397 @@
+/* vms.css — split-screen login: brand narrative left, sign-in right.
+   Pairs with template.ftl, which replaces the PatternFly layout entirely.
+
+   Because every OTHER login-theme page (reset password, OTP, error) still gets
+   its inner markup from Keycloak, form controls are styled BY ELEMENT AND ID —
+   not by PatternFly class — so an inherited page we never look at still renders
+   correctly.
+
+   THEMING. This page and the dashboard share one choice via the `vms-theme`
+   cookie (cookies cross the port boundary that localStorage can't). js/theme.js
+   applies it to <html> before paint and drives the on-page toggle. Default is
+   LIGHT — the same default the dashboard uses — and the OS theme is deliberately
+   ignored, because following the OS here while the dashboard defaults to light
+   is exactly what made the two disagree. */
+
+@font-face {
+  font-family: 'Inter';
+  src: url('../fonts/inter-var.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root,
+html[data-theme="light"] {
+  --bg:        #FFFFFF;   /* right panel  */
+  --brand-bg:  #F1F0EB;   /* left panel   */
+  --input:     #F4F2EE;
+  --border:    #E6E2DA;
+  --border2:   #D8D2C8;
+  --accent:    #E8863C;
+  --accent-h:  #D9772D;
+  --violet:    #5B5BD6;
+  --text:      #16181D;
+  --text2:     #4A4F57;
+  --muted:     #6B7280;
+  --dim:       #9AA0A6;
+  --red:       #DC2626;
+  --green-bg:  #E7F3EA;
+  --green-fg:  #2F6B44;
+  --violet-bg: #ECEBFB;
+  --chip-bg:   #EDEBE6;
+  --radius:    10px;
+  color-scheme: light;
+}
+
+/* Dark tokens — applied ONLY on an explicit choice (html[data-theme="dark"]),
+   never from prefers-color-scheme. The login page follows the dashboard's
+   choice via the vms-theme cookie, and the dashboard defaults to light; keying
+   dark off the OS here is exactly what made the two disagree. */
+html[data-theme="dark"] {
+  --bg:        #101820;
+  --brand-bg:  #090e14;
+  --input:     #1a2535;
+  --border:    #1f2a37;
+  --border2:   #2c3c47;
+  --accent:    #F18A3B;
+  --accent-h:  #f09a57;
+  --violet:    #8b8bf0;
+  --text:      #F1F5F9;
+  --text2:     #cbd5e1;
+  --muted:     #94A3B8;
+  --dim:       #64748b;
+  --red:       #EF4444;
+  --green-bg:  rgba(34,197,94,.14);
+  --green-fg:  #4ade80;
+  --violet-bg: rgba(139,139,240,.14);
+  --chip-bg:   rgba(255,255,255,.05);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+body.v-body {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.v-split {
+  display: grid;
+  grid-template-columns: 55fr 45fr;
+  min-height: 100vh;
+}
+
+/* ── Brand panel ─────────────────────────────────────────────────────────── */
+.v-brand {
+  position: relative;
+  overflow: hidden;
+  background: var(--brand-bg);
+  padding: 40px 56px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+/* Two soft colour fields — a cool tint up top, a violet bloom bottom-left. */
+.v-brand::before,
+.v-brand::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.v-brand::before {
+  width: 60vw; height: 60vw;
+  top: -22vw; left: -14vw;
+  background: radial-gradient(circle, rgba(140,170,160,.16), transparent 62%);
+}
+.v-brand::after {
+  width: 52vw; height: 52vw;
+  bottom: -20vw; left: 6vw;
+  background: radial-gradient(circle, rgba(122,110,220,.18), transparent 64%);
+}
+.v-brand-top, .v-brand-mid, .v-brand-foot { position: relative; z-index: 1; }
+
+.v-brand-top { display: flex; align-items: center; gap: 14px; }
+/* Height-driven, width follows each master's aspect ratio. Both SVG masters
+   are the square 48x48 badge, so light and dark share the same width. No
+   radius/shadow — each master draws its own rounded tile. Mirrors .brand-mark
+   in the React app's global.css; keep the two in step. */
+.v-logo {
+  height: 46px;
+  width: 46px;
+  background: url('../img/logo-light.svg') center / contain no-repeat;
+}
+html[data-theme="dark"] .v-logo {
+  background-image: url('../img/logo-dark.svg');
+}
+.v-logo-text { font-size: 14px; color: var(--muted); }
+
+.v-brand-mid { max-width: 640px; }
+.v-eyebrow {
+  color: var(--violet);
+  font-size: 12.5px; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase;
+  margin-bottom: 18px;
+}
+.v-headline {
+  margin: 0 0 20px;
+  font-size: clamp(30px, 3.4vw, 50px);
+  line-height: 1.1;
+  letter-spacing: -.025em;
+  font-weight: 800;
+  color: var(--text);
+}
+.v-lede {
+  margin: 0 0 26px;
+  max-width: 560px;
+  font-size: 15.5px;
+  line-height: 1.62;
+  color: var(--text2);
+}
+.v-chips { display: flex; flex-wrap: wrap; gap: 9px; }
+.v-chip {
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  color: var(--text2);
+  background: var(--chip-bg);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.v-chip-violet { background: var(--violet-bg); color: var(--violet); border-color: transparent; }
+.v-chip-green  { background: var(--green-bg);  color: var(--green-fg); border-color: transparent; }
+
+.v-brand-foot {
+  display: flex; align-items: center; gap: 8px;
+  font-family: ui-monospace, SFMono-Regular, 'JetBrains Mono', monospace;
+  font-size: 11.5px;
+  color: var(--dim);
+}
+.v-dot { opacity: .55; }
+
+/* ── Sign-in panel ───────────────────────────────────────────────────────── */
+.v-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 48px;
+}
+.v-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 380px;
+}
+
+/* Theme toggle + language switcher, clustered top-right of the card. */
+.v-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 34px;
+}
+.v-theme-toggle {
+  width: 34px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--input);
+  color: var(--text2);
+  font-size: 15px; line-height: 1;
+  cursor: pointer;
+}
+.v-theme-toggle:hover { color: var(--text); border-color: var(--border2); }
+
+.v-locales {
+  display: inline-flex;
+  gap: 2px; padding: 3px;
+  border-radius: 10px;
+  background: var(--input);
+  border: 1px solid var(--border);
+}
+.v-locale {
+  padding: 5px 13px;
+  border-radius: 7px;
+  font-size: 12.5px; font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+}
+.v-locale:hover { text-decoration: none; color: var(--text2); }
+.v-locale.active { background: var(--accent); color: #fff; }
+
+.v-title {
+  margin: 0 0 8px;
+  font-size: 25px; font-weight: 700;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+.v-subtitle {
+  margin: 0 0 26px;
+  font-size: 14px; line-height: 1.55;
+  color: var(--muted);
+}
+
+/* Keycloak's own form markup — styled by element/id, no PatternFly needed. */
+#kc-form-login { display: block; }
+
+label, .control-label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 13px; font-weight: 500;
+  color: var(--text2);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="email"],
+input[type="number"],
+select,
+.form-control {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: var(--input);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14.5px;
+  outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+input:focus, select:focus, .form-control:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+::placeholder { color: var(--dim); }
+
+/* Keycloak wraps each field in a form group (kcFormGroupClass = "form-group" in
+   the parent theme). Target the class AND the direct children, so a page whose
+   markup we have never seen still gets vertical rhythm. */
+.form-group,
+#kc-form-login > div { margin-bottom: 18px; }
+
+/* Keycloak wraps the password field in an input group with a show/hide button.
+   That button's icon comes from PatternFly's icon FONT, which we no longer load
+   — it would render as an empty square. The design has no show/hide control, so
+   hide the button rather than ship a dead one, and let the input fill the row. */
+.pf-c-input-group,
+.pf-v5-c-input-group { display: flex; align-items: stretch; }
+.pf-c-input-group > input,
+.pf-v5-c-input-group > input { flex: 1; }
+.pf-c-input-group button,
+.pf-v5-c-input-group button,
+button.pf-c-button.pf-m-control,
+button.pf-v5-c-button.pf-m-control { display: none; }
+
+/* Remember-me → a switch, matching the design. */
+#kc-form-options { margin: 4px 0 20px; }
+#kc-form-options .checkbox label,
+.v-switch-label {
+  display: flex; align-items: center; gap: 11px;
+  margin: 0;
+  font-size: 13.5px; color: var(--text2);
+  cursor: pointer;
+}
+#rememberMe {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 40px; height: 22px;
+  margin: 0; padding: 0;
+  border-radius: 999px;
+  background: var(--border2);
+  cursor: pointer;
+  transition: background .15s;
+}
+#rememberMe::after {
+  content: "";
+  position: absolute; top: 3px; left: 3px;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .15s;
+}
+#rememberMe:checked { background: var(--accent); }
+#rememberMe:checked::after { transform: translateX(18px); }
+
+/* Primary submit. */
+#kc-login,
+input[type="submit"],
+.btn-primary {
+  width: 100%;
+  padding: 14px 18px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font-family: inherit;
+  font-size: 15px; font-weight: 600;
+  cursor: pointer;
+  transition: background .12s;
+}
+#kc-login:hover,
+input[type="submit"]:hover,
+.btn-primary:hover { background: var(--accent-h); }
+
+#kc-form-buttons { margin-top: 4px; }
+
+/* Links (forgot password, register, try another way). */
+a, .v-link {
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+a:hover, .v-link:hover { text-decoration: underline; }
+#kc-form-options + div,
+.v-info { margin-top: 16px; font-size: 13px; color: var(--muted); }
+
+/* Feedback. */
+.v-alert, .alert, .pf-c-alert {
+  margin-bottom: 18px;
+  padding: 11px 13px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  background: var(--input);
+  color: var(--text2);
+  font-size: 13px;
+}
+.v-alert-error, .alert-error, .pf-m-danger {
+  border-left-color: var(--red);
+  color: var(--red);
+}
+.v-alert-success { border-left-color: var(--green-fg); color: var(--green-fg); }
+#input-error, #input-error-username, #input-error-password,
+.kc-feedback-text {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--red);
+}
+
+.v-legal {
+  margin: 26px 0 0;
+  text-align: center;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+/* ── Narrow screens: the brand panel is decoration, so it goes first and
+      shrinks, and the form takes the width it needs. ───────────────────────── */
+@media (max-width: 900px) {
+  .v-split { grid-template-columns: 1fr; }
+  .v-brand { padding: 28px 28px 34px; gap: 22px; }
+  .v-brand-mid { max-width: none; }
+  .v-headline { font-size: 30px; }
+  .v-lede { font-size: 14.5px; margin-bottom: 20px; }
+  .v-brand-foot { display: none; }
+  .v-panel { padding: 34px 28px 48px; }
+  .v-card { max-width: 440px; }
+}

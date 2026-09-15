@@ -1,0 +1,189 @@
+# The suites, as a merge gate.
+#
+# 879 tests existed in this repository before this file did, and not one of them
+# ran on a pull request. CONTRIBUTING.md asks contributors to run pytest by
+# hand, which is a request, not a control: it holds exactly as long as the
+# person remembering it. The tests are good — golden_motion.json replays 220
+# deterministic frames captured from the implementations they replaced,
+# test_compose_topology.py reads both compose files structurally so it fails on
+# the NEXT host-networked service — and none of that helps if nothing runs them.
+#
+# Built to the same rule as notices.yml and shared-sync.yml: a job here must
+# never go red for a reason outside the author's change. That is why the
+# dependency strategy differs per service rather than being uniform —
+#
+#   camera-mgmt, nvr   requirements.txt is pinned exactly (==) and pulls no ML,
+#                      so the job installs the real thing. Seconds, no drift.
+#   the other four     declare ML dependencies as RANGES (ultralytics, openvino,
+#                      onnx, open_clip_torch). A full install is gigabytes, is
+#                      several minutes, resolves differently day to day, and
+#                      buys two tests that importorskip themselves anyway. Those
+#                      jobs install tests/requirements-test.txt, and the weekly
+#                      `full-deps` job below installs the real requirements so
+#                      resolver drift surfaces on its own schedule.
+#
+# Every suite is its own matrix leg on purpose: a failure names the service in
+# the check title, and a slow one (analytics ~27s, smartsearch ~19s) does not
+# hold up the fast ones.
+#
+# Run any of this locally exactly as CI does:
+#   python -m pytest services/<service>/tests -q
+#   python -m pytest tests -q
+#   npm --prefix frontend-react run test
+
+name: tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * 2"      # Tuesdays — full-dependency drift, not urgent
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Services whose requirements are pinned: install the real thing ─────────
+  pinned:
+    if: github.event_name != 'schedule'
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # python-version matches each service's own Dockerfile base.
+          - service: camera-mgmt
+            python: "3.11"
+          - service: nvr
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r services/${{ matrix.service }}/requirements.txt
+          python -m pip install pytest pytest-asyncio
+      - name: Test
+        run: python -m pytest services/${{ matrix.service }}/tests -q
+
+  # ── Services with ML dependency ranges: lean test deps ────────────────────
+  lean:
+    if: github.event_name != 'schedule'
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [analytics, frames, motion, smartsearch]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.txt
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements-test.txt
+      - name: Test
+        # Skips are expected here and are the documented trade — see
+        # tests/requirements-test.txt. They are reported, not hidden.
+        run: python -m pytest services/${{ matrix.service }}/tests -q -rs
+
+  # ── Repo-level structural invariants ──────────────────────────────────────
+  topology:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # pyyaml only: these tests read the compose files structurally and must
+      # not acquire a dependency that can fail for its own reasons.
+      - run: python -m pip install pytest "pyyaml>=6.0,<7"
+      - run: python -m pytest tests -q -rs
+
+  # ── The documented test inventory must match the tree ─────────────────────
+  # TESTING.md carries a generated ledger between LEDGER markers. It is the one
+  # number in this programme that goes stale without anyone noticing: tests land,
+  # the table does not move, and the document quietly starts describing a
+  # repository that no longer exists. That already happened once — an earlier
+  # hand-counted version was stale by three E2E journeys within a single
+  # afternoon, which is why the arithmetic was moved into a script.
+  #
+  # `--check` exits 1 when the table and the tree disagree. Regenerate with
+  # `python scripts/coverage_ledger.py --write` and commit the result.
+  #
+  # NOT a coverage gate. It asserts nothing about the ratios and sets no
+  # threshold — see the standing decision in TESTING.md against a repo-wide
+  # percentage. It only requires that what the document CLAIMS is true.
+  ledger:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Reads source files and counts; no dependencies at all.
+      - run: python scripts/coverage_ledger.py --check
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"          # matches the node:22-slim build stage
+          cache: npm
+          cache-dependency-path: frontend-react/package-lock.json
+      - run: npm --prefix frontend-react ci
+      - run: npm --prefix frontend-react run test
+      # The typecheck is the closest thing the frontend has to coverage:
+      # 23,220 lines sit behind 329 lines of test, so tsc is doing most of the
+      # work of noticing a break. Cheap, and it belongs in the gate.
+      - run: npm --prefix frontend-react run typecheck
+
+  # ── Weekly: do the real requirements still resolve and pass? ───────────────
+  # Deliberately NOT on pull requests. This is where ML dependency-range drift
+  # is allowed to be red without blocking somebody's unrelated change.
+  full-deps:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: full-deps (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [analytics, frames, motion, smartsearch]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the service's real requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r services/${{ matrix.service }}/requirements.txt
+          python -m pip install pytest pytest-asyncio
+      - name: Test with everything present
+        # With torch/onnx actually installed, the importorskip tests run. If
+        # this passes and `lean` passes, the trade in requirements-test.txt is
+        # still sound; if only this one fails, a dependency moved.
+        run: python -m pytest services/${{ matrix.service }}/tests -q -rs

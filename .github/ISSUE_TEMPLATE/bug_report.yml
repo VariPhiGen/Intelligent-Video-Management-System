@@ -1,0 +1,60 @@
+name: Bug report
+description: Something is broken — recording, playback, onboarding, the UI, the stack itself.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks — a precise report is half the fix.
+
+        **Two things before you start:**
+        - A suspected **vulnerability** does not belong here. Use the private
+          channel in [SECURITY.md](../blob/main/SECURITY.md).
+        - **Scrub what you paste.** Logs and URLs from a VMS routinely carry
+          camera credentials (`rtsp://user:pass@…`), internal IPs, and footage
+          paths. Redact before posting — an issue is public forever.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+      placeholder: |
+        Added a camera via the wizard → probe succeeded → enabled it, but the
+        tile stays OFFLINE in Live View while VLC plays the relay URL fine.
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or `git rev-parse --short HEAD`, and whether the stack is stock or modified.
+      placeholder: v1.0.2, stock docker compose
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      description: How the stack runs (`./vms` prints "network mode = …, gpu = …" on every up).
+      options:
+        - Linux, host networking (default)
+        - Docker Desktop / bridge overlay (macOS, Windows)
+        - Linux + NVIDIA GPU (CDI overlay)
+        - Linux + NVIDIA GPU (legacy runtime overlay)
+        - Other / modified compose
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Usually `docker compose logs --tail 100 api nvr` around the failure.
+        REDACT credentials and internal addresses first.
+      render: text
+  - type: textarea
+    id: camera
+    attributes:
+      label: Camera details (if camera-related)
+      description: Vendor, model, firmware if known; ONVIF or manual RTSP; H.264 or H.265.
+      placeholder: Hikvision DS-2CD2043, ONVIF-discovered, H.265 main stream

@@ -1,0 +1,9 @@
+fastapi==0.115.5
+# Frame-broker notices only, and only when MOTION_FRAME_SOURCE=broker. This
+# service never reads frames — it needs one float per sample, not pixels — so
+# there is no shared memory here and nothing large crosses this client.
+redis==5.2.1
+uvicorn[standard]==0.32.1
+opencv-python-headless>=4.9,<4.12
+numpy>=1.26,<3
+pyyaml>=6.0,<7

@@ -1,0 +1,127 @@
+# Frame broker defaults. Cameras are NOT configured here — the camera-mgmt
+# registry pushes them at runtime (POST /cameras/{slug}) and re-asserts them
+# via its reconcile loop, exactly like the NVR, motion and smartsearch.
+
+capture:
+  # THE ONE PLACE THE SAMPLE RATE IS DECIDED, now that both consumers read
+  # these frames instead of decoding their own.
+  #
+  # 5.0, ADOPTED 2026-09-10 after an A/B on identical footage (the same 12 NVR
+  # segments through the real pipeline at 2 and at 5 FPS): tracker association
+  # failure fell 14.9% -> 9.2%, and on the live appliance 16.0% -> 12.9%, with
+  # no queue drops. Cost: about 1.4x broker CPU.
+  #
+  # Motion needed no change: its confirmation window is in SECONDS and resizes
+  # to the notice cadence (6 -> 12-14 samples). Its sensitivity presets and the
+  # region thresholds below were deliberately NOT retuned, and both were fitted
+  # on 500 ms differences, so the gate now skips more frames (43% -> 52% in the
+  # replay). That is the first place to look if events or detections thin out.
+  #
+  # FRAMES_SAMPLE_FPS=2 goes back; nothing else depends on the rate.
+  sample_fps: 5.0
+  # Frames held per camera in shared memory. 4 is 0.8 s of history at
+  # 5 FPS: enough for a consumer to fall briefly behind, small enough that
+  # five 1080p cameras fit in 124 MB.
+  #
+  # RAISING THIS IS NOT FREE and not usually the fix. Each slot is a full
+  # frame (6.22 MB at 1080p), so 5 cameras x 8 slots is 249 MB of /dev/shm.
+  # A consumer that cannot keep up should drop frames, not be waited for.
+  ring_slots: 4
+  rtsp_buffer_size: 1
+  open_timeout_ms: 5000
+  read_timeout_ms: 5000
+  reconnect_backoff_initial_seconds: 2.0
+  reconnect_backoff_max_seconds: 60.0
+
+motion:
+  # THE CANONICAL MOTION TUNING FOR THE WHOLE VMS. These values used to live in
+  # two files — services/motion/detector/ (scalar, for operator events) and
+  # services/smartsearch/index/motion.py (regions, for gating YOLO). One
+  # differencing pass now produces both, so a change here reaches both
+  # consumers and the two can no longer drift.
+  scale_width: 320
+  blur_kernel: 21
+
+  # ── region half: was smartsearch/index/motion.py ────────────────────────
+  # FITTED ON REAL FOOTAGE AND NOT MONOTONIC — do not "tune up to be safe".
+  # Measured 2026-08-31 on a 10-minute clip: ungated indexing found 8 people;
+  # 25 / 0.0008 found 7 (it lost someone); 18 / 0.0002 found all 8; and
+  # 15 / 0.0001 found only 6, because more crops make the deduplicator merge
+  # two people into one. More sensitivity is not more recall.
+  threshold: 18
+  min_area_fraction: 0.0002
+  # Morphological opening before dilation. Isolated sensor pixels that clear
+  # the threshold become real regions once dilated, and a frame full of them
+  # trips max_regions into a full-frame pass — costing the exact inference the
+  # region path exists to avoid. Measured on a synthetic mask of 400 speckle
+  # pixels plus one 4x9 distant figure: 252 regions passing min_area before,
+  # 1 after, and the figure survived both. 0 disables it.
+  despeckle_iterations: 1
+  dilate_iterations: 2
+  # Beyond this many regions, one full-frame inference is cheaper than N crops:
+  # the detector resizes any input to its own resolution, so three crops cost
+  # three inferences.
+  max_regions: 3
+  # THE CROP THE DETECTOR SEES, and it was too tight. Measured over 260 real
+  # (frame, region) pairs replayed through the shipped pipeline: at 0.15 the
+  # detector found 71 of 166 reference people, and 57 of those 95 misses were
+  # crops that TOUCHED the person and lost them anyway — 31 clipped to a
+  # fragment, 26 too small and blurry once upscaled to the detector's 640x640.
+  # At this value it finds 110 of 166, crop coverage p10 rises 0.615 -> 0.822,
+  # and surviving duplicate boxes fall 1.04% -> 0%.
+  #
+  # 0.80 is per side, so a region ends up 2.6x its raw width: the same
+  # rectangle the benchmark called "+50%" (it grew the already-0.15-padded
+  # region by half again). It is nearly free — the OpenVINO input is a static
+  # 1,3,640,640, so a bigger crop costs the same forward pass: 265 -> 279 CPU
+  # ms/frame, memory unchanged, and 0 frames dropped or evicted at the design
+  # rate of 10.5 frames/s. What it does cost is downstream: 1.72x observations,
+  # so 1.72x CLIP passes, rows and crops.
+  region_padding: 0.80
+  # PAIRED WITH THE PADDING ABOVE, not an independent knob. This compares a sum
+  # of PADDED region areas against the frame, so quadrupling the padding
+  # quadruples the number without the scene changing, and 0.35 would have sent
+  # frames down the whole-frame path that are cropped today.
+  #
+  # 1.20 keeps that from happening in either direction. Measured live over 90 s:
+  # the busiest frame still being cropped covers 0.341, which scales to ~1.16,
+  # while the weakest frame already taking the whole-frame path covers 0.38 and
+  # scales to ~1.29. 1.20 sits in that gap, so the same scenes take the same
+  # path. (Coverage scaled 3.1x-3.4x rather than the arithmetic 4x because
+  # regions clamp at the frame edges.)
+  #
+  # Only 6.7% of looked-at frames reach this rule at all; the whole-frame path
+  # is mostly the max_regions rule above (22%), which padding does not touch.
+  full_frame_fraction: 1.20   # regions covering more of the frame -> whole frame
+  scene_change_fraction: 0.55 # lights / IR cut / camera moved -> whole frame
+
+  # ── scalar half: was motion/detector/algorithm.py ───────────────────────
+  # Sub-threshold differences are zeroed before counting, so sensor noise does
+  # not inflate the fraction the Motion service thresholds against.
+  #
+  # NOT redundant here, though it WOULD be against the binary threshold above:
+  # measured 2026-09-07, a THRESH_TOZERO pass beneath a binary threshold
+  # produces a bit-identical mask. It earns its place on the scalar path,
+  # where the count is of surviving non-zero pixels rather than of a mask.
+  noise_floor: 10
+
+notice:
+  # Redis rather than the ZeroMQ the scope proposed: Valkey is already in this
+  # stack and camera-mgmt already depends on the client, so this adds no
+  # dependency and no new container. A notice is ~400 bytes at 10/s across
+  # five cameras.
+  #
+  # FIRE AND FORGET. Pub/sub drops for a slow subscriber rather than blocking
+  # the publisher, which is what we want: a consumer that has fallen behind
+  # must not be able to slow the decoder for every other consumer. A missed
+  # notice costs one sampled frame.
+  enabled: true
+  url: "redis://127.0.0.1:6379/0"        # overridden by REDIS_URL
+  channel_prefix: "vms.frames"
+
+api:
+  host: "127.0.0.1"     # loopback: reached only via the api proxy
+  port: 8014
+
+logging:
+  level: "INFO"
