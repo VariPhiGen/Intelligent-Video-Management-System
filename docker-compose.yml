@@ -572,6 +572,16 @@ services:
       # worker and a domain change is a remove followed by an add, so the
       # count touches zero on ordinary traffic. 0 = load once, hold for ever.
       ANALYTICS_IDLE_TIMEOUT_SECONDS: ${ANALYTICS_IDLE_TIMEOUT_SECONDS:-300}
+      # THE FACE MODELS FETCH THEMSELVES on first use, like the detector and
+      # the plate models. Set false on an air-gapped site that stages the two
+      # OpenCV Zoo .onnx files into the models volume by hand; face search then
+      # reports itself unavailable until they appear, exactly as before.
+      #
+      # Passed through HERE or the off switch does not exist: this service
+      # reads its own environment and there is no env_file, so a value set in
+      # .env alone would reach nothing — the same trap as
+      # ANALYTICS_NESTED_CONTAINMENT above.
+      ANALYTICS_FACE_AUTO_DOWNLOAD: ${ANALYTICS_FACE_AUTO_DOWNLOAD:-true}
       # WHERE CPU ACTIVITY EVENTS GO. The activity engine (analytics/activities/)
       # runs on this service's detections and tracks and POSTs every event to
       # the VMS ingest, /api/analytics/events on the api — the table the Events
@@ -670,6 +680,10 @@ services:
       SEARCHDB_URL: ${SEARCHDB_URL:-postgresql://search:search_secret@127.0.0.1:5434/smartsearch}
       SEARCH_CROP_DIR: ${SEARCH_CROP_DIR:-/data/search/crops}
       SEARCH_RETENTION_DAYS: ${SEARCH_RETENTION_DAYS:-30}
+      # Face search's two OpenCV Zoo models, fetched on first use and verified
+      # by digest. Same switch as ANALYTICS_FACE_AUTO_DOWNLOAD — both services
+      # read the same shared volume, so either one fetching is enough.
+      SEARCH_FACE_AUTO_DOWNLOAD: ${SEARCH_FACE_AUTO_DOWNLOAD:-true}
       # How often the service deletes expired rows and their crop files.
       # 0 disables the sweep; reads stay filtered to unexpired rows either way,
       # so the cost of disabling is disk, not wrong answers.

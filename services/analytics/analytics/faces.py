@@ -73,6 +73,8 @@ from typing import Optional
 
 import numpy as np
 
+from . import face_weights
+
 log = logging.getLogger("analytics.faces")
 
 
@@ -268,6 +270,11 @@ def build(cfg, device: Optional[str] = None) -> Optional[FaceReader]:
         log.warning("unknown face model %r; registered: %s — the face domain "
                     "will index nothing", cfg.model, sorted(FACE_MODELS))
         return None
+    # FETCH BEFORE ASKING WHETHER THEY ARE THERE — see face_weights.py. This
+    # runs inside the warm-up thread, off the engine lock, which is where the
+    # plate models already download; the docstring's "never blocks" contract is
+    # about add_camera, not about this.
+    face_weights.ensure(cfg.detector_weights, cfg.recogniser_weights or spec.weights)
     for path in (cfg.detector_weights, cfg.recogniser_weights or spec.weights):
         if not path or not os.path.isfile(path):
             log.warning("face models not available (%s missing) — the face "

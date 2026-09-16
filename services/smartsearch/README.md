@@ -301,8 +301,8 @@ the embedder never ran. Detection is the only cost it includes.
 
 `cameras.search_domains` (migrations 031 and 035) picks which of `person` /
 `vehicles` / `plate` / `face` a camera contributes. Pushed with the camera and
-honoured per frame. `face` is off by default and needs two model files first;
-see "Face models are fetched by hand" below.
+honoured per frame. `face` is off by default; the first camera that asks for it
+triggers the model fetch — see "Face models fetch themselves" below.
 
 **It does not save detection time.** Measured: 120 frames took 1.12 s for
 person+vehicles, 1.09 s person-only, 1.08 s unfiltered — the detector's class
@@ -465,25 +465,35 @@ model extensions on 2026-08-31 after exactly this file was staged by
 `git add -A` and the sweep did not object, because `.pt` was not an extension it
 knew about. In the container, weights land in the `search_models` volume.
 
-### Face models are fetched by hand
+### Face models fetch themselves
 
 Face search (the `face` camera domain) uses two models from the
-[OpenCV Zoo](https://github.com/opencv/opencv_zoo). Unlike the detector and the
-plate reader, **nothing downloads them automatically**, and this repository
-does not redistribute them.
+[OpenCV Zoo](https://github.com/opencv/opencv_zoo). This repository does not
+redistribute them — the open-core packaging harness refuses binaries — so they
+are **fetched on first use and verified by sha256**, exactly as the detector
+and the plate models are fetched by their own libraries. No manual step.
 
 | File | Model | Licence |
 |---|---|---|
 | `face_detection_yunet_2023mar.onnx` (232 KB) | YuNet face detector | MIT |
 | `face_recognition_sface_2021dec.onnx` (37 MB) | SFace face embedder | Apache-2.0 |
 
-Without them both services start normally and face search reports itself
-unavailable. smartsearch's `/health` shows `lifecycle.faces.available: false`,
-and analytics logs `face models not available`. People, vehicles and plates are
-unaffected.
+The fetch happens in the warm-up that loads the face reader — the first time a
+camera asks for the `face` domain — and lands in the shared `search_models`
+volume, which both services mount at `/models`. Whichever service warms up
+first pays for it; the other finds the files already there.
 
-To enable it, put both files in the `search_models` volume. analytics and
-smartsearch both mount it at `/models`:
+**If the fetch cannot happen** — no egress, a proxy, a digest that no longer
+matches upstream — nothing is installed and both services behave exactly as
+they did before: they start normally, `/health` shows
+`lifecycle.faces.available: false`, analytics logs `face models not available`,
+and people, vehicles and plates are unaffected. A file that fails verification
+is discarded rather than left on disk, so a truncated download or a captive
+portal's login page can never be loaded as a model.
+
+`ANALYTICS_FACE_AUTO_DOWNLOAD=false` / `SEARCH_FACE_AUTO_DOWNLOAD=false` turns
+the fetch off — for an air-gapped site that stages the files itself, which is
+the manual path, still supported and unchanged:
 
 ```sh
 base=https://github.com/opencv/opencv_zoo/raw/main/models

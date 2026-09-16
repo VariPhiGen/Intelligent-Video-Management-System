@@ -55,6 +55,8 @@ import numpy as np
 from .backends import BY_INCUMBENT, ONNX, BackendSpec
 from .domains import DOMAINS, FACE
 
+from . import face_weights
+
 log = logging.getLogger("smartsearch.faces")
 
 #: The width the schema holds. Not a constant of its own: the registry IS the
@@ -341,6 +343,13 @@ def build(cfg, *, detector_path: str = "", weights: str = "") -> FaceEncoder:
 
     det_path = detector_path or cfg.detector_weights
     rec_path = weights or cfg.recogniser_weights or spec.weights
+    # FETCH BEFORE ASKING WHETHER THEY ARE THERE. These two were the only
+    # models on the appliance that did not arrive on their own, so a clean
+    # install reported face search unavailable for ever and the missing step
+    # was a paragraph in a README. Never raises, and never blocks longer than
+    # its own timeout; if it cannot fetch, the check below answers exactly as
+    # it did before. See face_weights.py.
+    face_weights.ensure(det_path, rec_path)
     for path, what in ((det_path, "detector"), (rec_path, "embedder")):
         if not path or not os.path.isfile(path):
             return _inactive(cfg, f"{what} model file missing: {path or '<unset>'}")
