@@ -72,26 +72,25 @@ Browser ── Keycloak login (OIDC) ──▶  Variphi SPA + API  :8091 (API_PO
 | ✅ | Opt-in TLS front door (Caddy) |
 | ✅ | Boot resilience for unattended appliances |
 | ✅ | Peripheral inventory — barriers, relays, PLCs, UPS |
-| 🚧 | Peripherals rule engine — the UI builds rules; no engine evaluates them yet |
+| 🗓️ | Peripherals rule engine — evaluate events against rules and raise alerts |
 | 🗓️ | Outbound bridge — alerts to MQTT / Home Assistant, and on to field devices |
 
 ### Roadmap
 
 The next block of work is the **peripherals event spine** — turning the
 detections the analytics service already produces into actions a site can take.
-The event spine (layer 1) shipped in September 2026; the rule engine and the
-outbound bridge are designed and awaiting implementation:
+The event spine (layer 1) shipped in September 2026. Layers 2 to 4 are designed
+and awaiting implementation — nothing above layer 1 is wired up yet:
 
 ```
 1. EVENT PRODUCTION   motion / smartsearch / analytics ──▶ analytics_events   ✅ shipped
-2. RULE EVALUATION    analytics_events ──▶ alert_rules  ──▶ alerts            🚧 UI only
+2. RULE EVALUATION    analytics_events ──▶ alert_rules  ──▶ alerts            🗓️ designed
 3. OUTBOUND BRIDGE    alerts ──▶ MQTT / Home Assistant  ──▶ device            🗓️ designed
 4. FIELD LAYER        Home Assistant ──Modbus──▶ barrier / PLC / UPS          🗓️ designed
 ```
 
-**PTZ control** is the other near-term addition. The camera detail and config
-views already carry the PTZ pad and tab, disabled and marked "soon" — the ONVIF
-PTZ service behind them is what remains.
+**PTZ control** is the other near-term addition: pan, tilt, zoom and presets
+driven over the ONVIF PTZ service.
 
 **Vision-language search** is the larger one, and the bigger change to how
 search works. Smart Search today embeds crops with CLIP (`ViT-B-32`). CLIP

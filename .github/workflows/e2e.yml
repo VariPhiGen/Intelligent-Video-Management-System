@@ -7,7 +7,7 @@
 # workflow_dispatch for when someone wants it now.
 #
 # THE CONSTRAINTS BELOW ARE THE TEST, NOT PREFERENCES. They are set in
-# e2e/playwright.config.ts and e2e/.env.e2e and are NOT overridden here:
+# e2e/playwright.config.ts and e2e/e2e.env and are NOT overridden here:
 #
 #   workers: 1, retries: 0, fullyParallel: false
 #       The journeys share one appliance. Parallel workers would fight over
@@ -123,7 +123,7 @@ jobs:
           mkdir -p e2e/artifacts
           docker compose \
             --project-name vms-e2e \
-            --env-file e2e/.env.e2e \
+            --env-file e2e/e2e.env \
             -f docker-compose.yml \
             -f docker-compose.bridge.yml \
             -f e2e/docker-compose.e2e.yml \

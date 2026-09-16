@@ -1,7 +1,7 @@
 /**
  * env.ts — one place that knows where the stack is and who can log in.
  *
- * Values are read from e2e/.env.e2e rather than duplicated, so moving a port
+ * Values are read from e2e/e2e.env rather than duplicated, so moving a port
  * moves it for the stack, the readiness script and the tests together. A test
  * suite carrying its own copy of a port number is a suite that passes against
  * the wrong stack.
@@ -13,7 +13,7 @@ import { resolve } from 'node:path';
 // CommonJS (package.json declares no "type": "module"), so the ESM-only form
 // throws "exports is not defined in ES module scope" before a single test runs.
 // E2E_ENV_FILE is the escape hatch for pointing a run at another stack.
-const ENV_FILE = process.env.E2E_ENV_FILE ?? resolve(__dirname, '..', '.env.e2e');
+const ENV_FILE = process.env.E2E_ENV_FILE ?? resolve(__dirname, '..', 'e2e.env');
 
 function readEnvFile(): Record<string, string> {
   const out: Record<string, string> = {};

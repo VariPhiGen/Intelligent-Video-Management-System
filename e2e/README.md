@@ -162,7 +162,7 @@ several minutes before ingest is ready. See the header of
 
 ```
 e2e/
-  .env.e2e                  ports, fixed non-weak secrets, DEV_AUTH=false
+  e2e.env                   ports, fixed non-weak secrets, DEV_AUTH=false
   docker-compose.e2e.yml    simulators + E2E-only service settings
   playwright.config.ts      no retries, one worker, traces on failure
   scripts/up.sh             build, start, and wait on state (never a sleep)
@@ -171,7 +171,7 @@ e2e/
     timecode.py             reads the timecode back by glyph matching (not OCR)
   fixtures/onvif-sim/       ONVIF SOAP + WS-Discovery responder
   support/
-    env.ts                  reads .env.e2e — one source of truth for ports
+    env.ts                  reads e2e.env — one source of truth for ports
     auth.ts                 real Keycloak login; no token shortcuts
     api.ts                  service / anonymous clients, Keycloak admin token
     stack.ts                relay paths, camera stop/start (docker exec)

@@ -22,7 +22,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/../.." && pwd)"
-ENV_FILE="${HERE}/../.env.e2e"
+ENV_FILE="${HERE}/../e2e.env"
 PROJECT="${E2E_PROJECT:-vms-e2e}"
 
 cd "${ROOT}"
