@@ -40,8 +40,29 @@ log = structlog.get_logger(__name__)
 
 _LOCK_KEY = "discovery:scan:lock"
 _JOB_KEY = "discovery:scan:job"
-# Safety valve: a crashed worker's lock must not block scans forever.
-_LOCK_TTL_SEC = 3600
+
+# THE LOCK IS A LIVENESS TOKEN, NOT A TIMEOUT. It used to be a flat 3600s
+# safety valve, which made a dead scan indistinguishable from a slow one for an
+# hour: the job hash still said `running`, so the UI spun, and POST /scan
+# answered 409. Restarting the stack did not help — the state is in Valkey, a
+# different container with its own lifecycle — so the only recovery was
+# deleting the keys by hand, which is not something an operator can be expected
+# to know.
+#
+# Now the running scan REFRESHES the lock while it lives (_heartbeat), so the
+# key's presence means "a scan is running right now" rather than "a scan
+# started within the last hour". A worker that dies stops refreshing and the
+# lock is gone within _LOCK_TTL_SEC.
+_LOCK_TTL_SEC = 60
+_HEARTBEAT_SEC = 20
+
+_INTERRUPTED = "scan stopped unexpectedly — the API restarted or the worker died"
+
+# Strong references to in-flight scans. asyncio.create_task keeps only a WEAK
+# one, so a task nobody holds can be garbage-collected mid-sweep — and _run's
+# `finally` (which releases the lock) never runs. That produces exactly the
+# wedged state above, with no restart involved.
+_running: set[asyncio.Task] = set()
 _INT_FIELDS = {"total", "scanned"}
 _BOOL_FIELDS = {"with_credentials", "auto"}
 
@@ -69,6 +90,20 @@ async def current_job() -> Optional[dict[str, Any]]:
             job[k] = v == "1"
         else:
             job[k] = v or None
+
+    # A `running` job with no lock behind it is a scan whose worker is gone:
+    # the heartbeat stopped and the key expired. Reconcile HERE rather than in a
+    # startup hook, because this API runs several workers and any of them may
+    # answer the poll — a hook only fixes the worker that happens to restart.
+    # Written back, not just returned, so every other worker agrees.
+    #
+    # `done`/`error` reaching this point is normal: _run deletes the lock on its
+    # way out. Only `running` is a claim about the present.
+    if job.get("status") == "running" and not await r.exists(_LOCK_KEY):
+        finished = _utcnow().isoformat()
+        await _job_set(status="error", error=_INTERRUPTED, finished_at=finished)
+        job.update(status="error", error=_INTERRUPTED, finished_at=finished)
+        log.warning("scan.interrupted", job_id=job.get("id"))
     return job
 
 
@@ -110,7 +145,9 @@ async def start_scan(
         started_at=_utcnow().isoformat(),
         finished_at=None,
     )
-    asyncio.create_task(_run(cidr, username, password))
+    task = asyncio.create_task(_run(cidr, username, password))
+    _running.add(task)
+    task.add_done_callback(_running.discard)
     return await current_job() or {}
 
 
@@ -231,8 +268,21 @@ async def _known_camera_subnets() -> list[str]:
     return sorted(nets)
 
 
+async def _heartbeat(r: Any) -> None:
+    """Keep the lock alive for as long as this scan is actually running.
+
+    Refreshes IMMEDIATELY and then once per interval. Waiting a full interval
+    first would leave a scan that dies in its opening seconds holding a lock
+    nothing ever renewed — the same wedge, just a smaller window.
+    """
+    while True:
+        await r.expire(_LOCK_KEY, _LOCK_TTL_SEC)
+        await asyncio.sleep(_HEARTBEAT_SEC)
+
+
 async def _run(cidr: Optional[str], username: Optional[str], password: Optional[str]) -> None:
     r = await redis_client.get_redis()
+    beat = asyncio.create_task(_heartbeat(r))
     try:
         extra = None
         if not cidr:
@@ -294,4 +344,5 @@ async def _run(cidr: Optional[str], username: Optional[str], password: Optional[
         await _job_set(status="error", error=str(exc), finished_at=_utcnow().isoformat())
         log.error("scan.failed", error=str(exc))
     finally:
+        beat.cancel()
         await r.delete(_LOCK_KEY)

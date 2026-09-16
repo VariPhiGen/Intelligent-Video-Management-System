@@ -25,6 +25,7 @@ Run (from services/camera-mgmt): python -m pytest tests -q
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ class FakeRedis:
     def __init__(self):
         self.store: dict[str, str] = {}
         self.hashes: dict[str, dict[str, str]] = {}
+        self.expires: list[tuple[str, int]] = []
 
     async def set(self, key, value, ex=None, nx=False):
         if nx and key in self.store:
@@ -73,7 +75,11 @@ class FakeRedis:
         return int(b[field])
 
     async def expire(self, key, seconds):
+        self.expires.append((key, seconds))
         return True
+
+    async def exists(self, *keys):
+        return sum(1 for k in keys if k in self.store or k in self.hashes)
 
 
 @pytest.fixture
@@ -86,7 +92,14 @@ def redis(monkeypatch):
     monkeypatch.setattr(sm.redis_client, "get_redis", _get)
     # start_scan launches the scan as a background task; these tests are about
     # the lock and the job record it writes, not about the sweep.
-    monkeypatch.setattr(sm.asyncio, "create_task", lambda coro: coro.close())
+    class FakeTask:
+        def __init__(self, coro):
+            coro.close()
+
+        def add_done_callback(self, cb):
+            self.cb = cb
+
+    monkeypatch.setattr(sm.asyncio, "create_task", FakeTask)
     return fake
 
 
@@ -174,6 +187,81 @@ class TestScanLock:
         # The UI distinguishes "never scanned" from "scan finished with no
         # results"; an empty dict would render as the second.
         assert await sm.current_job() is None
+
+
+class TestInterruptedScan:
+    """A scan is an in-process asyncio task; the job record is in Valkey. The
+    two die at different times. When the API restarts mid-scan the task is
+    gone, but the hash still says `running` and the lock is still held — so the
+    UI spins forever on a scan nobody is running, and POST /scan answers 409.
+    Restarting does not clear it, because Valkey is a different container.
+
+    The lock's TTL is what frees scanning; reconciling the hash is what stops
+    the UI spinning. Both are needed: each alone leaves half the symptom."""
+
+    @pytest.mark.asyncio
+    async def test_a_scan_whose_worker_died_stops_reporting_itself_as_running(self, redis):
+        await sm.start_scan("10.0.0.0/24", None, None)
+        del redis.store[sm._LOCK_KEY]  # the lock expired; nothing refreshed it
+
+        job = await sm.current_job()
+        assert job["status"] == "error", "the UI polls this and spins on 'running'"
+        assert job["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_reconciled_status_is_written_back_not_just_returned(self, redis):
+        # Other workers poll the same hash. Fixing it only in the response
+        # leaves every other worker still reporting a running scan.
+        await sm.start_scan("10.0.0.0/24", None, None)
+        del redis.store[sm._LOCK_KEY]
+        await sm.current_job()
+        assert redis.hashes[sm._JOB_KEY]["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_live_scan_is_left_alone(self, redis):
+        await sm.start_scan("10.0.0.0/24", None, None)
+        assert (await sm.current_job())["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_a_finished_scan_is_not_rewritten_as_an_error(self, redis):
+        # _run deletes the lock on its way out, so "done with no lock" is the
+        # NORMAL end state and must not be mistaken for a death.
+        await sm.start_scan("10.0.0.0/24", None, None)
+        await sm._job_set(status="done", phase="done")
+        del redis.store[sm._LOCK_KEY]
+        assert (await sm.current_job())["status"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_the_lock_expires_in_minutes_not_hours(self, redis):
+        # A dead scan holds the lock until it expires. At an hour, the operator's
+        # only recovery is clearing Valkey by hand — which is the bug report.
+        assert sm._LOCK_TTL_SEC <= 120, "an operator will not wait this out"
+        assert sm._HEARTBEAT_SEC < sm._LOCK_TTL_SEC / 2, (
+            "a live scan must refresh well inside the TTL or it kills itself"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_live_scan_refreshes_its_own_lock(self, redis):
+        # The short TTL above is only safe if something renews it.
+        redis.store[sm._LOCK_KEY] = "1"
+        hb = asyncio.get_event_loop().create_task(sm._heartbeat(redis))
+        await asyncio.sleep(0)
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
+        # One immediate refresh, then one per interval — the first must not wait
+        # a full interval, or a restart inside the first interval is misread.
+        assert redis.expires and redis.expires[0] == (sm._LOCK_KEY, sm._LOCK_TTL_SEC)
+
+    @pytest.mark.asyncio
+    async def test_the_background_scan_is_referenced_so_it_cannot_be_collected(self, redis):
+        # asyncio.create_task keeps only a weak reference. Without a strong one
+        # the scan can be garbage-collected mid-sweep, and then _run's finally
+        # never runs: the lock is held and the job says running, forever.
+        await sm.start_scan("10.0.0.0/24", None, None)
+        assert sm._running, "nothing holds the task; it can vanish mid-scan"
 
 
 class TestJobFieldTypes:
