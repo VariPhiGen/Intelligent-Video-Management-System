@@ -17,7 +17,14 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [opened, synchronize, closed]
+    # `reopened` is here because leaving it out is a hole, found on 2026-09-16
+    # by the smoke-test PR. On `closed` this action reports success and locks
+    # the conversation — correct, there is nothing left to gate. But without
+    # `reopened` nothing re-runs when the PR comes back, so GitHub keeps
+    # displaying that success: a green CLA check on an unsigned PR. Any push
+    # would fix it via `synchronize`, which is exactly why it is easy to miss —
+    # close, reopen, merge, and no signature was ever collected.
+    types: [opened, reopened, synchronize, closed]
 
 permissions:
   actions: write
