@@ -152,11 +152,17 @@ A file-by-file tour for contributors lives in [`CODE-MAP.md`](CODE-MAP.md).
 
 ```bash
 ./vms up -d
-# UI:      http://localhost:8091    (login: admin/admin — change it; port = API_PORT)
+# UI:      http://localhost:8091    (user 'admin'; password printed on first run; port = API_PORT)
 # Keycloak http://localhost:8085    (master admin printed on first run)
 ```
 
-That is the whole install. On first run `./vms` creates `.env` from
+That is the whole install. **The sign-in password is generated, not
+`admin`/`admin`** — first run prints it and writes it to `.env` as
+`VMS_ADMIN_PASSWORD` (`grep VMS_ADMIN_PASSWORD .env` to read it back), and the
+realm's shipped `admin`/`admin` is retired before you ever reach the login page.
+See [`HARDENING.md` §1](HARDENING.md#1-sign-in-credentials).
+
+On first run `./vms` creates `.env` from
 `.env.example` and generates real secrets, because the API refuses to start on
 the shipped placeholder values — a deliberate guard, so that a box where a
 guessed `X-Internal-Key` is full admin cannot ship by accident.
@@ -198,7 +204,11 @@ generates the three real secrets the boot guard requires
 (`INTERNAL_API_KEY` / `DISCOVERY_SECRET_KEY` / `KEYCLOAK_ADMIN_PASSWORD`), adds
 the bridge overlay, then passes every argument through to `docker compose` —
 `vms ps`, `vms logs -f api`, `vms down`, etc. Then browse
-`http://localhost:8091` (admin / admin). In PowerShell call it as `.\vms.cmd`.
+`http://localhost:8091` as `admin`. Note that `gen-secrets.ps1` does **not**
+generate `VMS_ADMIN_PASSWORD`, so on Windows the seeded `admin`/`admin` is still
+live at first login (Keycloak marks it temporary and forces a change); set the
+key by hand in `.env` to retire it up front, as the Linux path does.
+In PowerShell call the wrapper as `.\vms.cmd`.
 
 **Generate secrets without starting** (optional — `vms` does this for you):
 

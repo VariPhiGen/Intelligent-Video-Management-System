@@ -26,7 +26,7 @@ The whole product runs from one command:
 
 ```bash
 cp .env.example .env    # first run generates real secrets via ./vms
-./vms up -d             # UI at http://localhost:8091 — admin/admin, change it
+./vms up -d             # UI at http://localhost:8091 — user 'admin', password in .env (VMS_ADMIN_PASSWORD)
 ```
 
 `./vms` is a thin `docker compose` wrapper that picks host/bridge networking
