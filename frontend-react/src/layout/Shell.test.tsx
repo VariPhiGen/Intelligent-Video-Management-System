@@ -147,33 +147,30 @@ describe('Shell nav — Administration needs an explicit yes', () => {
   });
 });
 
-describe('Shell nav — extensions contribute into a section', () => {
-  it('places the compliance extension entry under Govern', () => {
-    // The build includes the compliance extension, which registers
-    // "Evidence & Cases" under Govern gated on evidence_export. It follows the
-    // ordinary rule, so an unmentioned capability still shows it.
-    renderShell(principal({ live_view: true }), false);
-    expect(navItem('Evidence & Cases')).toBeInTheDocument();
-  });
-
-  it('hides the extension entry when its capability is denied', () => {
-    renderShell(principal({ evidence_export: false }), false);
-    expect(navItem('Evidence & Cases')).not.toBeInTheDocument();
-  });
-});
-
+// Anything asserting on what an EXTENSION contributes lives with that
+// extension — src/extensions/compliance/Shell.nav.test.tsx. Written here, it
+// ran against a build where the extension had been stripped and either failed
+// (asserting a nav entry that could not exist) or, worse, passed while
+// asserting the absence of something absent by construction. Tests move with
+// the code they cover; the section-header MECHANISM is core, so it stays, and
+// is written below against Administration rather than against an extension.
 describe('Shell nav — section headers follow their items', () => {
-  it('drops a section header once every item under it is hidden', () => {
-    // Govern holds Administration (admin-only) and the extension's
-    // Evidence & Cases. Deny both and the heading must go with them — an
-    // empty heading advertises a surface the principal cannot reach.
-    renderShell(principal({ evidence_export: false }), false);
-    expect(screen.queryByText('Govern')).not.toBeInTheDocument();
-  });
-
   it('keeps a section header while anything under it is still visible', () => {
-    renderShell(principal({ live_view: true }), false);
+    // Administration is core and admin-gated, so an admin always has exactly
+    // one item under Govern in every build — which is what makes this a test
+    // of the heading rule rather than of whatever happens to be installed.
+    renderShell(principal({ live_view: true }), true);
     expect(screen.getByText('Operate')).toBeInTheDocument();
     expect(screen.getByText('Govern')).toBeInTheDocument();
+    expect(navItem('Administration')).toBeInTheDocument();
+  });
+
+  it('drops a section header once every item under it is hidden', () => {
+    // Same principal, no admin: Administration goes, and with nothing else
+    // core under Govern the heading must go too. An empty heading advertises
+    // a surface the principal cannot reach.
+    renderShell(principal({ live_view: true }), false);
+    expect(screen.getByText('Operate')).toBeInTheDocument();
+    expect(navItem('Administration')).not.toBeInTheDocument();
   });
 });

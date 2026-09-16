@@ -33,16 +33,16 @@ Generated — do not edit between the markers.
 <!-- LEDGER:BEGIN -->
 | Service | Src lines | Test lines | Ratio | Tests |
 | --- | ---: | ---: | ---: | ---: |
-| analytics | 4,609 | 2,194 | 0.476 | 183 |
-| smartsearch | 6,666 | 2,957 | 0.444 | 251 |
+| analytics | 6,835 | 3,777 | 0.553 | 350 |
+| smartsearch | 8,180 | 4,479 | 0.548 | 371 |
+| camera-mgmt | 13,238 | 7,238 | 0.547 | 628 |
 | frames | 1,533 | 664 | 0.433 | 59 |
-| camera-mgmt | 13,965 | 5,997 | 0.429 | 531 |
+| nvr | 4,459 | 1,276 | 0.286 | 131 |
 | motion | 1,163 | 332 | 0.285 | 19 |
-| nvr | 4,419 | 1,183 | 0.268 | 124 |
-| frontend-react | 18,345 | 982 | 0.054 | 119 |
-| **total** | **50,700** | **14,309** | **0.282** | **1286** |
+| frontend-react | 17,311 | 2,222 | 0.128 | 217 |
+| **total** | **52,719** | **19,988** | **0.379** | **1775** |
 
-Plus 13 repo-level structural tests and 88 E2E assertions across 9 journey specs (J1, J2, J3, J4, J5, J6, J7, J8, J9). **Grand total 1387.**
+Plus 13 repo-level structural tests and 86 E2E assertions across 9 journey specs (J1, J2, J3, J4, J5, J6, J7, J8, J9). **Grand total 1874.**
 <!-- LEDGER:END -->
 
 Two things about these numbers, so nobody reconciles them against an older
