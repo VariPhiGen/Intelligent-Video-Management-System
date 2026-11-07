@@ -31,6 +31,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiFetch } from '@/lib/api';
+import { useCameras } from '@/lib/cameras';
 import { Stat } from './Stat';
 
 interface PlateRead {
@@ -174,11 +175,12 @@ function whenShort(ms: number): string {
  *  confidence is shown per read and why the plate is set in a mono face — two
  *  plates one character apart have to be distinguishable at a glance.
  */
-function PlatesPanel({ active, recent, top, onOpen }: {
+function PlatesPanel({ active, recent, top, onOpen, camName }: {
   active: boolean | null | undefined;
   recent: PlateRead[];
   top: TopPlate[];
   onOpen: (plate: string) => void;
+  camName: (slug: string) => string;
 }) {
   // Not enabled at all. A zero here is not a statement about traffic, and
   // "no plates read" would be read as one.
@@ -227,7 +229,7 @@ function PlatesPanel({ active, recent, top, onOpen }: {
                           title={`Look up ${p.plate}`}>
                     <span className="aid-plate-no">{p.plate}</span>
                     <span className="aid-plate-meta">
-                      {p.camera_id} · {whenShort(p.timestamp)}
+                      {camName(p.camera_id)} · {whenShort(p.timestamp)}
                     </span>
                     {/* Null is "not recorded" (rows predating migration 003),
                         not "scored zero" — an em dash, never a number. */}
@@ -300,6 +302,14 @@ function NoDetections({ cameras, days, onWiden }: {
 
 export function AiDetectionsDashboard() {
   const nav = useNavigate();
+  // The index reports cameras by relay slug (`exit-gate-hvte`); everywhere
+  // else the operator knows them by name (`exit gate`), and a slug like
+  // `test2-799k` for the camera named `cam3-entry` reads as a different camera
+  // entirely. Fall back to the slug for one that is no longer registered.
+  const { cameras: registered } = useCameras(60000);
+  const camName = useCallback(
+    (slug: string) => registered.find(c => c.slug === slug)?.name || slug,
+    [registered]);
   const [days, setDays] = useState(1);
   const [data, setData] = useState<DetResp | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -381,9 +391,21 @@ export function AiDetectionsDashboard() {
       {err && <div className="panel"><div className="panel-body" style={{ color: 'var(--red)' }}>{err}</div></div>}
 
       {firstLoad && (
-        <div className="panel"><div className="panel-body aid-none" style={{ textAlign: 'center', padding: 'var(--s9)' }}>
-          Loading detections…
-        </div></div>
+        <div role="status" aria-label="Loading detections" className="aid-loading">
+          <span className="sr-only">Loading detections…</span>
+          <div className="stat-grid" aria-hidden="true">
+            {Array.from({ length: 5 }, (_, i) => <div className="stat" key={i}>
+              <div className="skel" style={{ width: '55%', height: 30, marginBottom: 12 }} />
+              <div className="skel" style={{ width: '75%', height: 12 }} />
+            </div>)}
+          </div>
+          <div className="aid-split" aria-hidden="true">
+            {[0, 1].map(i => <div className="panel panel-body" key={i}>
+              <div className="skel" style={{ width: '40%', height: 16, marginBottom: 24 }} />
+              <div className="skel" style={{ height: 210 }} />
+            </div>)}
+          </div>
+        </div>
       )}
 
       {showEmpty && (
@@ -418,7 +440,7 @@ export function AiDetectionsDashboard() {
               letter-spacing, `exit-gate-hvte` set the tile's whole width and a
               longer name would simply overflow. `text` drops it to a size a
               name reads at and lets it wrap. */}
-          <Stat label="Top camera" value={topCam ? topCam.camera : '—'} text
+          <Stat label="Top camera" value={topCam ? camName(topCam.camera) : '—'} text
                 sub={topCam ? `${topCam.count.toLocaleString()} events` : undefined} />
         </div>
 
@@ -480,7 +502,7 @@ export function AiDetectionsDashboard() {
             <div className="panel-body">
               {(s?.top_cameras ?? []).map((c) => (
                 <div key={c.camera} className="aid-cam">
-                  <div className="aid-cam-head"><b>{c.camera}</b><span>{c.count.toLocaleString()}</span></div>
+                  <div className="aid-cam-head"><b title={c.camera}>{camName(c.camera)}</b><span>{c.count.toLocaleString()}</span></div>
                   <div className="aid-cam-track">
                     <div className="aid-cam-fill" style={{ width: `${(c.count / maxCam) * 100}%` }} />
                   </div>
@@ -519,7 +541,7 @@ export function AiDetectionsDashboard() {
         </div>
 
         <PlatesPanel active={data?.plates_active} recent={recentPlates}
-                     top={topPlates} onOpen={openPlate} />
+                     top={topPlates} onOpen={openPlate} camName={camName} />
       </div>
       )}
     </div>

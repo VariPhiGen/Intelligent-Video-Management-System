@@ -197,6 +197,8 @@ def _options_media2(svc: Any, cfg: Any) -> Optional[dict]:
         return None
     enc = str(getattr(cfg, "Encoding", "") or "")
     block = next((b for b in blocks if str(getattr(b, "Encoding", "")) == enc), blocks[0])
+    # Every codec this configuration can be switched to (the camera returns one options block per encoding).
+    encodings = sorted({str(getattr(b, "Encoding", "") or "") for b in blocks} - {""})
 
     frs = [x for x in (_num(v) for v in getattr(block, "FrameRatesSupported", None) or []) if x is not None]
     fps_range = {"min": int(min(frs)), "max": int(max(frs))} if frs else None
@@ -211,6 +213,7 @@ def _options_media2(svc: Any, cfg: Any) -> Optional[dict]:
         "quality_range": _range(getattr(block, "QualityRange", None)),
         "h264_profiles": [str(p) for p in getattr(block, "ProfilesSupported", None) or []],
         "constant_bitrate_supported": bool(getattr(block, "ConstantBitRateSupported", False)),
+        "encodings": encodings,
     }
 
 
@@ -269,6 +272,12 @@ def _set_media2(svc: Any, config_token: str, changes: dict) -> None:
 
     if changes.get("gov_length") is not None:
         conf.GovLength = int(changes["gov_length"])
+    if changes.get("encoding") and str(getattr(conf, "Encoding", "")) != changes["encoding"]:
+        conf.Encoding = changes["encoding"]
+        # Profile names belong to a codec (H.265 "Main10" isn't an H.264 profile): reset to the common "Main"
+        # unless one was given — a profile the camera rejects for the new codec fails the whole Set.
+        if not changes.get("h264_profile"):
+            conf.Profile = "Main"
     if changes.get("h264_profile"):
         conf.Profile = changes["h264_profile"]
     if changes.get("quality") is not None:
@@ -336,6 +345,7 @@ def _get_ver10(media: Any) -> list[dict]:
                 "quality_range": _range(getattr(opts, "QualityRange", None)),
                 "bitrate_kbps_range": _bitrate_range(opts),
                 **(_codec_options(opts) or {}),
+                "encodings": [c for c in ("H264", "JPEG", "MPEG4") if getattr(opts, c, None) is not None],
             }
         except Exception as exc:  # noqa: BLE001 — options are advisory
             log.debug("onvif_media.options_failed", token=vec.token, error=str(exc))
@@ -364,6 +374,14 @@ def _set_ver10(media: Any, config_token: str, changes: dict) -> None:
             rate.FrameRateLimit = int(changes["fps"])
         if changes.get("bitrate_kbps") is not None:
             rate.BitrateLimit = int(changes["bitrate_kbps"])
+
+    if changes.get("encoding"):
+        if changes["encoding"] != "H264":
+            raise OnvifError("This camera's encoder (ONVIF Media ver10) can only be set to H264 here")
+        conf.Encoding = "H264"
+        if getattr(conf, "H264", None) is None:      # a camera on H.265 may carry no H.264 block at all
+            conf.H264 = {"GovLength": int(changes.get("gov_length") or 50),
+                         "H264Profile": changes.get("h264_profile") or "Main"}
 
     if changes.get("gov_length") is not None or changes.get("h264_profile"):
         h264 = getattr(conf, "H264", None)
@@ -433,7 +451,10 @@ async def _call(fn, *args) -> Any:
     except Exception as exc:  # noqa: BLE001 — zeep raises a zoo of exception types
         if is_auth_error(exc):
             raise OnvifError("Camera rejected the stored ONVIF credentials", auth=True)
-        raise OnvifError(str(exc))
+        # Never a blank message: several zeep / requests / ssl exceptions stringify to "" (a TLS handshake reset, a
+        # bare ConnectionError), and an empty detail reaches the UI as a bare "Request failed (HTTP 502)" — found live
+        # on KEC's Weld Shop West Side View-1 Verify & save, with nothing to say whether it was TLS, the port or a refusal.
+        raise OnvifError(str(exc).strip() or f"{exc.__class__.__name__} while talking to the camera over ONVIF")
 
 
 async def get_encoder_settings(ip: str, port: int, user: str, password: str) -> list[dict]:

@@ -19,7 +19,10 @@ source:
   max_sample_fps: 2.0                        # sampler mode only
 
 detect:
-  confidence: 0.35
+  # Below this a box is dropped. 0.4, not ultralytics' 0.35: over ~6,000 stored
+  # person boxes, 0.35-0.40 was the single biggest band (12%) and where false
+  # triggers sit. Env ANALYTICS_DETECT_CONFIDENCE (docker-compose.yml) wins.
+  confidence: 0.4
   min_crop_width: 16       # too small to embed is too small to track
   min_crop_height: 32
   queue_size: 64           # frames, not detections; full evicts the OLDEST
@@ -68,14 +71,39 @@ motion:
 
 tracking:
   enabled: true
-  max_association_cost: 1.75   # real continuations measured at p99 = 1.63
+  # 2.5 SINCE 2026-09-17, MEASURED, not guessed. 1.75 was fitted when this
+  # pipeline sampled at 1-2 FPS; a walking person covers more ground between
+  # frames than that threshold expects at the rate the broker now delivers.
+  # Four minutes of gate footage replayed through this tracker and the real
+  # activity engine:
+  #
+  #     cost 1.75, max_age 3    94 tracks / 81 objects, median life 1.2 s
+  #     cost 2.50, max_age 3    85 tracks / 74 objects, median life 3.4 s
+  #     cost 2.50, max_age 5    66 tracks / 55 objects at 2.5 FPS
+  #
+  # with the same crossings counted in every case. Fewer identities for the same
+  # footage is the point: each spurious identity is a duplicate activity event.
+  max_association_cost: 2.5
   velocity_alpha: 0.5
   confirm_after_seconds: 1.0
-  max_age_seconds: 3.0
+  max_age_seconds: 5.0
   stationary_after_seconds: 4.0
   stationary_distance: 0.15
   max_tracks_per_key: 64
   index_tentative: true
+  # RE-ASSOCIATION. An object that reappears where another just vanished is the
+  # same object far more often than not, and this tracker has no appearance
+  # model to ask. So: remember a dead identity for this long after it is
+  # dropped, and let a new detection inherit it when it overlaps by
+  # `reassociate_iou` OR sits within `reassociate_distance` object heights.
+  #
+  # DELIBERATELY STRICT. An extra identity costs a duplicate event; a wrong
+  # merge loses a person from search entirely, which is worse. A near miss is
+  # counted on /health as `id_switch_suspects` rather than quietly accepted, so
+  # the thresholds can be judged from data instead of taste. 0 = off.
+  reassociate_within_seconds: 2.0
+  reassociate_iou: 0.3
+  reassociate_distance: 1.0
 
 index_policy:
   suppression_enabled: true
@@ -117,7 +145,29 @@ plates:
 
 models:
   detector: "ultralytics"
-  detector_weights: "/models/weights/yolov8n.pt"
+  # AUTO: the most accurate candidate this machine can keep up with, measured
+  # here and cached (analytics/capacity.py). A path pins one model.
+  # Env: ANALYTICS_DETECTOR_WEIGHTS.
+  detector_weights: auto
+  # Most accurate first. yolov8s leads: on night IR frames from site cameras
+  # (2026-10-26) n indexed a cloth, a truck flank and a blocked lens as people
+  # and missed a rider and two motorbikes; s at 640 made no false detections
+  # on the same frames. No confidence threshold separates n's errors from real
+  # people (real 0.41, false 0.57/0.64), and s at 480 to save CPU missed both
+  # real people — so the trade is model size, not input size or threshold.
+  # n is the fallback for machines s cannot keep up on. Full paths under the
+  # models volume: ultralytics downloads the release asset to exactly there.
+  # Env: ANALYTICS_DETECTOR_CANDIDATES (comma-separated).
+  detector_candidates:
+    - /models/weights/yolov8s.pt
+    - /models/weights/yolov8n.pt
+  # Demand = Smart Search cameras x camera_fps x motion_share + activity
+  # cameras x camera_fps; the chosen model must measure >= demand x headroom.
+  # Env: ANALYTICS_CAPACITY_MOTION_SHARE / ANALYTICS_CAPACITY_CAMERA_FPS
+  # (defaults to FRAMES_SAMPLE_FPS when set).
+  capacity_headroom: 1.25
+  capacity_motion_share: 0.5
+  capacity_camera_fps: 5.0
   device: null                 # null = CUDA if present, else CPU
   detector_backend: auto       # auto | openvino | torch
   backend_attempts: 3
@@ -165,7 +215,13 @@ activities:
   # group standing still keeps being seen. Smart Search's motion-gated path is
   # separate and unchanged. Env: ANALYTICS_ACTIVITIES_ENABLED.
   enabled: true
-  queue_size: 16             # frames; full evicts the OLDEST
+  # frames; full evicts the OLDEST. 64, not 16: with every camera running
+  # activities the worker averages ~18 fps against a ~25 fps ceiling, but a
+  # stall on the internet link hits all five cameras at once and each then
+  # flushes its backlog - 16 frames overflowed on such bursts (570 frames, 0.9%,
+  # never reached an activity in a measured hour). 64 absorbs a ~2.5 s
+  # shared stall; a queued 1080p frame is ~6 MB, so ~330 MB at worst.
+  queue_size: 64
 
 events:
   # CPU ACTIVITY EVENTS -> the VMS. The activity engine runs on this service's
@@ -179,6 +235,30 @@ events:
   timeout_seconds: 10.0
   queue_size: 1024
   batch_size: 50
+
+heatmap:
+  # HEATMAP OVERLAY -> the VMS. The Heatmap_overlay activity accumulates where
+  # its chosen classes were seen and renders a picture on this interval; each
+  # one is POSTed to camera-mgmt's /api/analytics/heatmaps, which stores it and
+  # serves it to the Heatmap page. The interval is NOT the accumulation window:
+  # heat keeps accumulating across snapshots for the whole session.
+  # Env: ANALYTICS_HEATMAP_URL / ANALYTICS_HEATMAP_INTERVAL_SECONDS. Empty url
+  # falls back to the events url and key above (same API).
+  snapshot_interval_seconds: 60.0
+  # The heat matrix is this many times smaller than the frame per axis. A heat
+  # point is tens of pixels wide and then blurred, so a quarter of the
+  # resolution is invisible and costs a sixteenth of the work.
+  scale: 4
+  # Long side of the rendered overlay. The DeepStream pipeline rendered at its
+  # muxer size (1280x720); a card in the browser needs no more.
+  output_width: 1280
+  jpeg_quality: 85
+  url: ""
+  internal_api_key: ""
+  timeout_seconds: 20.0
+  # Artifacts are ~200-400 KB, so the queue is short and the OLDEST is dropped:
+  # a stale overlay is worthless next to the one just made.
+  queue_size: 8
 
 logging:
   level: "INFO"

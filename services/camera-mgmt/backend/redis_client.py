@@ -181,11 +181,14 @@ async def get_cached_snapshot(slug: str) -> Optional[bytes]:
 
 async def set_cached_snapshot(slug: str, jpeg: bytes) -> None:
     r = await get_redis()
-    await r.set(
-        f"stream:snapshot_jpeg:{slug}",
-        base64.b64encode(jpeg).decode("ascii"),
-        ex=SNAPSHOT_CACHE_TTL_SEC,
-    )
+    import hashlib
+    import time
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.set(f"stream:snapshot_jpeg:{slug}", base64.b64encode(jpeg).decode("ascii"), ex=SNAPSHOT_CACHE_TTL_SEC)
+        pipe.set(f"stream:snapshot_meta:{slug}",
+                 f"{time.time()}:{hashlib.sha256(jpeg).hexdigest()}", ex=SNAPSHOT_CACHE_TTL_SEC)
+        await pipe.execute()
+
 
 
 # ── Bulk cleanup ──────────────────────────────────────────────────────────────
@@ -200,6 +203,11 @@ async def delete_stream_keys(slug: str) -> None:
         f"stream:snapshot_jpeg:{slug}",
         f"stream:restamp:{slug}",
         f"stream:hls_fail:{slug}",
+        # PTZ control lease + in-flight continuous-move marker (see
+        # services/ptz_control.py). A deleted camera must not leave a lease
+        # behind that a re-added camera of the same slug would inherit.
+        f"ptz:lock:{slug}",
+        f"ptz:cmd:{slug}",
     ]
     if keys:
         await r.delete(*keys)

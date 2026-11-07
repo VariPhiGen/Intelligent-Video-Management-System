@@ -15,6 +15,9 @@ import { useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import type { Camera, SubTrack } from '@/lib/types';
 import { useToast } from '@/components/Toast';
+import { RetentionInput } from '@/components/RetentionInput';
+import { formatRetention, retentionError, splitRetention, toMinutes,
+         MINUTES_PER_DAY, type RetentionUnit } from '@/lib/retention';
 
 const SOURCE_LABEL: Record<string, string> = {
   onvif: 'from the camera’s ONVIF profiles',
@@ -40,7 +43,7 @@ function benefit(sub: SubTrack): string {
  * ranged from +12% to +230% of a camera's storage, so the card states the
  * actual measured bitrate as GB/day rather than quoting an average that is
  * wrong by an order of magnitude on the cameras that matter. */
-function cost(sub: SubTrack, keepDays: number | null): string {
+function cost(sub: SubTrack, keepMinutes: number | null): string {
   const mbps = sub.bitrate_mbps;
   if (mbps == null) {
     return 'Stores a second copy of everything. Its size was not measured — '
@@ -50,10 +53,15 @@ function cost(sub: SubTrack, keepDays: number | null): string {
   const share = sub.main_bitrate_mbps
     ? ` — about ${Math.round((mbps / sub.main_bitrate_mbps) * 100)}% of what the main recording uses`
     : '';
-  const total = keepDays
-    ? ` Kept for ${keepDays} day${keepDays === 1 ? '' : 's'}, that is roughly `
-      + `${Math.round(gbDay * keepDays)} GB.`
-    : '';
+  // Minutes in, gigabytes out. A sub kept for thirty minutes costs megabytes,
+  // and rounding its window to "0 days" (or its size to "0 GB") would make the
+  // one number on this card that justifies the feature read as free.
+  let total = '';
+  if (keepMinutes) {
+    const gb = (gbDay * keepMinutes) / MINUTES_PER_DAY;
+    const size = gb >= 1 ? `${Math.round(gb)} GB` : `${Math.max(1, Math.round(gb * 1000))} MB`;
+    total = ` Kept for ${formatRetention(keepMinutes)}, that is roughly ${size}.`;
+  }
   return `About ${gbDay.toFixed(1)} GB per day${share}.${total}`;
 }
 
@@ -62,9 +70,12 @@ export function SubTrackCard({ camera, onSaved }: { camera: Camera; onSaved: () 
   const [busy, setBusy] = useState<'probe' | 'toggle' | null>(null);
   const sub = camera.sub_track;
   // Blank = the appliance default. Kept as text so clearing the box means
-  // "use the default" rather than "zero days".
-  const [keep, setKeep] = useState(() => sub?.retention_days?.toString() ?? '');
-  const keepDays = keep.trim() === '' ? null : Number(keep);
+  // "use the default" rather than "zero". The unit is seeded from the stored
+  // MINUTES, so a sub kept for three days opens reading "3 days".
+  const [keep, setKeep] = useState(() => splitRetention(sub?.retention_minutes).value);
+  const [keepUnit, setKeepUnit] =
+    useState<RetentionUnit>(() => splitRetention(sub?.retention_minutes).unit);
+  const keepMinutes = keep.trim() === '' ? null : toMinutes(keep, keepUnit);
 
   const probe = async () => {
     setBusy('probe');
@@ -80,11 +91,16 @@ export function SubTrackCard({ camera, onSaved }: { camera: Camera; onSaved: () 
     } finally { setBusy(null); }
   };
 
-  const toggle = async (recording_enabled: boolean, retention_days = keepDays) => {
+  const toggle = async (recording_enabled: boolean, retention_minutes = keepMinutes) => {
     setBusy('toggle');
     try {
+      if (retention_minutes != null && retentionError(keep, keepUnit)) {
+        toast(retentionError(keep, keepUnit) as string, 'err');
+        setBusy(null);
+        return;
+      }
       await apiFetch(`/cameras/${camera.id}/sub-track`,
-                     { method: 'PUT', body: JSON.stringify({ recording_enabled, retention_days }) });
+                     { method: 'PUT', body: JSON.stringify({ recording_enabled, retention_minutes }) });
       toast(recording_enabled ? 'Recording the second stream' : 'Stopped recording the second stream', 'ok');
       onSaved();
     } catch (e: any) {
@@ -127,10 +143,10 @@ export function SubTrackCard({ camera, onSaved }: { camera: Camera; onSaved: () 
             <span style={{ color: 'var(--muted)' }}>Storage</span>
             {/* Prefer the number the operator is typing, then what the server
                 says will actually apply — a camera on the appliance default has
-                no `retention_days` of its own but is still kept for a definite
-                number of days, and the total is the useful half of the answer. */}
+                no `retention_minutes` of its own but is still kept for a
+                definite period, and the total is the useful half of the answer. */}
             <span>{cost(sub, sub.recording_enabled
-              ? (keepDays ?? sub.effective_retention_days) : null)}</span>
+              ? (keepMinutes ?? sub.effective_retention_minutes) : null)}</span>
           </div>
 
           <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer' }}>
@@ -151,15 +167,23 @@ export function SubTrackCard({ camera, onSaved }: { camera: Camera; onSaved: () 
           {sub.recording_enabled && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '10px 0 0 26px' }}>
               <span style={{ fontSize: 12.5 }}>Keep this stream for</span>
-              <input
-                type="number" min={1} max={3650} step={1} value={keep}
-                onChange={e => setKeep(e.target.value)}
-                onBlur={() => sub.recording_enabled && toggle(true)}
-                placeholder={sub.effective_retention_days
-                  ? `Default (${sub.effective_retention_days})` : 'Default'}
-                style={{ width: 110 }}
-              />
-              <span style={{ fontSize: 12.5, color: 'var(--muted)' }}>days</span>
+              {/* Save when focus LEAVES the control, not on every blur inside
+                  it: the number and the unit are two fields, and tabbing from
+                  "30" to the unit dropdown would otherwise save 30 days a
+                  moment before the operator picks "minutes". */}
+              <span onBlur={e => {
+                if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+                if (sub.recording_enabled) toggle(true);
+              }}>
+                <RetentionInput
+                  value={keep} unit={keepUnit}
+                  onValue={setKeep} onUnit={setKeepUnit}
+                  placeholder={sub.effective_retention_minutes
+                    ? `Default (${formatRetention(sub.effective_retention_minutes)})` : 'Default'}
+                  width={100}
+                  ariaLabel="Keep this stream for"
+                />
+              </span>
             </div>
           )}
           {sub.recording_enabled && (

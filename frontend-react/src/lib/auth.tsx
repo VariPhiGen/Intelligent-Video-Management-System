@@ -28,16 +28,36 @@ interface AuthState {
 }
 
 let kc: Keycloak | null = null;
+let kcProbe = '';   // Keycloak's discovery URL — "is the sign-in server answering at all?"
+
+/**
+ * Keep the session fresh WITHOUT throwing a video wall onto the login page over a network blip.
+ *
+ * A failed refresh used to call kc.login() straight away — a full-page navigation. On a kiosk / Android video wall
+ * a 10-second tunnel or SIM drop then left the screen on Keycloak's login page, or on a blank "can't reach" page
+ * when that navigation failed too (reported as "white page after some run"). Now: if Keycloak itself can't be
+ * reached it's the network — keep the current session and try again on the next tick (the HLS streams don't need
+ * the token anyway). Only when Keycloak answers and still refuses (the SSO session really ended) do we sign in.
+ * Returns true when the token is fresh; throws only when it is redirecting to the login page.
+ */
+async function refreshSession(minValidity: number): Promise<boolean> {
+  if (!kc) return true;
+  try {
+    await kc.updateToken(minValidity);
+    return true;
+  } catch {
+    const reachable = await fetch(kcProbe, { cache: 'no-store' }).then((r) => r.ok).catch(() => false);
+    if (!reachable) return false;              // network / tunnel down: not a sign-out
+    kc.login();
+    throw new Error('Session expired');
+  }
+}
 
 /** Bearer header for the current session (empty in dev mode). */
 export async function authHeaders(): Promise<Record<string, string>> {
   if (!kc) return {};
-  try {
-    await kc.updateToken(30);
-  } catch {
-    kc.login();
-    throw new Error('Session expired');
-  }
+  const fresh = await refreshSession(30);
+  if (!fresh && kc.isTokenExpired()) throw new Error('Sign-in server unreachable — retrying');
   return kc.token ? { Authorization: `Bearer ${kc.token}` } : {};
 }
 
@@ -108,6 +128,7 @@ async function initAuth(): Promise<void> {
     ? cfg.url
     : `${location.protocol}//${location.hostname}:${cfg.port || 8085}`;
   kc = new Keycloak({ url, realm: cfg.realm || 'vms', clientId: cfg.client_id || 'vms-web' });
+  kcProbe = `${url.replace(/\/$/, '')}/realms/${encodeURIComponent(cfg.realm || 'vms')}/.well-known/openid-configuration`;
   const ok = await kc.init({
     onLoad: 'login-required',
     pkceMethod: 'S256',
@@ -132,7 +153,12 @@ async function initAuth(): Promise<void> {
     }
   } catch { /* storage off */ }
 
-  setInterval(() => { kc?.updateToken(60).catch(() => kc?.login()); }, 60000);
+  setInterval(() => { refreshSession(60).catch(() => {}); }, 60000);
+  // Android freezes timers while the screen is off / the tab is hidden: refresh the moment it's visible again, before
+  // anything on the page needs the token (and before the SSO idle timeout can be reached by the frozen interval).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshSession(60).catch(() => {});
+  });
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {

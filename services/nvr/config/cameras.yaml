@@ -23,7 +23,20 @@ recording:
   # have measured your own hardware; an explicit value always wins.
   # max_concurrent_extractions: 4
   # Age-based retention for cameras without their own value (registry-synced
-  # cameras pass NVR_DEFAULT_RETENTION_DAYS per camera, which takes priority).
+  # cameras pass their own resolved figure, which takes priority).
+  #
+  # MINUTES is the canonical unit — segments are 60 s and retention deletes
+  # whole ones, so a minute is the finest period this recorder can honour.
+  # `default_retention_days` below still works and is read as a day-spelling
+  # of the same setting; set `default_retention_minutes` to express what days
+  # cannot (a lobby camera kept 20 minutes, a rig kept an hour). Per camera,
+  # a `cameras:` entry may carry `retention_minutes` or `retention_days`.
+  #
+  # The sweep PACES ITSELF from the shortest retention on the box: a fleet of
+  # 30-day cameras is still swept hourly, while one camera at 10 minutes pulls
+  # the loop to 150 s, so the setting means what it says. Directory walks
+  # (orphan/clip/HLS cleanup) stay hourly regardless.
+  # default_retention_minutes: 43200
   default_retention_days: 30
   # HARD storage cap (GB): when total footage exceeds this, the oldest segments
   # across ALL cameras are deleted until back under. Strongly recommended —

@@ -39,6 +39,21 @@ class MotionEngine:
         self._events: deque[dict] = deque(maxlen=_EVENT_LOG_SIZE)
         self._event_seq = 0
         self._event_lock = threading.Lock()
+        #: detector/activity.py — runs of motion for the playback timeline.
+        #: None = not recorded (no VMS URL, or switched off).
+        self._activity = None
+
+    def attach_activity(self, recorder) -> None:
+        self._activity = recorder
+
+    def note_motion(self, camera: str, motion: bool, ts: float) -> None:
+        """One sample's motion decision. Never raises into the sampling path."""
+        if self._activity is not None:
+            self._activity.sample(camera, motion, ts)
+
+    def activity_snapshot(self) -> dict:
+        return self._activity.snapshot() if self._activity is not None \
+            else {"configured": False}
 
     # ── Camera lifecycle ──────────────────────────────────────────────────────
 
@@ -86,6 +101,8 @@ class MotionEngine:
         if cam is None:
             return False
         cam.stop.set()
+        if self._activity is not None:
+            self._activity.end(name)
         if thread is not None:
             # Bounded join outside the registry lock; the loop notices stop
             # within one read timeout even mid-reconnect (abortable backoff).

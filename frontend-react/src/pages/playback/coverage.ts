@@ -92,3 +92,18 @@ export function fmtWall(epochSec: number): string {
   const d = new Date(epochSec * 1000), p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+
+// Recording is switched on, but nothing new has landed for this long. Segments
+// are 60 s and the NVR calls its own indexer stale at 180 s; ten minutes is
+// well clear of both, so this never flickers on a healthy camera.
+const STALL_MS = 10 * 60 * 1000;
+
+/** "Recording" is the setting; this asks whether footage is actually arriving.
+ *  A camera that went offline days ago otherwise sat under a green, pulsing
+ *  "Recording" badge — the setting was still on, and nothing said the newest
+ *  footage was five days old. */
+export function isStalled(c: { recording: boolean; latest: string | null }, now = Date.now()): boolean {
+  if (!c.recording || !c.latest) return false;
+  const t = Date.parse(c.latest);
+  return Number.isFinite(t) && now - t > STALL_MS;
+}

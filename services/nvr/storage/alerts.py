@@ -53,14 +53,46 @@ DISK_CRIT_PCT = 95.0
 # failing, the operator is about to start losing retention they think they have.
 CAP_WARN_PCT = 90.0
 # How long after an eviction the cap still counts as binding. Retention runs
-# hourly, so a window shorter than a couple of passes would flicker between
-# "binding" and "fine" while the cap evicts on every single pass.
+# at most hourly (faster when a camera is kept for minutes), so a window
+# shorter than a couple of passes would flicker between "binding" and "fine"
+# while the cap evicts on every single pass. Sized against the SLOWEST cadence
+# deliberately: a faster sweep only makes this window more generous, never
+# tighter than the thing it is smoothing.
 CAP_BINDING_WINDOW_S = 6 * 3600
+
+
+def _trim(value: float, unit: str) -> str:
+    """`11.4 days`, but `11 days` rather than `11.0 days`.
+
+    One decimal where it carries information and none where it does not. This
+    formatter serves both an EXACT configured policy and a MEASURED on-disk
+    span, and a policy of thirty days rendered "30.0 days" reads as a
+    measurement rather than as the number someone typed.
+    """
+    rounded = round(value, 1)
+    body = f"{rounded:.0f}" if rounded == int(rounded) else f"{rounded:.1f}"
+    plural = "" if body == "1" else "s"
+    return f"{body} {unit}{plural}"
+
+
+def format_retention(minutes: float | None) -> str:
+    """Human spelling of a retention period. Mirrors camera-mgmt's
+    services/retention_units.format_retention — two services, one wording, so
+    an operator reading a storage alert and a compliance report sees the same
+    period described the same way."""
+    if minutes is None:
+        return "unknown"
+    minutes = float(minutes)
+    if minutes >= 1440:
+        return _trim(minutes / 1440, "day")
+    if minutes >= 60:
+        return _trim(minutes / 60, "hour")
+    return _trim(minutes, "minute")
 
 
 def evaluate(*, disk_state: dict | None, footage_bytes: int, limit_bytes: int | None,
              pressure: dict, oldest_epoch: float | None,
-             configured_days: int | None, now: float | None = None) -> dict:
+             configured_minutes: int | None, now: float | None = None) -> dict:
     """Fold everything into one state plus the reasons behind it. Pure.
 
     Pure on purpose: this is the whole decision, so it can be tested exhaustively
@@ -95,18 +127,21 @@ def evaluate(*, disk_state: dict | None, footage_bytes: int, limit_bytes: int | 
     last_evict = pressure.get("size_cap_last_at")
     binding = bool(last_evict and (now - last_evict) <= CAP_BINDING_WINDOW_S)
 
-    effective_days = None
+    # In MINUTES, like the policy it is compared against. Days would have
+    # rounded a fleet kept for hours down to "0.0 days" in the one message
+    # whose whole job is to say how much retention the cap is costing.
+    effective_minutes = None
     if oldest_epoch:
-        effective_days = max(0.0, (now - oldest_epoch) / 86400.0)
+        effective_minutes = max(0.0, (now - oldest_epoch) / 60.0)
 
     if binding:
         # The message names the shortfall rather than the mechanism, because the
         # mechanism is working correctly and the shortfall is the problem.
-        if effective_days is not None and configured_days:
+        if effective_minutes is not None and configured_minutes:
             raise_to(WARNING, (
                 f"Storage cap is shortening retention: cameras are configured "
-                f"for {configured_days} days but the oldest footage on disk is "
-                f"{effective_days:.1f} days old."))
+                f"for {format_retention(configured_minutes)} but the oldest "
+                f"footage on disk is {format_retention(effective_minutes)} old."))
         else:
             raise_to(WARNING, "Storage cap is evicting footage to stay under the limit.")
     elif cap_pct is not None and cap_pct >= CAP_WARN_PCT:
@@ -126,9 +161,9 @@ def evaluate(*, disk_state: dict | None, footage_bytes: int, limit_bytes: int | 
         "disk_used_pct": used_pct,
         "cap_usage_pct": (round(cap_pct, 1) if cap_pct is not None else None),
         "cap_binding": binding,
-        "effective_retention_days": (round(effective_days, 1)
-                                     if effective_days is not None else None),
-        "configured_retention_days": configured_days,
+        "effective_retention_minutes": (round(effective_minutes, 1)
+                                        if effective_minutes is not None else None),
+        "configured_retention_minutes": configured_minutes,
         "size_cap_evictions": pressure.get("size_cap_evictions", 0),
         "disk_floor_evictions": pressure.get("disk_floor_evictions", 0),
         "checked_at": now,
@@ -225,8 +260,8 @@ class StorageAlerter:
             "disk_used_pct": result["disk_used_pct"],
             "cap_usage_pct": result["cap_usage_pct"],
             "cap_binding": result["cap_binding"],
-            "effective_retention_days": result["effective_retention_days"],
-            "configured_retention_days": result["configured_retention_days"],
+            "effective_retention_minutes": result["effective_retention_minutes"],
+            "configured_retention_minutes": result["configured_retention_minutes"],
             "at": result["checked_at"],
         }
         body = json.dumps(payload).encode("utf-8")

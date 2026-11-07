@@ -30,6 +30,8 @@ export interface EncoderOptions {
   bitrate_kbps_range?: Range | null;
   quality_range?: Range | null;
   h264_profiles?: string[];
+  /** Codecs this configuration can switch to (e.g. ["H264", "H265"]). */
+  encodings?: string[];
 }
 
 export interface EncoderProfile {

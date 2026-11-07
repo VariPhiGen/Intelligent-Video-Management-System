@@ -10,7 +10,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  coverageComplete, epochAt, hlsResponseError, mediaTimeFor, playlistEnd, playlistUrl,
+  coverageComplete, epochAt, hlsResponseError, mediaTimeFor, planSync, playlistEnd, playlistUrl,
+  type SyncTile,
 } from './hlsShared';
 
 /** A fragment as hls.js reports it: media-timeline start + wall-clock PDT (ms). */
@@ -133,5 +134,73 @@ describe('hlsResponseError', () => {
 
   it('survives no response at all', () => {
     expect(hlsResponseError({}).status).toBe(0);
+  });
+});
+
+describe('planSync — the shared playhead across tiles', () => {
+  // Camera A's footage ends at epoch 1180 (three 60 s segments from 1000);
+  // camera B's runs 20 s longer. Normal: each camera's last segment closes at
+  // its own moment.
+  const A = [frag(0, 60, 1000), frag(60, 60, 1060), frag(120, 60, 1120)];
+  const B = [frag(0, 60, 1000), frag(60, 60, 1060), frag(120, 80, 1120)];
+  const tile = (name: string, frags: any[], currentTime: number, ended = false): SyncTile =>
+    ({ name, frags, currentTime, ended, seekable: true });
+
+  it('pulls a drifted tile back onto the leader', () => {
+    const plan = planSync([tile('a', A, 30), tile('b', B, 35)], 1);
+    expect(plan.clock).toBe(1030);
+    expect(plan.seeks).toEqual([{ name: 'b', mediaTime: 30 }]);
+  });
+
+  it('leaves tiles within tolerance alone', () => {
+    expect(planSync([tile('a', A, 30), tile('b', B, 30.5)], 1).seeks).toEqual([]);
+  });
+
+  it('never lets an ended tile drag a still-playing one back (the end-of-footage flicker)', () => {
+    // A has played out and sits on its last frame — inside its last fragment,
+    // because real media ends a little short of the declared duration. B is
+    // still playing 10 s later. The old loop led with A and seeked B back to
+    // 1179.9 every 500 ms, which is the flicker.
+    const plan = planSync([tile('a', A, 179.9, true), tile('b', B, 190)], 1);
+    expect(plan.clock).toBe(1190);          // B leads
+    expect(plan.seeks).toEqual([]);         // and A is not revived past its end
+  });
+
+  it('does not seek a tile past the end of its own footage', () => {
+    // B leads at 1195; A's footage ended at 1180 but A has not fired ended yet.
+    const plan = planSync([tile('b', B, 195), tile('a', A, 178)], 1);
+    expect(plan.clock).toBe(1195);
+    expect(plan.seeks).toEqual([]);
+  });
+
+  it('when every tile has ended, keeps the clock and seeks nothing', () => {
+    const plan = planSync([tile('a', A, 179.9, true), tile('b', B, 199.9, true)], 1);
+    expect(plan.clock).toBeCloseTo(1179.9);
+    expect(plan.seeks).toEqual([]);
+  });
+
+  it('never seeks a tile that cannot seek right now', () => {
+    const busy = { ...tile('b', B, 35), seekable: false };
+    expect(planSync([tile('a', A, 30), busy], 1).seeks).toEqual([]);
+  });
+
+  it('leads with a tile that is moving, not one frozen on its first segment', () => {
+    // A was selected first but is still buffering at 1030; B is playing at
+    // 1035. The old loop led with A and yanked B back every tick.
+    const stuck = { ...tile('a', A, 30), advancing: false };
+    const plan = planSync([stuck, tile('b', B, 35)], 1);
+    expect(plan.clock).toBe(1035);
+    expect(plan.seeks).toEqual([{ name: 'a', mediaTime: 35 }]);
+  });
+
+  it('pulls no one while every tile is still buffering', () => {
+    const plan = planSync([{ ...tile('a', A, 30), advancing: false },
+                           { ...tile('b', B, 35), advancing: false }], 1);
+    expect(plan.clock).toBe(1030);
+    expect(plan.seeks).toEqual([]);
+  });
+
+  it('has no clock before any tile has fragments', () => {
+    expect(planSync([tile('a', [], 0)], 1)).toEqual({ clock: null, seeks: [] });
   });
 });

@@ -9,10 +9,13 @@
  *
  * TWO KINDS OF THING LIVE HERE AND THEY ARE NOT THE SAME.
  *
- *   Observations   the relay path table. Used for assertions the UI genuinely
- *                  cannot make — "deleting a camera took its sub track away
- *                  too" is invisible on screen and is exactly the drift the
- *                  two-track invariant exists to prevent.
+ *   Observations   the relay path table, and what the frame broker and the
+ *                  search index each believe they are working on. Used for
+ *                  assertions the UI genuinely cannot make — "deleting a camera
+ *                  took its sub track away too", or "switching indexing on
+ *                  reached the service that does the decoding" — both invisible
+ *                  on screen, and both exactly the drift these invariants exist
+ *                  to prevent.
  *
  *   Interventions  stopping a camera container. This is not test scaffolding
  *                  reaching into the product; it is the physical event the
@@ -59,6 +62,54 @@ export async function relayPathNames(): Promise<string[]> {
 /** Is this exact relay path present? Used for both halves of J9. */
 export async function relayHasPath(name: string): Promise<boolean> {
   return (await relayPathNames()).includes(name);
+}
+
+/**
+ * The cameras the FRAME BROKER is decoding, and the ones the SEARCH INDEX is
+ * ingesting.
+ *
+ * WHY THESE ARE OBSERVATIONS AND NOT SOMETHING THE API COULD ANSWER.
+ * `GET /api/search/cameras` lists the REGISTRY's cameras — what the operator
+ * could search — and says nothing about what the two services downstream of it
+ * actually hold. The gap between those two is precisely where the 2026-09-18
+ * defects lived: a camera the registry had opted into indexing that the broker
+ * was not decoding, and a camera deleted from the registry that both services
+ * kept working on for ever. Neither is visible from above, and neither has any
+ * pixels.
+ *
+ * Both ports are unpublished on the bridge, so this asks from inside the
+ * network, like `relayPaths` does.
+ */
+async function serviceCameras(url: string, key: string): Promise<string[]> {
+  const out = await insideNetwork(
+    'import json,urllib.request;' +
+    `d=json.load(urllib.request.urlopen('${url}'));` +
+    `print(json.dumps([i['${key}'] for i in d.get('cameras',[])]))`,
+  );
+  return JSON.parse(out.trim());
+}
+
+/** Slugs the frame broker is decoding. Keyed on `camera`, not `name` — the
+ *  broker spells it differently from every other service here, which is a trap
+ *  `frames_client.list_cameras` documents having fallen into. */
+export async function brokerCameras(): Promise<string[]> {
+  return serviceCameras('http://frames:8014/cameras', 'camera');
+}
+
+/** Slugs the search index is ingesting. */
+export async function indexCameras(): Promise<string[]> {
+  return serviceCameras('http://smartsearch:8013/cameras', 'name');
+}
+
+/** What the index believes one camera contributes, or null if it holds none. */
+export async function indexDomains(slug: string): Promise<string[] | null> {
+  const out = await insideNetwork(
+    'import json,urllib.request;' +
+    "d=json.load(urllib.request.urlopen('http://smartsearch:8013/cameras'));" +
+    `print(json.dumps(next((sorted(i.get('domains') or []) for i in d.get('cameras',[]) ` +
+    `if i['name']=='${slug}'), None)))`,
+  );
+  return JSON.parse(out.trim());
 }
 
 /**

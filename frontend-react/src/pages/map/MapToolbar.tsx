@@ -14,6 +14,7 @@ const LAYERS: [View, string][] = [
   ['cameras', 'Cameras'],
   ['ha', 'HA Devices'],
   ['heatmap', 'Heatmap'],
+  ['coverage', 'Coverage'],
 ];
 
 export function MapToolbar({

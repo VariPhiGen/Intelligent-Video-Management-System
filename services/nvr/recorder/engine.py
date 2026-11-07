@@ -48,6 +48,11 @@ class RecordingEngine:
     STALENESS_FACTOR = 3                # alarm if lag > N * segment_duration
     DISK_WARN_PCT = 90                  # log WARNING above this used-% threshold
     DISK_CRIT_PCT = 95                  # log CRITICAL above this used-% threshold
+    # Floor for the FS↔DB reconcile lookback. A camera kept for ten minutes
+    # must not get a ten-minute rediscovery window: the sweep that deletes on
+    # that clock is itself periodic, so live-but-unindexed segments routinely
+    # sit slightly older than the retention period between passes.
+    RECONCILE_MIN_LOOKBACK_S = 3600
 
     def __init__(self, config: dict, index: SegmentIndex):
         self._config = config
@@ -69,9 +74,13 @@ class RecordingEngine:
         rec_cfg = config["recording"]
         ff_cfg = config.get("ffmpeg", {})
 
-        # Per-camera retention (days), covering runtime-added cameras too so the
-        # RetentionManager can honor the value passed via POST /cameras/{name}.
-        self._retention_days: dict[str, int] = {}
+        # Per-camera retention in MINUTES, covering runtime-added cameras too
+        # so the RetentionManager can honor the value passed via
+        # POST /cameras/{name}. Minutes rather than days because segments are
+        # 60 s and retention deletes whole ones — a minute is the finest period
+        # this recorder can actually honour, and days made a twenty-minute
+        # retention inexpressible rather than merely unusual.
+        self._retention_minutes: dict[str, int] = {}
         # Per-camera groom-after overrides (days before footage is remuxed
         # keyframe-only). Absent = appliance default (recording.groom_after_days).
         self._groom_after_days: dict[str, int] = {}
@@ -88,16 +97,20 @@ class RecordingEngine:
                 ffmpeg_loglevel=ff_cfg.get("loglevel", "warning"),
             )
             self._workers[cam["name"]] = worker
-            if cam.get("retention_days"):
-                self._retention_days[cam["name"]] = cam["retention_days"]
+            # cameras.yaml may spell it either way. Minutes wins; days is
+            # converted here so nothing below this line sees two units.
+            if cam.get("retention_minutes"):
+                self._retention_minutes[cam["name"]] = int(cam["retention_minutes"])
+            elif cam.get("retention_days"):
+                self._retention_minutes[cam["name"]] = int(cam["retention_days"]) * 1440
             if cam.get("groom_after_days") is not None:
                 # `is not None`, not truthiness: 0 is a real setting ("never
                 # groom this camera"), distinct from having no override at all.
                 self._groom_after_days[cam["name"]] = cam["groom_after_days"]
 
     def get_retention_map(self) -> dict[str, int]:
-        """Per-camera retention_days for cameras added at runtime or via config."""
-        return dict(self._retention_days)
+        """Per-camera retention MINUTES for cameras added at runtime or config."""
+        return dict(self._retention_minutes)
 
     def set_disk_pressure_callback(self, callback) -> None:
         """Register a zero-arg callable invoked when the disk crosses critical
@@ -105,15 +118,22 @@ class RecordingEngine:
         so space is reclaimed within a health cycle, not at the next hourly pass."""
         self._disk_pressure_callback = callback
 
-    def set_retention(self, name: str, retention_days: int) -> None:
-        """Update a camera's retention without restarting its worker.
+    def set_retention(self, name: str, retention_minutes: int) -> None:
+        """Update a camera's retention (MINUTES) without restarting its worker.
 
         Works whether or not the camera currently has a live worker — a
         removed camera's footage keeps aging out, so its policy must stay
-        updatable too. Takes effect on the retention manager's next pass.
+        updatable too. Takes effect on the retention manager's next pass, and
+        that pass re-paces itself from this map (see main.run_retention_loop):
+        setting a camera to ten minutes also makes the sweep run often enough
+        for ten minutes to mean something.
         """
-        self._retention_days[name] = retention_days
-        logger.info("Retention for '%s' set to %dd", name, retention_days)
+        if retention_minutes is None:
+            rc = self._config["recording"]
+            retention_minutes = int(rc.get("default_retention_minutes") or 0) \
+                or int(rc.get("default_retention_days", 30)) * 1440
+        self._retention_minutes[name] = retention_minutes
+        logger.info("Retention for '%s' set to %d min", name, retention_minutes)
 
     def get_groom_map(self) -> dict[str, int]:
         """Per-camera groom_after_days overrides (runtime or config)."""
@@ -167,13 +187,18 @@ class RecordingEngine:
             self._monitor_thread.join(timeout=10)
 
     def add_camera(self, name: str, rtsp_url: str,
-                   retention_days: int = 30,
+                   retention_minutes: int | None = None,
                    masks: list | None = None,
                    groom_after_days: int | None = None) -> None:
         """Add a new camera at runtime without stopping existing recordings.
 
         ``masks`` (normalized privacy-mask polygons) opts the worker into the
         overlay + re-encode path; None/empty keeps zero-CPU stream copy.
+
+        ``retention_minutes`` None means the APPLIANCE default, read from the
+        loaded config — not a number hard-coded here. The old signature
+        defaulted to 30 days inline, so a camera added without the parameter
+        was kept for thirty days whatever cameras.yaml said.
         """
         if name in self._workers:
             raise ValueError(f"Camera '{name}' already exists")
@@ -194,14 +219,14 @@ class RecordingEngine:
             masks=masks,
         )
         self._workers[name] = worker
-        self._retention_days[name] = retention_days
+        self._retention_minutes[name] = retention_minutes
         if groom_after_days is not None:
             # 0 included: see set_groom_after — it means "never groom", not
             # "no preference".
             self._groom_after_days[name] = groom_after_days
         worker.start()
-        logger.info("Added and started camera '%s' at runtime (retention %dd, %d mask(s))",
-                    name, retention_days, len(masks or []))
+        logger.info("Added and started camera '%s' at runtime (retention %d min, %d mask(s))",
+                    name, retention_minutes, len(masks or []))
 
     def remove_camera(self, name: str) -> None:
         """Stop and remove a camera at runtime.
@@ -371,15 +396,25 @@ class RecordingEngine:
         offline for hours still has its on-disk segments rediscovered on
         the next reconciliation pass — the previous fixed 1-hour bound
         silently dropped them.
+
+        Read from the LIVE retention map, not the static YAML: runtime-added
+        cameras (every registry-synced one) are absent from the file and were
+        silently falling back to the 30-day default. With minute-granular
+        retention that fallback stops being harmless in the other direction
+        too, so the window is floored at RECONCILE_MIN_LOOKBACK_S — a window
+        shorter than the sweep interval would drop segments that are still
+        perfectly live, and rediscovering a little too much is free.
         """
-        retention_by_name = {
-            c["name"]: c.get("retention_days", 30)
-            for c in self._config.get("cameras", [])
-        }
+        retention_by_name = dict(self._retention_minutes)
+        for c in self._config.get("cameras", []):
+            retention_by_name.setdefault(
+                c["name"], int(c.get("retention_minutes") or 0)
+                or int(c.get("retention_days", 30)) * 1440)
         total_added = 0
         for name, worker in list(self._workers.items()):
-            retention_days = retention_by_name.get(name, 30)
-            lookback = int(retention_days) * 86400
+            retention_minutes = retention_by_name.get(name, 30 * 1440)
+            lookback = max(int(retention_minutes) * 60,
+                           self.RECONCILE_MIN_LOOKBACK_S)
             try:
                 added = worker.reconcile(lookback_seconds=lookback)
             except Exception:

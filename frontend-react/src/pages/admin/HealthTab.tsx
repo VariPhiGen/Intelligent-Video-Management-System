@@ -2,10 +2,12 @@
  * HealthTab.tsx — the System health dashboard, on real data: node cards with
  * resource meters (appliance CPU/RAM, NVR disk + index lag, motion analysis
  * load, GPU utilization + VRAM + NVDEC/NVENC), a "Recording & analysis" panel
- * (channels recording, channels with issues), core-service dots, and an
- * Observability card linking the live API reference.
+ * (channels recording, channels with issues), core-service dots, an AI
+ * detection card (which model and runtime, why, and whether it keeps up), and
+ * an Observability card linking the live API reference.
  * Every probe is independent — one dead service never blanks the tab.
  */
+import { AnimatedValue } from '@/components/AnimatedValue';
 import { useEffect, useState, type ReactNode } from 'react';
 import { apiFetch } from '@/lib/api';
 import type { SystemHealth } from '@/lib/types';
@@ -43,12 +45,32 @@ interface GpuDevice {
   power_limit_w: number | null;
 }
 interface GpuState { present: boolean; count: number; pct: number | null; devices: GpuDevice[] }
+/** /api/analytics/engine — the analytics service's health, summarised. */
+interface AiEngine {
+  configured?: boolean;
+  reachable: boolean;
+  state?: string;
+  cameras?: number;
+  model?: string | null;
+  mode?: 'auto' | 'pinned' | null;
+  reason?: string | null;
+  runtime?: string | null;
+  device?: string | null;
+  capacity_fps?: number | null;
+  demand_fps?: number | null;
+  over_capacity?: boolean;
+  frames_processed?: number | null;
+  frames_skipped_no_motion?: number | null;
+  frames_evicted?: number | null;
+  warnings: string[];
+}
 interface Probes {
   sys: (SystemHealth & { host?: { hostname: string; cores: number; load1: number; cpu_pct: number; mem_pct: number | null; mem_total_gb: number | null; gpu?: GpuState } | null }) | null;
   nvr: NvrHealth | null;
   motion: MotionHealth | null;
   workers: NvrWorker[];
   eventsLastHour: number | null;
+  ai: AiEngine | null;
 }
 
 const LAG_ISSUE_S = 180; // 3× the 60s segment duration — the NVR's own staleness rule
@@ -78,7 +100,7 @@ function Meter({ label, pct, right }: { label: string; pct: number | null; right
     <div className="meter-row">
       <div className="cap">
         <span style={{ color: 'var(--muted)' }}>{label}</span>
-        <b style={{ color: pct != null ? meterColor(pct) : 'var(--dim)' }}>{right}</b>
+        <b style={{ color: pct != null ? meterColor(pct) : 'var(--dim)' }}><AnimatedValue value={right} /></b>
       </div>
       <span className="meter-track" style={{ width: '100%', height: 6, display: 'block' }}>
         <span className="meter-fill" style={{
@@ -121,11 +143,39 @@ function NodeCard({ name, sub, state, children }: {
   );
 }
 
+const RUNTIME_LABEL: Record<string, string> = { openvino: 'OpenVINO', ultralytics: 'PyTorch', torch: 'PyTorch' };
+
+function AiCard({ ai }: { ai: AiEngine }) {
+  const load = ai.capacity_fps && ai.demand_fps != null ? (ai.demand_fps / ai.capacity_fps) * 100 : null;
+  const state: NodeState = !ai.reachable ? 'down'
+    : ai.over_capacity || ai.state === 'FAILED' ? 'high load' : 'healthy';
+  const runtime = ai.runtime ? (RUNTIME_LABEL[ai.runtime] ?? ai.runtime) : null;
+  return (
+    <NodeCard name="AI detection" state={state}
+      sub={ai.reachable ? `${ai.cameras ?? 0} camera${ai.cameras === 1 ? '' : 's'}${runtime ? ` · ${runtime}${ai.device ? ` on ${ai.device.toUpperCase()}` : ''}` : ''}` : 'analytics:8015'}>
+      {ai.reachable && <>
+        <Meter label="Load at busy times" pct={load}
+          right={load != null ? `${Math.round(load)}% · ${ai.capacity_fps!.toFixed(1)} fps capacity` : 'measuring…'} />
+        <div style={{ marginTop: 'var(--s3)' }}>
+          <KV k="Model" v={ai.model ? `${ai.model} · ${ai.mode === 'pinned' ? 'pinned' : 'chosen automatically'}` : 'loads with the first camera'} />
+          <KV k="Frames analysed" v={ai.frames_processed ?? '—'} />
+          <KV k="Skipped (no motion)" v={ai.frames_skipped_no_motion ?? '—'} />
+          {!!ai.frames_evicted && <KV k="Dropped (overloaded)" v={ai.frames_evicted} col="var(--yellow)" />}
+        </div>
+        {ai.reason && <div style={{ marginTop: 'var(--s3)', fontSize: 11.5, color: 'var(--muted)' }}>{ai.reason}</div>}
+      </>}
+      {ai.warnings.map(w => (
+        <div key={w} role="status" style={{ marginTop: 'var(--s3)', fontSize: 11.5, color: 'var(--yellow)' }}>{w}</div>
+      ))}
+    </NodeCard>
+  );
+}
+
 function KV({ k, v, col }: { k: string; v: ReactNode; col?: string }) {
   return (
     <div className="kv-row">
       <span>{k}</span>
-      <span style={col ? { color: col } : undefined}>{v}</span>
+      <span style={col ? { color: col } : undefined}><AnimatedValue value={v} /></span>
     </div>
   );
 }
@@ -175,7 +225,7 @@ export function HealthTab() {
     let alive = true;
     (async () => {
       const since = new Date(Date.now() - 3600_000);
-      const [sys, nvr, motion, workers, events] = await Promise.all([
+      const [sys, nvr, motion, workers, events, ai] = await Promise.all([
         fetch('/health').then(r => (r.ok ? r.json() : null)).catch(() => null),
         apiFetch<NvrHealth>('/nvr/health').catch(() => null),
         apiFetch<MotionHealth>('/motion/health').catch(() => null),
@@ -183,8 +233,9 @@ export function HealthTab() {
         apiFetch<{ events: { started_at: string }[] }>('/motion/events?limit=1000')
           .then(d => (d.events || []).filter(e => new Date(e.started_at) > since).length)
           .catch(() => null),
+        apiFetch<AiEngine>('/analytics/engine').catch(() => null),
       ]);
-      if (alive) setP({ sys, nvr, motion, workers, eventsLastHour: events });
+      if (alive) setP({ sys, nvr, motion, workers, eventsLastHour: events, ai });
     })();
     return () => { alive = false; };
   }, []);
@@ -235,6 +286,11 @@ export function HealthTab() {
             </b> free
           </div>
         </NodeCard>
+
+        {/* AI detection. Omitted where analytics is not deployed. Load is demand
+            against the model's MEASURED throughput on this machine, so a full
+            bar means busy moments will skip frames — the warning says what to do. */}
+        {p.ai && p.ai.configured !== false && <AiCard ai={p.ai} />}
 
         {/* Analysis (motion) card hidden per updated UI — re-enable to surface
             motion decode load and triggered-camera counts.

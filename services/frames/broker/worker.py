@@ -30,6 +30,7 @@ no notice yet is simply invisible for a moment, which is harmless.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -40,6 +41,7 @@ from .config import AppConfig
 from .motion import CanonicalMotion
 from .notice import NoticePublisher, build_notice
 from .ring import FrameRing
+from .sampling import FrameSampler
 
 log = logging.getLogger("frames.worker")
 
@@ -60,7 +62,11 @@ class CameraWorker:
         self.last_error: Optional[str] = None
         self.frames_published = 0
         self.frames_decoded = 0
+        #: Frames taken off the wire, including the ones sampling skips. The
+        #: ratio to frames_published is what the sample rate actually was.
+        self.frames_grabbed = 0
         self.reconnects = 0
+        self._sampler: Optional[FrameSampler] = None
         self.last_frame_at: Optional[float] = None
         self.motion = CanonicalMotion(config.motion)
         self._ring: Optional[FrameRing] = None
@@ -83,7 +89,19 @@ class CameraWorker:
 
     # ── the loop ─────────────────────────────────────────────────────────────
     def _open(self) -> Optional[cv2.VideoCapture]:
-        cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        # TCP, not UDP. Measured on this appliance with five streams in one
+        # process: UDP lost two streams outright (51 failed grabs each) and the
+        # live broker logged 202 decode-error lines in five minutes, against one
+        # per minute for a clean reader. The motion service and the NVR already
+        # force TCP for the same reason. FFmpeg reads this when the capture is
+        # constructed, so it is set here rather than once at import.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = \
+            f"rtsp_transport;{self._cfg.capture.rtsp_transport}"
+        # Decode threads go in as an open-time property: OpenCV sets FFmpeg's
+        # thread_count itself and ignores `threads` in the options string.
+        params = ([cv2.CAP_PROP_N_THREADS, self._cfg.capture.decode_threads]
+                  if self._cfg.capture.decode_threads > 0 else [])
+        cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG, params)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, self._cfg.capture.rtsp_buffer_size)
             cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self._cfg.capture.open_timeout_ms)
@@ -114,12 +132,12 @@ class CameraWorker:
             return self._ring
 
     def _run(self) -> None:
-        interval = (1.0 / self._cfg.capture.sample_fps
-                    if self._cfg.capture.sample_fps > 0 else 0.5)
         backoff = self._cfg.capture.reconnect_backoff_initial_seconds
 
         while not self._stop.is_set():
+            opening = time.time()
             cap = self._open()
+            open_seconds = time.time() - opening
             if cap is None:
                 self.state = "CONNECTING"
                 self.last_error = "could not open stream"
@@ -135,7 +153,21 @@ class CameraWorker:
             # A new connection is a discontinuity, not motion: the first frame
             # differs from the last of the old session by the outage length.
             self.motion.reset()
-            next_due = 0.0
+            # One sampler per session: nothing about the old stream's clock
+            # survives a reconnect. It is told only what the SOURCE declares and
+            # how long opening it took (FFmpeg reads ahead while opening, so
+            # the first frames are that much older than their arrival) - the
+            # same for every camera; see broker/clock.py.
+            sampler = FrameSampler(self._cfg.capture.sample_fps,
+                                   source_fps=cap.get(cv2.CAP_PROP_FPS) or 0.0,
+                                   policy=self._cfg.capture.clock_policy,
+                                   open_seconds=open_seconds)
+            self._sampler = sampler
+            clock_mode = sampler.mode
+            log.info("[%s] sampling at %.1f FPS (source declares %.1f FPS, opened in "
+                     "%.1f s, clock policy %s)", self.camera, self._cfg.capture.sample_fps,
+                     cap.get(cv2.CAP_PROP_FPS) or 0.0, open_seconds,
+                     self._cfg.capture.clock_policy)
 
             try:
                 while not self._stop.is_set():
@@ -145,16 +177,25 @@ class CameraWorker:
                         self.reconnects += 1
                         break
                     now = time.time()
-                    if now < next_due:
+                    self.frames_grabbed += 1
+                    # The timestamp contract decides what time this frame
+                    # happened, and the sampler whether it is due. See
+                    # broker/clock.py and broker/sampling.py.
+                    ts = sampler.consider(cap.get(cv2.CAP_PROP_POS_MSEC), now)
+                    if sampler.mode != clock_mode:
+                        clock_mode = sampler.mode
+                        log.info("[%s] timestamps now on the %s clock (%s%% of recent "
+                                 "source steps implausible)", self.camera, clock_mode,
+                                 sampler.clock.snapshot()["implausible_steps_pct"])
+                    if ts is None:
                         continue                  # grabbed and dropped: free
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
                         continue
-                    next_due = now + interval
                     self.frames_decoded += 1
                     self.last_frame_at = now
                     try:
-                        self._publish(frame, now)
+                        self._publish(frame, ts)
                     except Exception as exc:                   # noqa: BLE001
                         # A publish fault must never kill the capture thread —
                         # it is the thing that recovers everything else.
@@ -188,6 +229,8 @@ class CameraWorker:
             "state": self.state,
             "frames_decoded": self.frames_decoded,
             "frames_published": self.frames_published,
+            "frames_grabbed": self.frames_grabbed,
+            "sampling": (self._sampler.snapshot() if self._sampler is not None else None),
             "reconnects": self.reconnects,
             "last_frame_at": self.last_frame_at,
             "last_error": self.last_error,

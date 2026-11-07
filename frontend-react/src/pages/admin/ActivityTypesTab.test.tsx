@@ -57,15 +57,15 @@ describe('ActivityTypesTab', () => {
     expect(within(row).queryByText('required_duration_s')).toBeNull();
   });
 
-  it('saves only names and colours', async () => {
+  it('saves names, colours and search aliases', async () => {
     const calls = api();
     render(<ActivityTypesTab />);
     fireEvent.change(await screen.findByLabelText('stray_parking name'), { target: { value: 'Parking' } });
     fireEvent.click(screen.getByRole('button', { name: /save names/i }));
     await waitFor(() => expect(calls.called('PUT /api/cameras/analytics/types')).toBe(true));
     expect(calls.bodyOf('PUT /api/cameras/analytics/types')).toEqual({ types: [
-      { key: 'stray_parking', label: 'Parking', color: '#ffb020' },
-      { key: 'idle_worker', label: 'Idle worker', color: '#4fd1c5' },
+      { key: 'stray_parking', label: 'Parking', color: '#ffb020', search_aliases: [], suggested_aliases: [] },
+      { key: 'idle_worker', label: 'Idle worker', color: '#4fd1c5', search_aliases: [], suggested_aliases: [] },
     ] });
   });
 

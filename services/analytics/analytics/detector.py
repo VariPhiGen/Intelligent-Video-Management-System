@@ -13,7 +13,13 @@ Nothing else imports ultralytics.
 """
 from __future__ import annotations
 
+import collections
 import logging
+import multiprocessing
+import os
+import signal
+import statistics
+import time
 from dataclasses import dataclass
 from typing import Optional, Protocol, Sequence
 
@@ -28,6 +34,10 @@ log = logging.getLogger("analytics.detector")
 
 TORCH = "torch"
 OPENVINO = "openvino"
+
+#: Ceiling on one crash-isolated probe. Importing the runtime and compiling the
+#: model dominate (seconds); a probe that hangs is a backend that does not work.
+PROBE_TIMEOUT_S = 180.0
 
 
 def _openvino_version() -> str | None:
@@ -163,8 +173,133 @@ def _smoke_test(detector: "UltralyticsDetector") -> None:
     detector.detect(probe)
 
 
+class SwappableDetector:
+    """The reference both pipelines keep, so the model behind it can change live.
+
+    WHY A SWAP AND NOT A RESTART. When the camera set outgrows the model (see
+    capacity.py), the alternative is tearing the pipeline down and rebuilding
+    it: a gap in detection, every tracker reset, and every object in view
+    re-announced as new. Rebinding one reference costs none of that. A call
+    already in flight finishes on the old model — it holds its own reference —
+    and the next frame runs on the new one.
+    """
+
+    #: Real calls timed for the live throughput estimate, and how many it
+    #: needs before the estimate is trusted over the start-up measurement.
+    WINDOW = 64
+    MIN_SAMPLES = 16
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._durations: collections.deque = collections.deque(maxlen=self.WINDOW)
+
+    @property
+    def inner(self):
+        return self._inner
+
+    def swap(self, new):
+        old, self._inner = self._inner, new
+        self._durations.clear()          # those timings were the old model's
+        return old
+
+    def detect(self, frame):
+        start = time.perf_counter()
+        try:
+            return self._inner.detect(frame)
+        finally:
+            self._durations.append(time.perf_counter() - start)
+
+    def live_fps(self) -> Optional[float]:
+        """Throughput from real calls, under whatever else this machine is doing.
+
+        BETTER EVIDENCE THAN A BENCHMARK, which runs once at warm-up — on
+        2026-10-27 that read 1.8 fps for yolov8s while Smart Search was still
+        loading, against ~3 under steady load. Single-stream (1 / median), so
+        with a shared OpenVINO request pool it understates: the safe direction.
+        """
+        d = list(self._durations)
+        if len(d) < self.MIN_SAMPLES:
+            return None
+        return 1.0 / max(statistics.median(d), 1e-6)
+
+    def __getattr__(self, name):
+        # backend, snapshot(), ... — whatever the current model exposes.
+        return getattr(self._inner, name)
+
+
+def _probe_child(shared: bool, artifact: str, confidence: float,
+                 device: Optional[str], threads: int, requests: int) -> None:
+    """Runs in a fresh interpreter: build the detector exactly as
+    build_selected would, then the same smoke test. Returning is passing."""
+    if shared:
+        from .openvino_detector import SharedOpenVinoDetector
+        det = SharedOpenVinoDetector(artifact, confidence, device,
+                                     num_requests=requests, threads=threads)
+    else:
+        det = UltralyticsDetector(artifact, confidence, device, backend=OPENVINO)
+    _smoke_test(det)
+
+
+def probe_isolated(target, args: tuple, timeout: float = PROBE_TIMEOUT_S) -> Optional[str]:
+    """Why `target(*args)` would take down the process running it, or None.
+
+    Only what an except clause cannot survive is reported: death by signal,
+    and a hang. A child that merely RAISES returns None — the in-process
+    attempt fails the same way as an ordinary exception, keeps its retry
+    budget, and reports the real error text rather than "status 1".
+
+    THE SMOKE TEST CANNOT CATCH A NATIVE CRASH. SIGILL from an instruction the
+    CPU (or the VM it runs in) does not implement, or SIGSEGV from a broken
+    plugin, kills the process executing it, and no except clause runs. In
+    process, that process is the service: the container restarts, warms up,
+    crashes again — 30 restarts in 30 minutes on an Apple M5, zero frames
+    indexed, and /health "healthy" between deaths because the crash comes on
+    the first inference, after the health check has passed. In a child it is
+    just a return value, and the fallback works the way it was meant to.
+
+    SPAWN, NOT FORK: a forked child would inherit the parent's runtime threads
+    and locks mid-flight, which is its own way to hang.
+    """
+    proc = multiprocessing.get_context("spawn").Process(target=target, args=args, daemon=True)
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        return f"probe did not finish within {timeout:.0f}s"
+    code = proc.exitcode
+    if code is not None and code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        hint = (" — the CPU or its VM rejects an instruction the runtime uses"
+                if -code == signal.SIGILL else "")
+        return f"probe crashed with {name}{hint}"
+    if code:
+        log.info("detector probe raised in its child (status %s); the in-process "
+                 "attempt will report the error", code)
+    return None
+
+
+def _cap_torch_threads(threads: int) -> None:
+    """Half the machine for torch inference, the rule the OpenVINO path uses.
+
+    Torch defaults to every core, and on an appliance that also decodes every
+    camera that oversubscribes: measured 2026-10-27 under live load on an
+    Apple M5, yolov8n ran 3.7 fps on 10 threads and 4.6 on 5. Process-wide.
+    """
+    try:
+        import torch
+        torch.set_num_threads(threads or max(2, (os.cpu_count() or 4) // 2))
+    except Exception:                                              # noqa: BLE001
+        pass
+
+
 def build_selected(selector, weights: str, confidence: float,
-                   device: Optional[str], square_letterbox: bool = True) -> Detector:
+                   device: Optional[str], square_letterbox: bool = True,
+                   shared_openvino: bool = False, inference_threads: int = 0,
+                   inference_requests: int = 2) -> Detector:
     """Load the best detector this machine will actually give us.
 
     Walks the selector's plans in order — preferred first, torch last — and
@@ -179,7 +314,38 @@ def build_selected(selector, weights: str, confidence: float,
     plans = selector.plans(weights)
     last: Optional[Exception] = None
     for plan in plans:
+        if plan.backend == OPENVINO and plan is not plans[-1]:
+            # Isolated first: an in-process failure here can be a dead service
+            # rather than an exception (see probe_isolated).
+            why = selector.isolation_verdict(plan.backend, plan.artifact, lambda: probe_isolated(
+                _probe_child, (shared_openvino, plan.artifact, confidence, device,
+                               inference_threads, inference_requests)))
+            if why:
+                selector.record_crash(plan.backend, why)
+                continue
         try:
+            if shared_openvino and plan.backend == OPENVINO:
+                # One compiled model, THROUGHPUT, shared by both paths. Falls
+                # through to the ultralytics runtime on any failure, so an
+                # optimisation can never cost this service its detector.
+                from .openvino_detector import SharedOpenVinoDetector
+                try:
+                    shared = SharedOpenVinoDetector(
+                        plan.artifact, confidence, device,
+                        num_requests=inference_requests, threads=inference_threads,
+                        selected_by=(BY_FALLBACK if plan.is_fallback
+                                     else BY_CONFIG if plan.is_pinned
+                                     else BY_PREFERENCE),
+                    )
+                    _smoke_test(shared)
+                    selector.record_success(plan.backend)
+                    return shared
+                except Exception as exc:                           # noqa: BLE001
+                    log.warning("shared OpenVINO detector unavailable (%s: %s); "
+                                "using the ultralytics runtime for this artifact",
+                                type(exc).__name__, exc)
+            if plan.backend == TORCH:
+                _cap_torch_threads(inference_threads)
             det = UltralyticsDetector(
                 plan.artifact, confidence, device, square_letterbox,
                 backend=plan.backend,

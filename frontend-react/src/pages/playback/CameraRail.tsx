@@ -3,17 +3,16 @@
  * view, the searchable picker that adds one, and the case actions.
  *
  * Extracted from MultiPlayer because it is the only part of that screen that
- * does not touch the shared clock — it edits a list of four slugs. The sync
- * lock indicator is static on purpose: every tile is always on one clock, so
- * there is nothing to toggle (see the disabled case buttons below it, which are
- * the Incident Cases surface that does not exist yet).
+ * does not touch the shared clock — it edits a list of four slugs, and flips
+ * the sync lock the parent owns. (The disabled case buttons below it are the
+ * Incident Cases surface that does not exist yet.)
  */
 import { useMemo } from 'react';
 
 import type { NvrCamera } from './coverage';
 
 export function CameraRail({
-  sel, nvrCams, regName, toggleCam, camFilter, setCamFilter, addOpen, setAddOpen,
+  sel, nvrCams, regName, toggleCam, camFilter, setCamFilter, addOpen, setAddOpen, syncLock, toggleSync,
 }: {
   sel: string[];
   nvrCams: NvrCamera[];
@@ -23,6 +22,8 @@ export function CameraRail({
   setCamFilter: (v: string) => void;
   addOpen: boolean;
   setAddOpen: (v: boolean) => void;
+  syncLock: boolean;
+  toggleSync: () => void;
 }) {
   // Cameras that can still be added: recorded, not already in view, and
   // matching whatever has been typed.
@@ -107,15 +108,20 @@ export function CameraRail({
           )}
         </div>
       )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0 14px', fontSize: 12,
-                    color: 'var(--green)' }}>
-        <span style={{ width: 30, height: 16, borderRadius: 8, background: 'var(--green)',
-                       position: 'relative', flexShrink: 0 }}>
-          <span style={{ position: 'absolute', top: 2, right: 2, width: 12, height: 12,
-                         borderRadius: '50%', background: '#fff' }} />
+      <button type="button" role="switch" aria-checked={syncLock} onClick={toggleSync}
+              title={syncLock ? 'Tiles move together — click to let them run independently'
+                              : 'Tiles run independently — click to lock them to one clock'}
+              style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0 14px', fontSize: 12,
+                       padding: 0, border: 'none', background: 'transparent', cursor: 'pointer',
+                       color: syncLock ? 'var(--green)' : 'var(--dim)', textAlign: 'left' }}>
+        <span style={{ width: 30, height: 16, borderRadius: 8, position: 'relative', flexShrink: 0,
+                       background: syncLock ? 'var(--green)' : 'var(--border, #3a4652)',
+                       transition: 'background .15s' }}>
+          <span style={{ position: 'absolute', top: 2, left: syncLock ? 16 : 2, width: 12, height: 12,
+                         borderRadius: '50%', background: '#fff', transition: 'left .15s' }} />
         </span>
-        Sync lock · all at same time
-      </div>
+        {syncLock ? 'Sync lock · all at same time' : 'Sync off · tiles independent'}
+      </button>
       <button className="btn-ghost btn-sm" disabled style={{ width: '100%', marginBottom: 8 }}>
         ＋ Start incident case
       </button>

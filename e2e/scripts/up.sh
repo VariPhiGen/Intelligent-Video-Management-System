@@ -51,8 +51,23 @@ if [ "${E2E_FRESH:-1}" = "1" ]; then
   compose down -v --remove-orphans >/dev/null 2>&1 || true
 fi
 
-echo "▸ building fixture images"
-compose build rtsp-cam-1 rtsp-cam-2 onvif-sim
+# THE PRODUCT IMAGES ARE BUILT TOO, AND LEAVING THEM OUT MADE GREEN MEAN
+# NOTHING. `compose up -d` builds an image only when it is MISSING; an image
+# left over from a previous run is reused as-is. So the first run on a machine
+# tested the working tree and every run after it tested whatever that first run
+# had compiled — a change to a service could be exercised by the whole suite and
+# never actually run. Found on 2026-09-18, when six new assertions failed
+# against an api image built before the code they were written for.
+#
+# The build is layer-cached, so an unchanged tree costs seconds. E2E_BUILD=0
+# skips it for someone iterating on a spec who knows the images are current.
+if [ "${E2E_BUILD:-1}" = "1" ]; then
+  echo "▸ building images (product + fixtures; E2E_BUILD=0 to skip)"
+  compose build
+else
+  echo "▸ building fixture images only (E2E_BUILD=0)"
+  compose build rtsp-cam-1 rtsp-cam-2 onvif-sim
+fi
 
 echo "▸ starting the stack"
 compose up -d

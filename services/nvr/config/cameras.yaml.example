@@ -5,16 +5,27 @@
 cameras:
   - name: entrance           # Must match nvr_camera_name in the DeepStream pipeline
     rtsp_url: "rtsp://admin:password@192.168.1.10:554/Streaming/Channels/101"
-    retention_days: 7
+    # How long this camera's footage is kept, in MINUTES. Segments are 60 s and
+    # whole ones are deleted, so a minute is the finest period that can mean
+    # anything here. `retention_days: 7` still works and is read as a
+    # day-spelling of the same setting.
+    retention_minutes: 10080   # 7 days
 
   - name: office-cam01
     rtsp_url: "rtsp://admin:password@192.168.1.11:554/Streaming/Channels/101"
-    retention_days: 7
+    retention_minutes: 10080   # 7 days
 
   # Add more cameras here:
   # - name: parking-lot
   #   rtsp_url: "rtsp://admin:password@192.168.1.12:554/Streaming/Channels/101"
-  #   retention_days: 14
+  #   retention_minutes: 20160   # 14 days
+  #
+  # A lobby camera kept for twenty minutes — the kind of policy days could not
+  # express at all. The retention sweep paces itself from the shortest
+  # retention on the box, so this is enforced on a matching clock.
+  # - name: lobby
+  #   rtsp_url: "rtsp://admin:password@192.168.1.13:554/Streaming/Channels/101"
+  #   retention_minutes: 20
 
 recording:
   segment_duration: 60         # seconds per segment file (1 440 files/day/camera)

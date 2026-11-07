@@ -36,10 +36,12 @@ function arrowhead(ctx: CanvasRenderingContext2D, from: number[], to: number[], 
 }
 
 export function PolygonEditor({
-  cameraId, polygons, drawing, drawColor = '#facc15', drawMode = 'polygon',
+  cameraId, snapshotPath, polygons, drawing, drawColor = '#facc15', drawMode = 'polygon',
   onFinish, onCancel, onPendingChange, noun = 'zone', minPoints = 3, readOnly = false,
 }: {
   cameraId: string;
+  /** The picture to draw over (default: the camera's live snapshot) — a PTZ preset's own reference picture. */
+  snapshotPath?: string;
   polygons: EditorPolygon[];
   drawing: boolean;
   /** Display-only surface (e.g. the coverage map): no drawing is ever offered
@@ -78,7 +80,8 @@ export function PolygonEditor({
     (async () => {
       for (let attempt = 0; attempt < 3 && alive; attempt++) {
         try {
-          const blob = await apiBlob(`/cameras/${cameraId}/snapshot?t=${Date.now()}`);
+          const path = snapshotPath || `/cameras/${cameraId}/snapshot`;
+          const blob = await apiBlob(`${path}${path.includes('?') ? '&' : '?'}t=${Date.now()}`);
           if (!alive) return;
           objUrl = URL.createObjectURL(blob);
           const image = new Image();
@@ -95,7 +98,7 @@ export function PolygonEditor({
     })();
 
     return () => { alive = false; if (objUrl) URL.revokeObjectURL(objUrl); };
-  }, [cameraId, reloadKey]);
+  }, [cameraId, snapshotPath, reloadKey]);
 
   useEffect(() => { if (!drawing) setCur([]); }, [drawing]);
 

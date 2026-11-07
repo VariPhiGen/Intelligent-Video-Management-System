@@ -4,6 +4,10 @@ Env overrides (set by docker-compose):
   MOTION_BIND_HOST  — api.host  (bridge overlay binds 0.0.0.0 in-container)
   MOTION_PORT       — api.port
   MOTION_LOG_LEVEL  — logging.level
+  MOTION_EVENTS_URL — the VMS API root that motion ACTIVITY (playback markers)
+                      is posted to; empty = not reported
+  MOTION_INTERNAL_API_KEY / INTERNAL_API_KEY — the key it is posted with
+  MOTION_ACTIVITY_ENABLED — off switch for the above
 """
 from __future__ import annotations
 
@@ -67,6 +71,21 @@ class SourceConfig:
 
 
 @dataclass(frozen=True)
+class ActivityConfig:
+    """Motion activity for the playback timeline (detector/activity.py).
+
+    `url` is the VMS API root; the sink appends /api/playback/timeline/presence.
+    Empty = runs are neither kept nor sent — the incident log and its API are
+    unaffected either way.
+    """
+    enabled: bool = True
+    url: str = ""
+    internal_api_key: str = ""
+    hold_seconds: float = 2.0
+    segment_seconds: float = 120.0
+
+
+@dataclass(frozen=True)
 class ApiConfig:
     host: str = "127.0.0.1"
     port: int = 8012
@@ -78,6 +97,7 @@ class AppConfig:
     capture: CaptureConfig
     api: ApiConfig
     source: SourceConfig = SourceConfig()
+    activity: ActivityConfig = ActivityConfig()
     log_level: str = "INFO"
 
     @classmethod
@@ -93,6 +113,7 @@ class AppConfig:
         api = raw.get("api", {}) or {}
         src = raw.get("source", {}) or {}
         logging_ = raw.get("logging", {}) or {}
+        act = raw.get("activity", {}) or {}
 
         frame_source = os.environ.get(
             "MOTION_FRAME_SOURCE", src.get("frame_source", "capture")
@@ -118,6 +139,18 @@ class AppConfig:
                                            "redis://127.0.0.1:6379/0"))),
                 broker_channel_prefix=src.get("broker_channel_prefix",
                                               "vms.frames"),
+            ),
+            activity=ActivityConfig(
+                enabled=os.environ.get(
+                    "MOTION_ACTIVITY_ENABLED", str(act.get("enabled", True))
+                ).lower() not in ("0", "false", "no"),
+                url=os.environ.get("MOTION_EVENTS_URL", act.get("url", "")).strip().rstrip("/"),
+                internal_api_key=os.environ.get(
+                    "MOTION_INTERNAL_API_KEY",
+                    os.environ.get("INTERNAL_API_KEY", act.get("internal_api_key", ""))),
+                hold_seconds=float(act.get("hold_seconds", 2.0)),
+                # Never beyond the VMS's 10-minute bound on a stored segment.
+                segment_seconds=min(540.0, max(10.0, float(act.get("segment_seconds", 120.0)))),
             ),
             log_level=os.environ.get(
                 "MOTION_LOG_LEVEL", logging_.get("level", "INFO")

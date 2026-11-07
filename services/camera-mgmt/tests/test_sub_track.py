@@ -345,34 +345,53 @@ def _cam_with_sub(**sub_extra):
     return cam(sub={**SUB, **sub_extra})
 
 
+DAY = 1440  # minutes; retention is minute-granular (services/retention_units.py)
+
+
 def test_sub_uses_the_appliance_default_when_it_has_none_of_its_own():
-    from backend.config import settings
-    assert tracks.sub_retention_days(_cam_with_sub(), 30) == settings.nvr_sub_retention_days
+    from backend.services import retention_units
+    assert (tracks.sub_retention_minutes(_cam_with_sub(), 30 * DAY)
+            == retention_units.default_sub_retention_minutes())
 
 
 def test_sub_default_is_much_shorter_than_a_typical_main():
-    from backend.config import settings
-    assert settings.nvr_sub_retention_days < 15
+    from backend.services import retention_units
+    assert retention_units.default_sub_retention_minutes() < 15 * DAY
 
 
 def test_camera_can_set_its_own_sub_retention():
-    assert tracks.sub_retention_days(_cam_with_sub(retention_days=7), 30) == 7
+    assert tracks.sub_retention_minutes(
+        _cam_with_sub(retention_minutes=7 * DAY), 30 * DAY) == 7 * DAY
 
 
 def test_sub_retention_never_exceeds_the_main():
     """A scrub track outliving the footage it helps scrub is pure waste."""
-    assert tracks.sub_retention_days(_cam_with_sub(retention_days=90), 15) == 15
+    assert tracks.sub_retention_minutes(
+        _cam_with_sub(retention_minutes=90 * DAY), 15 * DAY) == 15 * DAY
+
+
+def test_a_minute_scale_main_clamps_the_sub_to_minutes_too():
+    """THE reason the sub had to move to minutes along with the main.
+
+    The old clamp floored at one DAY. A camera whose main was cut to thirty
+    minutes would still have kept a sub track for a full day — the scrub track
+    outliving by 48x the footage it exists to help scrub, on the one setting an
+    operator chose specifically to stop holding that footage.
+    """
+    assert tracks.sub_retention_minutes(_cam_with_sub(), 30) == 30
 
 
 def test_sub_retention_falls_back_to_the_appliance_main_default():
     """Main retention None means 'appliance default', not 'unlimited'."""
-    from backend.config import settings
-    got = tracks.sub_retention_days(_cam_with_sub(retention_days=9999), None)
-    assert got == settings.nvr_default_retention_days
+    from backend.services import retention_units
+    got = tracks.sub_retention_minutes(
+        _cam_with_sub(retention_minutes=9999 * DAY), None)
+    assert got == retention_units.default_retention_minutes()
 
 
 def test_sub_retention_is_never_zero():
-    assert tracks.sub_retention_days(_cam_with_sub(retention_days=0), 30) >= 1
+    assert tracks.sub_retention_minutes(
+        _cam_with_sub(retention_minutes=0), 30 * DAY) >= 1
 
 
 # ── Phase 0: what every profile actually is, recorded on the camera ────────

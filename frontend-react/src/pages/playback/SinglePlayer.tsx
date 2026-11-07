@@ -3,17 +3,28 @@
  * pb-view (pbOpen/pbSelectCamera/pbRefreshRange/pbFetchCoverage/pbBind).
  * Video plays sequential 2-min chunks via useChunkPlayer; the timeline canvas
  * shows footage (green), gaps (red) and the playhead over a pan/zoomable
- * window; the right rail switches cameras.
+ * window; the header dropdown (display names) switches cameras. With `ai_analytics`, and on a
+ * camera AI Config gives activities or person/vehicle indexing, a strip under
+ * the footage bar marks when a person / vehicle was in view (for the kinds it
+ * indexes) and its AI events (timelineMarks.ts): click one or step through
+ * them with ◀ ▶ to seek to its pre-roll.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch } from '@/lib/api';
-import type { Camera } from '@/lib/types';
+import { useAuth } from '@/lib/auth';
+import type { Camera, NvrCoverage } from '@/lib/types';
 import { useToast } from '@/components/Toast';
 import type { PersonHit, SearchResponse } from '@/lib/smartsearch';
 import { AnnotateLayer } from './AnnotateLayer';
-import { CHUNK_SECONDS, fmtWall, nvrCoverage, toSec, type NvrCamera } from './coverage';
+import { useVideoZoom } from './useVideoZoom';
+import { listLabelClasses, type LabelClass } from '@/lib/labelClasses';
+import { CHUNK_SECONDS, covSpans, fmtWall, nvrCoverage, toSec, type NvrCamera } from './coverage';
 import { SimilarModal } from './SimilarModal';
 import { Timeline } from './Timeline';
+import {
+  adjacentMark, cameraHasAi, clipToFootage, fetchAdjacent, indexedKinds, PRESENCE_META,
+  toMarkFromAdjacent, useTimelineMarks, type TimelineMark,
+} from './timelineMarks';
 import { useChunkPlayer } from './useChunkPlayer';
 import { useHlsPlayer } from './useHlsPlayer';
 
@@ -22,6 +33,7 @@ interface Gap { start: number; end: number }                // epoch seconds
 
 const ZOOMS = [1, 6, 24];
 const SPEEDS = [1, 2, 4];
+const MARKS_PREF = 'vms-playback-marks';
 
 export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpenAt, onClose, startAt }: {
   camera: string;
@@ -45,6 +57,9 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
 
   const [range, setRange] = useState<Range | null>(null);
   const [gaps, setGaps] = useState<Gap[]>([]);
+  // The coverage answer itself, with the window it answers for: what the
+  // markers are cut to, so none is drawn over time with no footage.
+  const [cov, setCov] = useState<{ data: NvrCoverage; from: number; to: number } | null>(null);
   const [view, setView] = useState(() => ({ start: Date.now() - 24 * 3600_000, end: Date.now() }));
   const [speed, setSpeed] = useState(1);
   const [jump, setJump] = useState('');
@@ -53,8 +68,71 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
   // to ONE frame, and drawing on moving footage commits it to a frame the
   // operator never inspected.
   const [annotating, setAnnotating] = useState(false);
+  // The taxonomy is admin-owned and small, so it is fetched once per mount
+  // rather than per annotate-mode toggle. A failure leaves it empty, which the
+  // layer renders as "no label classes" — the honest reading either way, since
+  // a save without a class would be refused.
+  const [labelClasses, setLabelClasses] = useState<LabelClass[]>([]);
+
+  useEffect(() => {
+    let alive = true;
+    listLabelClasses()
+      .then(all => { if (alive) setLabelClasses(all.filter(c => c.active)); })
+      .catch(() => { if (alive) setLabelClasses([]); });
+    return () => { alive = false; };
+  }, []);
   // Search-by-example results for the last drawn box (null = modal closed).
   const [similar, setSimilar] = useState<SearchResponse<PersonHit> | null>(null);
+
+  // ── AI event marks: the API enforces `ai_analytics`; the check here only
+  //    spares a user without it a request that is certain to be refused. ──
+  const { me } = useAuth();
+  // Per camera: no marker UI at all unless AI Config has it doing something.
+  const regCam = registry.find(c => c.slug === camera);
+  const cameraAi = cameraHasAi(regCam);
+  const kinds = useMemo(() => indexedKinds(regCam), [regCam]);
+  const canEvents = !!me?.permissions?.ai_analytics && cameraAi;
+  const [showMarks, setShowMarks] = useState(() => {
+    try { return localStorage.getItem(MARKS_PREF) !== 'off'; } catch { return true; }
+  });
+  const toggleMarks = () => setShowMarks(v => {
+    try { localStorage.setItem(MARKS_PREF, v ? 'off' : 'on'); } catch { /* private mode */ }
+    return !v;
+  });
+  // Activities hidden from the strip — per session, since the set of
+  // activities differs from camera to camera.
+  const [hiddenActs, setHiddenActs] = useState<ReadonlySet<string>>(() => new Set());
+  const marksOn = canEvents && showMarks;
+  const { marks: rawMarks, truncated, status: marksStatus } = useTimelineMarks(
+    camera, view, marksOn, kinds, typeof window !== 'undefined' ? window.innerWidth : 1200);
+  // Only what can be played: a marker over a recording gap, or ahead of the
+  // footage the NVR has indexed, is not drawn, counted or walked to.
+  const marks = useMemo(
+    () => (cov ? clipToFootage(rawMarks, covSpans(cov.data, cov.from, cov.to)) : []),
+    [rawMarks, cov]);
+  const shownMarks = useMemo(
+    () => (hiddenActs.size ? marks.filter(m => !hiddenActs.has(m.activity)) : marks),
+    [marks, hiddenActs]);
+  const legend = useMemo(() => {
+    // Indexed presence kinds first and always — "indexed and quiet" reads as
+    // a 0, not as a row with no name — then the activities that fired.
+    const presence = new Map<string, { label: string; color: string; n: number }>(
+      kinds.map(k => [PRESENCE_META[k].key, { label: PRESENCE_META[k].label,
+                                               color: PRESENCE_META[k].color, n: 0 }]));
+    const events = new Map<string, { label: string; color: string; n: number }>();
+    for (const m of marks) {
+      const into = m.row === 'event' ? events : presence;
+      const e = into.get(m.activity);
+      if (e) e.n++; else into.set(m.activity, { label: m.label, color: m.color, n: 1 });
+    }
+    return [...presence.entries(),
+            ...[...events.entries()].sort((a, b) => a[1].label.localeCompare(b[1].label))];
+  }, [marks, kinds]);
+  const toggleAct = (key: string) => setHiddenActs(prev => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
 
   // Consume-once: a deep-linked timestamp applies to the camera it arrived with.
   // Without this, switching cameras inside Playback would keep yanking the new
@@ -104,6 +182,10 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
     try { return localStorage.getItem('vms-playback-engine') === 'clip'; }
     catch { return false; }
   }, []);
+  // Digital zoom over the recorded frame. Single playback only — see
+  // useVideoZoom for why the multi-view does not get it.
+  const zoom = useVideoZoom();
+
   const hlsPlayer = useHlsPlayer(videoRef, playerHandlers, { enabled: !forceClips });
   const useHls = hlsPlayer.available && !forceClips;
   const clipPlayer = useChunkPlayer(videoRef, playerHandlers, { enabled: !useHls });
@@ -116,8 +198,11 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
 
   const fetchCoverage = useCallback(async () => {
     const cam = cameraRef.current;
-    const { start, end } = viewRef.current;
-    const span = Math.max(60_000, Math.round((end - start) / 16));
+    const { start: vs, end: ve } = viewRef.current;
+    // The view plus half a view either side — the window the markers are
+    // fetched for, so every marker held has coverage to be cut against.
+    const start = vs - (ve - vs) / 2, end = ve + (ve - vs) / 2;
+    const span = Math.max(60_000, Math.round((ve - vs) / 16));
     const key = `${cam}|${Math.floor(start / span)}|${Math.ceil(end / span)}`;
     if (key === covKey.current) return;
     if (covCtl.current) covCtl.current.abort();
@@ -128,6 +213,7 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
       if (cam !== cameraRef.current) return;
       setGaps((Array.isArray(data.gaps) ? data.gaps : [])
         .map(g => ({ start: toSec(g.start), end: toSec(g.end) })));
+      setCov({ data, from: start, to: end });
       covKey.current = key;
     } catch { /* aborted or NVR briefly away — next pan/zoom retries */ }
     finally { if (covCtl.current === ctl) covCtl.current = null; }
@@ -165,6 +251,7 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
     player.stop();
     setRange(null);
     setGaps([]);
+    setCov(null);
     covKey.current = '';
     player.setOverlay('Loading footage range…');
     let cancelled = false;
@@ -195,6 +282,59 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
     if (inGap(epoch, slop)) { player.showGapStop(); return; }
     player.seek(cameraRef.current, epoch);
   }, [inGap, player]);
+
+  /** Seek to an event's pre-roll, panning the view if it is off screen. */
+  const seekMark = (m: TimelineMark) => {
+    const { start, end } = viewRef.current;
+    const at = m.seekAt * 1000;
+    if (at < start || m.start * 1000 > end) {
+      const half = (end - start) / 2;
+      setView({ start: m.start * 1000 - half, end: m.start * 1000 + half });
+    }
+    doSeek(m.seekAt);
+  };
+  /** ◀ ▶: the nearest loaded mark if there is one, otherwise ask the API —
+   *  the next marker may be days away, far outside the loaded window. The
+   *  same filters apply: hidden rows and activities are skipped either way. */
+  const stepping = useRef(false);
+  const stepMark = async (dir: 1 | -1) => {
+    const at = player.currentEpoch();
+    const local = adjacentMark(shownMarks, at, dir);
+    if (local) { seekMark(local); return; }
+    if (at == null || stepping.current) return;
+    stepping.current = true;
+    try {
+      const shownKinds = kinds.filter(k => !hiddenActs.has(PRESENCE_META[k].key));
+      const hiddenEvents = [...hiddenActs].filter(k => !k.startsWith('presence:'));
+      // The API knows markers, not footage: an answer inside a recording gap
+      // is skipped and the search goes on past it (bounded — a camera that
+      // records nothing for days is not worth a hundred round trips).
+      let from = at;
+      for (let hop = 0; hop < 12; hop++) {
+        const m = await fetchAdjacent(camera, from, dir, shownKinds, true, hiddenEvents);
+        if (cameraRef.current !== camera) return;
+        if (!m) break;
+        const mark = toMarkFromAdjacent(m);
+        const end = m.end ?? m.start;
+        const around = await nvrCoverage(camera, new Date((m.seek_at - 60) * 1000),
+                                          new Date((end + 60) * 1000), 30);
+        if (cameraRef.current !== camera) return;
+        const playable = clipToFootage([mark], covSpans(around, (m.seek_at - 60) * 1000,
+                                                         (end + 60) * 1000));
+        if (playable.length) {
+          seekMark(dir === 1 ? playable[0] : playable[playable.length - 1]);
+          return;
+        }
+        from = m.seek_at;
+      }
+      toast(dir === 1 ? 'Nothing later with footage on this camera'
+                      : 'Nothing earlier with footage on this camera');
+    } catch {
+      toast('Could not look up the next marker', 'err');
+    } finally {
+      stepping.current = false;
+    }
+  };
 
   const skip = (sec: number) => {
     const cur = player.currentEpoch();
@@ -235,7 +375,43 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
     setView({ start: dayStart, end: dayStart + viewHours * 3600_000 });
   };
 
-  const regName = (name: string) => registry.find(c => c.slug === name)?.name || name;
+  // The dropdown shows what operators call the cameras, sorted that way. The
+  // value stays the slug (the NVR's recording name); two cameras sharing a
+  // display name get their slug appended so they can still be told apart.
+  const cameraOptions = useMemo(() => {
+    const list = (nvrCams.length ? nvrCams : [{ name: camera } as NvrCamera])
+      .map(c => ({ value: c.name, label: registry.find(r => r.slug === c.name)?.name || c.name }));
+    const seen = new Map<string, number>();
+    for (const o of list) seen.set(o.label, (seen.get(o.label) ?? 0) + 1);
+    return list
+      .map(o => (seen.get(o.label)! > 1 && o.label !== o.value ? { ...o, label: `${o.label} (${o.value})` } : o))
+      .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' }));
+  }, [nvrCams, registry, camera]);
+
+  // Fullscreen the whole player card, not just the <video>: the timeline, markers and the annotate bar stay usable
+  // (a bare video element in fullscreen would drop all of them). `F` toggles, unless typing in a field; Esc is the
+  // browser's own exit.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [fs, setFs] = useState(false);
+  const toggleFs = useCallback(() => {
+    if (document.fullscreenElement) void document.exitFullscreen?.();
+    else void cardRef.current?.requestFullscreen?.();
+  }, []);
+  useEffect(() => {
+    const onChange = () => setFs(document.fullscreenElement === cardRef.current);
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (e.key !== 'f' && e.key !== 'F') return;
+      if (e.ctrlKey || e.metaKey || e.altKey || (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)))) return;
+      e.preventDefault();
+      toggleFs();
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('fullscreenchange', onChange); document.removeEventListener('keydown', onKey); };
+  }, [toggleFs]);
+  // "Find similar" opens a modal OUTSIDE the card, which fullscreen would hide — leave fullscreen so it's seen.
+  useEffect(() => { if (similar && document.fullscreenElement) void document.exitFullscreen?.(); }, [similar]);
 
   return (
     <div id="pb-view" className="fade">
@@ -243,14 +419,14 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
         <SimilarModal outcome={similar} onClose={() => setSimilar(null)}
                       onOpenAt={(slug, epoch) => { setSimilar(null); onOpenAt(slug, epoch); }} />
       )}
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div ref={cardRef} className={`card pb-card${fs ? ' pb-fs' : ''}`} style={{ padding: 0, overflow: 'hidden' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px',
                       borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
           <button className="btn-ghost btn-sm" onClick={onClose}>← Cameras</button>
           <select value={camera} onChange={e => onSelectCamera(e.target.value)}
-                  style={{ maxWidth: 320, width: 'auto' }}>
-            {(nvrCams.length ? nvrCams : [{ name: camera } as NvrCamera]).map(c => (
-              <option key={c.name} value={c.name}>{c.name}</option>
+                  title={camera} style={{ maxWidth: 320, width: 'auto' }}>
+            {cameraOptions.map(o => (
+              <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
           <div style={{ flex: 1 }} />
@@ -258,18 +434,54 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
           <input value={jump} onChange={e => setJump(e.target.value)} onKeyDown={onJump}
                  type="text" placeholder="YYYY-MM-DD HH:MM:SS"
                  title="Jump to a date/time (Enter)" style={{ maxWidth: 190, fontSize: 12 }} />
+          <button className="btn-ghost btn-sm" onClick={toggleFs}
+                  title={fs ? 'Exit fullscreen (F or Esc)' : 'Fullscreen — video, timeline and annotate (F)'}
+                  aria-label={fs ? 'Exit fullscreen' : 'Fullscreen'}>
+            {fs ? '⤡ Exit fullscreen' : '⤢ Fullscreen'}
+          </button>
         </div>
 
         <div className="pb-video-wrap">
-          <video ref={videoRef} playsInline onClick={player.togglePlay} />
+          {/* The stage carries the zoom transform and holds BOTH the video and
+              (portalled in) the annotate canvas, so a box drawn while zoomed
+              maps to the same source pixels as one drawn at 1x. Overlays and
+              the annotate toolbar stay outside it — chrome must not scale. */}
+          <div className="pb-stage" ref={zoom.attachStage} style={zoom.style}
+               onPointerDown={zoom.onPanStart}
+               onPointerMove={zoom.onPanMove}
+               onPointerUp={zoom.onPanEnd}
+               onPointerCancel={zoom.onPanEnd}
+               onContextMenu={e => { if (zoom.zoomed) e.preventDefault(); }}>
+            <video ref={videoRef} playsInline onClick={player.togglePlay} />
+          </div>
           {player.overlay != null && <div className="pb-overlay"><div>{player.overlay}</div></div>}
           {player.loading && <div className="pb-overlay"><span className="spinner" /></div>}
           {player.gapWarn && <div className="pb-gapwarn">Recording gap detected in this window</div>}
+
+          {/* Zoom controls. Hidden while the frame is at 1x would be tidier and
+              worse: an operator cannot discover a control that is not there. */}
+          <div className="pb-zoom" role="group" aria-label="Zoom">
+            <button className="btn-ghost btn-sm iconish" onClick={zoom.zoomOut}
+                    disabled={!zoom.zoomed} aria-label="Zoom out" title="Zoom out">−</button>
+            <span className="pb-zoom-level" aria-live="polite">
+              {zoom.tf.scale.toFixed(1)}×
+            </span>
+            <button className="btn-ghost btn-sm iconish" onClick={zoom.zoomIn}
+                    aria-label="Zoom in" title="Zoom in (scroll on the video)">+</button>
+            <button className="btn-ghost btn-sm" onClick={zoom.reset}
+                    disabled={!zoom.zoomed} title="Reset zoom">Reset</button>
+          </div>
+          {zoom.zoomed && (
+            <div className="pb-zoom-hint">Right-drag to pan</div>
+          )}
+
           {/* key: a camera switch discards any half-drawn box — the capture
               belongs to the previous camera's frame. */}
           {annotating && (
             <AnnotateLayer key={camera} videoRef={videoRef} camera={camera}
+                           classes={labelClasses}
                            epochOf={player.currentEpoch}
+                           stage={zoom.stageEl}
                            onSimilar={onOpenAt ? setSimilar : undefined} />
           )}
         </div>
@@ -298,6 +510,21 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
             }}>
             ✏ Annotate
           </button>
+          {canEvents && (
+            <div className="pb-group">
+              <button className={`btn-ghost btn-sm${showMarks ? ' active' : ''}`}
+                      aria-pressed={showMarks} onClick={toggleMarks}
+                      title="Show AI markers on the timeline">◆ Markers</button>
+              {showMarks && (
+                <>
+                  <button className="btn-ghost btn-sm" title="Previous marker"
+                          onClick={() => stepMark(-1)}>◀</button>
+                  <button className="btn-ghost btn-sm" title="Next marker"
+                          onClick={() => stepMark(1)}>▶</button>
+                </>
+              )}
+            </div>
+          )}
           <div style={{ flex: 1 }} />
           <div className="pb-group">
             {ZOOMS.map(h => (
@@ -309,38 +536,32 @@ export function SinglePlayer({ camera, nvrCams, registry, onSelectCamera, onOpen
                  onChange={e => onDatePick(e.target.value)} />
         </div>
 
+        {marksOn && (
+          <div className="pb-marks-bar" aria-live="polite">
+            {marksStatus === 'unavailable' && <span>Events are not available for this camera.</span>}
+            {marksStatus !== 'unavailable' && !legend.length && (
+              <span>{marksStatus === 'loading' ? 'Loading markers…' : 'No AI events in this window.'}</span>
+            )}
+            {legend.map(([key, a]) => (
+              <button key={key} className="pb-mark-chip" aria-pressed={!hiddenActs.has(key)}
+                      title={hiddenActs.has(key) ? `Show ${a.label}` : `Hide ${a.label}`}
+                      onClick={() => toggleAct(key)}>
+                <span className="pb-mark-dot" style={{ background: a.color }} />
+                {a.label} <span style={{ color: 'var(--muted)' }}>{a.n}</span>
+              </button>
+            ))}
+            {truncated && <span title="Zoom in to see every event">· newest shown only — zoom in for all</span>}
+          </div>
+        )}
         <Timeline
           viewStart={view.start} viewEnd={view.end}
           range={range} gaps={gaps} playhead={player.wall}
+          marks={marksOn ? shownMarks : undefined}
+          presenceRows={marksOn ? kinds.filter(k => !hiddenActs.has(PRESENCE_META[k].key)) : undefined}
+          onMarkClick={seekMark}
           onSeek={doSeek}
           onViewChange={(start, end) => setView({ start, end })}
         />
-      </div>
-
-      {/* Cameras rail (legacy pbRailRender) */}
-      <div className="card" style={{ padding: 14 }}>
-        <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: '.12em', textTransform: 'uppercase',
-                      color: 'var(--dim)', marginBottom: 10 }}>Cameras</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, fontSize: 12.5 }}>
-          {!nvrCams.length && <p style={{ color: 'var(--dim)', fontSize: 12 }}>No recorded cameras.</p>}
-          {nvrCams.map(c => {
-            const reg = registry.find(x => x.slug === c.name);
-            const live = reg?.health_status === 'connected';
-            return (
-              <div key={c.name} className={`lv-node${camera === c.name ? ' active' : ''}`}
-                   onClick={() => onSelectCamera(c.name)}>
-                <span style={{ width: 7, height: 7, borderRadius: '50%',
-                               background: live ? 'var(--green)' : 'var(--dim)', flexShrink: 0 }} />
-                <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {regName(c.name)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-        <div className="d-hint" style={{ marginTop: 12 }}>
-          Click a camera to load its timeline. Footage is the NVR's continuous recording.
-        </div>
       </div>
     </div>
   );

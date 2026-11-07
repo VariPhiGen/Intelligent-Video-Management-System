@@ -40,11 +40,11 @@ def _zone(name, points=None, kind="zone", direction=None):
 
 
 def camera(slug=SLUG, activities=("unauthorised_access",), regions=None,
-           retention_days=None, name=None):
+           retention_minutes=None, name=None):
     regions = regions if regions is not None else {"region_1": _zone("Zone 1")}
     acts = [{"type": a, "regions": list(regions), "params": {}} for a in activities]
     return SimpleNamespace(id=uuid.uuid4(), slug=slug, name=name or slug.split("-")[0],
-                           enabled=True, retention_days=retention_days,
+                           enabled=True, retention_minutes=retention_minutes,
                            analytics_config={"regions": regions, "activities": acts})
 
 
@@ -55,9 +55,9 @@ def event(**kw):
     return ev.EventIn(**base)
 
 
-def prepare(items, *cams, default_retention_days=30):
+def prepare(items, *cams, default_retention_minutes=30 * 1440):
     return ev.prepare(items, {c.slug: c for c in cams}, now=NOW,
-                      default_retention_days=default_retention_days)
+                      default_retention_minutes=default_retention_minutes)
 
 
 # ── Event creation from configured activities ───────────────────────────────
@@ -129,14 +129,29 @@ class TestCreation:
     def test_expiry_follows_the_camera_footage_retention(self):
         """An event must not outlive the footage its playback link points at."""
         start = NOW - timedelta(hours=1)
-        [short], _ = prepare([event(started_at=start)], camera(retention_days=7))
-        [default], _ = prepare([event(started_at=start)], camera(), default_retention_days=30)
+        [short], _ = prepare([event(started_at=start)], camera(retention_minutes=7 * 1440))
+        [default], _ = prepare([event(started_at=start)], camera(),
+                               default_retention_minutes=30 * 1440)
         assert short["expires_at"] == start + timedelta(days=7)
         assert default["expires_at"] == start + timedelta(days=30)
 
+    def test_a_minute_scale_retention_is_honoured_rather_than_rounded(self):
+        """The event's deadline is computed in MINUTES. Rounded to days, a
+        camera kept for 90 minutes would either keep its events for a full day
+        (over-retention the compliance report would not show) or for zero
+        (every event rejected as outside retention on arrival)."""
+        start = NOW - timedelta(minutes=5)
+        [row], _ = prepare([event(started_at=start)], camera(retention_minutes=90))
+        assert row["expires_at"] == start + timedelta(minutes=90)
+
     def test_an_event_older_than_the_footage_it_would_link_to_is_refused(self):
         rows, rejected = prepare([event(started_at=NOW - timedelta(days=8))],
-                                 camera(retention_days=7))
+                                 camera(retention_minutes=7 * 1440))
+        assert rows == [] and rejected[0]["reason"] == "outside_retention"
+
+    def test_an_event_older_than_a_minute_scale_window_is_refused_too(self):
+        rows, rejected = prepare([event(started_at=NOW - timedelta(minutes=31))],
+                                 camera(retention_minutes=30))
         assert rows == [] and rejected[0]["reason"] == "outside_retention"
 
     def test_oversized_attributes_are_refused(self):

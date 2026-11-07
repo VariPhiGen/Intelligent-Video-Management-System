@@ -193,11 +193,19 @@ html[data-theme="dark"] {
   --tl-track:   #E3E7ED;
   --tl-footage: #5F6F86;
   --tl-grid:    rgba(17, 23, 34, .08);
+  /* Presence rows under the footage: cool hues, apart from the orange
+     playhead and from each other. */
+  --tl-person:  #5B5BD6;
+  --tl-vehicle: #0F8A7E;
+  --tl-motion:  #B8457A;
 }
 html[data-theme="dark"] {
   --tl-track:   #161B22;
   --tl-footage: #5E7390;
   --tl-grid:    rgba(255, 255, 255, .05);
+  --tl-person:  #8B8CF2;
+  --tl-vehicle: #2DBFAE;
+  --tl-motion:  #E27AA6;
 }
 
 /* Availability chart palette (camera Health tab). Up is teal, down is red:
@@ -532,7 +540,7 @@ html[data-theme="dark"] .avatar { background: var(--n4); }
   border-bottom: 1px solid var(--border);
   position: relative; z-index: 10;
 }
-.topbar-title { font-size: 16px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; }
+.topbar-title { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.01em; line-height: inherit; white-space: nowrap; }
 .site-chip {
   display: inline-flex; align-items: center; gap: 6px;
   padding-left: var(--s4); border-left: 1px solid var(--border2);
@@ -815,7 +823,11 @@ html[data-theme="dark"] .chip { background: transparent; }
   margin-bottom: var(--s4);
   max-width: 100%; overflow-x: auto;
 }
-.tabs::-webkit-scrollbar { height: 0; }
+/* No scrollbar on a tab bar. `scrollbar-width` is the rule that works: the
+   global `* { scrollbar-width: thin }` makes Chrome 121+ ignore every
+   ::-webkit-scrollbar rule, which is why height: 0 alone stopped hiding it. */
+.tabs { scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
 .tab {
   display: inline-flex; align-items: center;
   padding: 5px 12px; font-size: 13.5px; font-weight: 500;
@@ -854,6 +866,10 @@ a.tab, a.tab:hover { text-decoration: none; }
   transition: background var(--fast) var(--ease);
 }
 .page-tabs .tab.active::after { background: var(--accent); }
+/* More tabs out of view: fade that end (useTabOverflow sets the classes). */
+.page-tabs.fade-end { mask-image: linear-gradient(to right, #000 calc(100% - 48px), transparent); }
+.page-tabs.fade-start { mask-image: linear-gradient(to left, #000 calc(100% - 48px), transparent); }
+.page-tabs.fade-start.fade-end { mask-image: linear-gradient(to right, transparent, #000 48px, #000 calc(100% - 48px), transparent); }
 html[data-theme="dark"] .page-tabs .tab.active { background: transparent; }
 
 /* A tab row: tabs on the left, a trailing action on the right. With page tabs
@@ -1123,9 +1139,15 @@ label:has(input), label:has(select), label:has(textarea) {
   .logo, .rail-foot, .nav-section { display: none; }
   /* Items size to their own labels ("Playback & Cases" is not a 68px word) and
      the strip scrolls sideways without drawing a scrollbar under the icons. */
+  /* The fade on the right edge is the only sign the strip scrolls: eleven
+     destinations do not fit a phone, and a label cut off at the edge
+     ("Periphe") read as a rendering bug, not as "there is more". The end
+     padding lets the last item scroll fully clear of the fade. */
   nav {
-    display: flex; gap: 0; padding: 4px var(--s1); height: 60px;
+    display: flex; gap: 0; padding: 4px 32px 4px var(--s1); height: 60px;
     overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+            mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
   }
   nav::-webkit-scrollbar { display: none; }
   nav a {

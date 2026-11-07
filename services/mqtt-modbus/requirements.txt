@@ -1,0 +1,2 @@
+aiomqtt>=2.3,<3
+pyserial>=3.5,<4

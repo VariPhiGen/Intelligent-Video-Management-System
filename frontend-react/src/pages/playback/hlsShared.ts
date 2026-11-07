@@ -144,6 +144,66 @@ export function playlistEnd(frags: Fragment[]): number | null {
   return last.programDateTime! / 1000 + last.duration;
 }
 
+/** One tile of a synchronised multi-camera view, as the playhead loop sees it. */
+export interface SyncTile {
+  name: string;
+  frags: Fragment[];
+  currentTime: number;
+  ended: boolean;
+  /** Can the element seek right now (HAVE_CURRENT_DATA and not mid-seek)? */
+  seekable: boolean;
+  /**
+   * Is the clock actually moving — playing, with data ahead, not mid-seek?
+   * Omitted = true. A tile still buffering its first segment has a time but
+   * it is frozen, and must not be what the others are pulled back to.
+   */
+  advancing?: boolean;
+}
+
+/**
+ * The shared playhead, and which tiles to pull back onto it.
+ *
+ * THE REFERENCE MUST BE A TILE THAT IS STILL PLAYING. Two cameras' footage
+ * ends a few seconds apart — each camera's last segment closed at its own
+ * moment — and a tile that has run out still reports a time: a segment's real
+ * media ends a little short of the duration its fragment declares, so
+ * `epochAt` finds its last frame inside the fragment. Taken as the reference,
+ * that frozen time dragged the other, still-playing tile back to it every
+ * 500 ms; each backward seek emptied its buffer, fired `waiting`, and the tile
+ * flashed its loading spinner. The playing tile then never reached its own end,
+ * so the "every tile ended → reload" path never ran and the loop never stopped.
+ *
+ * So: lead with the first tile still playing. An ended tile is only the clock
+ * when every tile has ended, and then nothing is seeked. A tile is never
+ * seeked past its own footage either — `mediaTimeFor` would clamp it to its
+ * last frame, again and again.
+ */
+export function planSync(
+  tiles: SyncTile[], tolerance: number,
+): { clock: number | null; seeks: { name: string; mediaTime: number }[] } {
+  const timed = tiles.map(t => ({ t, at: t.frags.length ? epochAt(t.frags, t.currentTime) : null }));
+  const moving = (x: typeof timed[number]) => x.at != null && !x.t.ended && x.t.advancing !== false;
+  const lead = timed.find(moving)
+    ?? timed.find(x => x.at != null && !x.t.ended)
+    ?? timed.find(x => x.at != null);
+  if (!lead) return { clock: null, seeks: [] };
+  const ref = lead.at!;
+  const seeks: { name: string; mediaTime: number }[] = [];
+  // Everything has played out, or nothing is moving yet (all still buffering):
+  // report the clock but pull no one. Seeking a playing tile back to a frozen
+  // one every tick is what kept multi-view tiles flashing their spinner.
+  if (!moving(lead)) return { clock: ref, seeks };
+  for (const { t, at } of timed) {
+    if (t === lead.t || at == null || t.ended || !t.seekable) continue;
+    if (Math.abs(at - ref) <= tolerance) continue;
+    const end = playlistEnd(t.frags);
+    if (end != null && ref >= end - tolerance) continue;   // beyond this tile's footage
+    const media = mediaTimeFor(t.frags, ref);
+    if (media != null) seeks.push({ name: t.name, mediaTime: media });
+  }
+  return { clock: ref, seeks };
+}
+
 /** True when the fragments cover their span with no gap worth warning about. */
 export function coverageComplete(frags: Fragment[]): boolean {
   const end = playlistEnd(frags);

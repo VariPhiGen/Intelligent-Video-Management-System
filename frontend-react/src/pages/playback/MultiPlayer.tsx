@@ -18,22 +18,25 @@
  * <Timeline> component, here in multi-lane mode (one coverage lane per camera,
  * one shared playhead). Pan, zoom (10 min–7 days) and click-to-seek all move
  * every tile together. There is no separate "Load" button: scrubbing the
- * timeline, jumping to a time, or hitting LIVE is what loads footage.
+ * timeline, jumping to a time, or hitting LIVE is what loads footage, and the
+ * tab opens playing the newest footage just like the single player.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import { ApiError } from '@/lib/api';
-import type { Camera } from '@/lib/types';
+import { useAuth } from '@/lib/auth';
+import type { Camera, NvrCoverage } from '@/lib/types';
 import { useToast } from '@/components/Toast';
 import { DateTimeField } from '@/components/DateTimeField';
 import { CameraRail } from './CameraRail';
-import { fmtWall, nvrCoverage, toSec, type NvrCamera } from './coverage';
+import { covSpans, fmtWall, nvrCoverage, toSec, type NvrCamera } from './coverage';
 import {
   RELOAD_MIN_INTERVAL_MS, createHls, datedFragments, detectHevc, epochAt,
-  hlsResponseError, mediaTimeFor, playlistUrl, useBearerToken,
+  hlsResponseError, mediaTimeFor, planSync, playlistEnd, playlistUrl, useBearerToken,
 } from './hlsShared';
 import { NoFootage, type TileState } from './NoFootage';
 import { Timeline } from './Timeline';
+import { cameraHasAi, clipToFootage, indexedKinds, useLaneMarks } from './timelineMarks';
 
 const CHUNK_MS = 120_000;
 /**
@@ -78,6 +81,10 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   const [addOpen, setAddOpen] = useState(false);     // add-camera dropdown open?
   const [view, setView] = useState(() => ({ start: Date.now() - 24 * 3600_000, end: Date.now() }));
   const [gaps, setGaps] = useState<Record<string, Gap[]>>({});
+  // Each lane's coverage answer and the window it covers — what that lane's
+  // markers are cut to, so none is drawn where the camera has no footage.
+  const [covs, setCovs] = useState<{ win: { from: number; to: number };
+                                     byCam: Record<string, NvrCoverage | null> } | null>(null);
   const [playing, setPlaying] = useState(false);
   // Where the jump-to control is pointed. Kept so the box reflects the last
   // jump rather than clearing itself the moment you use it. (`jumpTo` further
@@ -86,6 +93,16 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   const [rate, setRate] = useState(1);
   const [tileStatus, setTileStatus] = useState<Record<string, TileState | null>>({});
   const [clockMs, setClockMs] = useState<number | null>(null);
+  // On: every tile shows the same instant — drift is pulled back and any seek
+  // moves them all. Off: tiles run free — a tile's jump-to-footage moves only
+  // that tile, and clicking a tile plays/pauses just it.
+  const [syncLock, setSyncLock] = useState(true);
+  const syncLockRef = useRef(syncLock); syncLockRef.current = syncLock;
+  // Each tile's own wall clock (epoch seconds) — only tracked with sync lock
+  // off, where it drives a per-lane playhead and the tile's time readout.
+  const [tileClocks, setTileClocks] = useState<Record<string, number | null>>({});
+  const tileClocksRef = useRef(tileClocks); tileClocksRef.current = tileClocks;
+  const tileReloads = useRef<Record<string, number>>({});   // per-tile reload floor
 
   const vids = useRef<Record<string, HTMLVideoElement | null>>({});
   // One hls.js instance and one fragment list per tile. The fragments are what
@@ -94,7 +111,10 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   // still agree on the time being shown.
   const hlses = useRef<Record<string, Hls | null>>({});
   const tileFrags = useRef<Record<string, ReturnType<typeof datedFragments>>>({});
-  const endedCount = useRef(0);
+  // Which tiles have played out, by name. A Set, not a counter: a tile that
+  // ends, is seeked, and ends again is still one tile, and counting events let
+  // two `ended`s from one camera reload every tile while the other still played.
+  const endedTiles = useRef(new Set<string>());
   const loadToken = useRef(0);
   const lastReload = useRef(0);
   // Assigned below, once the clock it reads is in scope. Held as a ref because
@@ -145,36 +165,50 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
 
   useEffect(() => () => { stopTiles(); }, [stopTiles]);
 
-  // ── point every tile at `epochSec` (epoch seconds) ──
-  const loadAt = useCallback(async (epochSec: number) => {
-    const cams = selRef.current;
+  // ── point every tile (or just `only`) at `epochSec` (epoch seconds) ──
+  const loadAt = useCallback(async (epochSec: number, only?: string[]) => {
+    const cams = only ?? selRef.current;
     if (!cams.length) { toast('Pick at least one camera', 'err'); return; }
     if (!hlsOk) { toast('This browser cannot play recorded video', 'err'); return; }
-    stopTiles(true);
-    // Show the requested instant immediately; the playhead switches to the
-    // tiles' own PDT tags as soon as their fragments land.
-    setClockMs(epochSec * 1000);
-    endedCount.current = 0;
-    lastReload.current = Date.now();
+    if (only) {
+      // One tile re-pointed with sync lock off: tear down just that tile and
+      // leave the others' players (and the shared load token) alone.
+      for (const n of only) {
+        const h = hlses.current[n];
+        if (h) { try { h.destroy(); } catch { /* already gone */ } }
+        hlses.current[n] = null;
+        delete tileFrags.current[n];
+        endedTiles.current.delete(n);
+      }
+    } else {
+      stopTiles(true);
+      // Show the requested instant immediately; the playhead switches to the
+      // tiles' own PDT tags as soon as their fragments land.
+      setClockMs(epochSec * 1000);
+      endedTiles.current.clear();
+      lastReload.current = Date.now();
+    }
     const token = loadToken.current;
-    setTileStatus(Object.fromEntries(cams.map(n => [n, { kind: 'loading' } as TileState])));
+    setTileStatus(st => ({ ...(only ? st : {}),
+                           ...Object.fromEntries(cams.map(n => [n, { kind: 'loading' } as TileState])) }));
     await refreshToken();
     if (token !== loadToken.current) return;
     // Set the ref alongside the state: playingRef only catches up on the next
     // render, and LEVEL_LOADED can fire before that — a tile reading a stale
     // `false` would load correctly and then just sit there. Same idiom as
     // changeSpeed below.
-    setPlaying(true); playingRef.current = true;
+    if (!only) { setPlaying(true); playingRef.current = true; }
 
     for (const n of cams) {
       const v = vids.current[n];
       if (!v) continue;
+      if (only && hlses.current[n]) continue;   // a newer single-tile load won
       // Four of these run at once, so each buffers less than the single player.
       const inst = createHls(bearer, { maxBufferLength: 30, backBufferLength: 30 });
       hlses.current[n] = inst;
 
       inst.on(Hls.Events.LEVEL_LOADED, (_e, data) => {
-        if (token !== loadToken.current) return;
+        if (token !== loadToken.current || hlses.current[n] !== inst) return;
         const frags = datedFragments(data.details.fragments);
         tileFrags.current[n] = frags;
         if (!frags.length) {
@@ -184,7 +218,7 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
         const media = mediaTimeFor(frags, epochSec);
         if (media != null) v.currentTime = media;
         try { v.playbackRate = rateRef.current; } catch { /* not ready */ }
-        if (playingRef.current) v.play().catch(() => {});
+        if (playingRef.current || only) v.play().catch(() => {});
         // The tile stays in 'loading' until the element can actually show a
         // frame. This event is the *playlist* landing, which is an index query
         // — clearing here would drop the spinner and leave a black tile for the
@@ -192,7 +226,7 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
       });
 
       inst.on(Hls.Events.ERROR, (_e, data) => {
-        if (token !== loadToken.current) return;
+        if (token !== loadToken.current || hlses.current[n] !== inst) return;
         // A 409 means grooming rewrote a segment under us — the playlist's
         // content signatures are stale, so rebuild rather than fail the tile.
         if (data.response?.code === 409) { reloadRef.current(); return; }
@@ -211,16 +245,55 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   }, [bearer, hevc, hlsOk, refreshToken, stopTiles, toast]);
   const loadRef = useRef(loadAt); loadRef.current = loadAt;
 
-  // Seek = load a window at that instant, and keep the timeline framing it.
+  /**
+   * Move every tile within the playlists they already hold, if all of them
+   * cover `epochSec`. Each playlist spans 30 minutes, so most scrubs and every
+   * ±30 s land inside it — and then a seek is a `currentTime` assignment that
+   * reuses the buffer, not four new playlists, four fresh players and four
+   * first-segment waits (which is what made scrubbing here slower than the
+   * single player).
+   */
+  const seekInPlace = useCallback((epochSec: number, only?: string[]) => {
+    const cams = only ?? selRef.current;
+    if (!cams.length) return false;
+    for (const n of cams) {
+      const frags = tileFrags.current[n];
+      if (!hlses.current[n] || !vids.current[n] || !frags?.length) return false;
+      const end = playlistEnd(frags);
+      // Keep a margin off the end: near the live edge the playlist is short,
+      // and a rebuild is what picks up newly recorded footage.
+      if (end == null || epochSec < frags[0].programDateTime! / 1000 || epochSec > end - 5) return false;
+    }
+    for (const n of cams) {
+      const v = vids.current[n]!;
+      const media = mediaTimeFor(tileFrags.current[n], epochSec);
+      if (media != null) v.currentTime = media;
+      if (playingRef.current) v.play().catch(() => {});
+    }
+    if (only) {
+      only.forEach(n => endedTiles.current.delete(n));
+      setTileClocks(c => ({ ...c, ...Object.fromEntries(only.map(n => [n, epochSec])) }));
+    } else {
+      endedTiles.current.clear();
+      setClockMs(epochSec * 1000);
+    }
+    return true;
+  }, []);
+
+  // Seek = move the tiles to that instant, and keep the timeline framing it.
   const doSeek = useCallback((epochSec: number) => {
     const v = viewRef.current;
     const span = v.end - v.start;
     const ms = epochSec * 1000;
     // Only re-frame if the target left the current window (keeps scrubbing calm).
     if (ms < v.start || ms > v.end) setView({ start: ms - span / 2, end: ms + span / 2 });
-    loadRef.current(epochSec);
-  }, []);
+    if (!seekInPlace(epochSec)) loadRef.current(epochSec);
+  }, [seekInPlace]);
   const doSeekRef = useRef(doSeek); doSeekRef.current = doSeek;
+  /** Sync lock off: move one tile, in place when its playlist covers it. */
+  const seekTile = useCallback((name: string, epochSec: number) => {
+    if (!seekInPlace(epochSec, [name])) loadRef.current(epochSec, [name]);
+  }, [seekInPlace]);
 
   const newestLatest = useCallback(() => {
     const ls = selRef.current.map(n => rangesRef.current[n]?.latest).filter((x): x is number => x != null);
@@ -242,35 +315,46 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
     setSel(nvrCams.slice(0, 4).map(c => c.name));
   }, [nvrCams]);
 
-  // First real selection → land on the latest footage, playing.
+  // First real selection → land on the latest footage, playing — the same
+  // "open at live" the single player does, with no Load step. If none of the
+  // selected cameras reports a recorded range, start at now anyway: each tile
+  // then says why it has nothing (no footage / gap + jump) instead of idling.
   const started = useRef(false);
+  const startSel = useRef<string[] | null>(null);
   useEffect(() => {
     if (started.current || !sel.length) return;
-    const newest = newestLatest();
-    if (newest == null) return;
     started.current = true;
+    startSel.current = sel;
+    const newest = newestLatest() ?? Date.now() / 1000;
     const endMs = newest * 1000 + 10 * 60_000;
     setView({ start: endMs - 24 * 3600_000, end: endMs });
     doSeekRef.current(newest - 120);
-  }, [sel, newestLatest]);
+  }, [sel, ranges, newestLatest]);
 
   // ── coverage per selected camera, debounced on view/selection ──
   const covCtl = useRef<AbortController | null>(null);
   const covTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchCoverage = useCallback(async () => {
     const cams = selRef.current;
-    const { start, end } = viewRef.current;
-    if (!cams.length) { setGaps({}); return; }
+    const { start: vs, end: ve } = viewRef.current;
+    // The view plus half a view either side: the window the lane markers are
+    // fetched for (useLaneMarks), so each has coverage to be cut against.
+    const start = vs - (ve - vs) / 2, end = ve + (ve - vs) / 2;
+    if (!cams.length) { setGaps({}); setCovs(null); return; }
     if (covCtl.current) covCtl.current.abort();
     const ctl = new AbortController(); covCtl.current = ctl;
     try {
       const entries = await Promise.all(cams.map(async n => {
         try {
           const d = await nvrCoverage(n, new Date(start), new Date(end), 30, ctl.signal);
-          return [n, (Array.isArray(d.gaps) ? d.gaps : []).map(g => ({ start: toSec(g.start), end: toSec(g.end) }))] as const;
-        } catch { return [n, [] as Gap[]] as const; }
+          return [n, d] as const;
+        } catch { return [n, null] as const; }
       }));
-      if (covCtl.current === ctl) setGaps(Object.fromEntries(entries));
+      if (covCtl.current === ctl) {
+        setGaps(Object.fromEntries(entries.map(([n, d]) => [n, (Array.isArray(d?.gaps) ? d!.gaps : [])
+          .map(g => ({ start: toSec(g.start), end: toSec(g.end) }))])));
+        setCovs({ win: { from: start, to: end }, byCam: Object.fromEntries(entries) });
+      }
     } finally { if (covCtl.current === ctl) covCtl.current = null; }
   }, []);
   useEffect(() => {
@@ -280,7 +364,17 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   }, [view, sel, fetchCoverage]);
 
   // ── transport ──
-  const skip = (sec: number) => { if (clockMs != null) doSeek(clockMs / 1000 + sec); };
+  const skip = (sec: number) => {
+    if (!syncLock) {
+      // Each tile steps from where IT is.
+      for (const n of sel) {
+        const at = tileClocks[n];
+        if (at != null) seekTile(n, at + sec);
+      }
+      return;
+    }
+    if (clockMs != null) doSeek(clockMs / 1000 + sec);
+  };
   const playPause = () => {
     const next = !playing;
     setPlaying(next);
@@ -311,19 +405,31 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   };
   // A tile can decode now — this, not the playlist, is when its wait ends.
   const onTileReady = (name: string) =>
-    setTileStatus(st => (st[name] && st[name]!.kind === 'loading' ? { ...st, [name]: null } : st));
+    setTileStatus(st => (st[name] && (st[name]!.kind === 'loading' || st[name]!.kind === 'buffering')
+      ? { ...st, [name]: null } : st));
   // Buffer ran dry (the next segment is still being built): show the spinner
   // again rather than a frozen frame.
   const onTileWaiting = (name: string) =>
-    setTileStatus(st => (st[name] == null ? { ...st, [name]: { kind: 'loading' } } : st));
+    setTileStatus(st => (st[name] == null ? { ...st, [name]: { kind: 'buffering' } } : st));
 
-  const onTileEnded = () => {
-    endedCount.current++;
+  const onTileEnded = (name: string) => {
+    endedTiles.current.add(name);
+    if (!syncLockRef.current) {
+      // Independent tiles: this one has run out — rebuild just it, at its own
+      // position, under the same floor the shared reload uses.
+      const at = tileClocksRef.current[name];
+      const last = tileReloads.current[name] ?? 0;
+      if (at != null && playingRef.current && Date.now() - last >= RELOAD_MIN_INTERVAL_MS) {
+        tileReloads.current[name] = Date.now();
+        loadRef.current(at, [name]);
+      }
+      return;
+    }
     // Every tile has played out its playlist. With a 30-minute window that
     // means the recording ended, not that a 2-minute chunk did — so rebuild at
     // the playhead (picking up footage recorded since) rather than jumping
     // forward 120 s into what may be nothing.
-    if (endedCount.current >= selRef.current.length && playingRef.current) {
+    if (selRef.current.every(n => endedTiles.current.has(n)) && playingRef.current) {
       reloadRef.current();
     }
   };
@@ -342,11 +448,19 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
       delete hlses.current[n];
       delete tileFrags.current[n];
     }
-    if (started.current && added.length && clockMs != null) loadRef.current(clockMs / 1000);
+    // The selection the first start was made with already loaded every tile
+    // (that effect runs just before this one) — loading again here tore that
+    // load down and restarted all four.
+    if (started.current && added.length && startSel.current !== sel) {
+      // Join the shared clock; with nothing playing yet, open at live.
+      const at = clockMs != null ? clockMs / 1000 : (newestLatest() ?? Date.now() / 1000) - 120;
+      if (clockMs != null && !syncLockRef.current) loadRef.current(at, added);
+      else loadRef.current(at);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel]);
 
-  // Playhead: read the wall clock off the first tile that has fragments.
+  // Playhead: read the wall clock off the first tile that is still playing.
   //
   // Not `loadStart + currentTime` any more. Each tile's playlist begins at the
   // segment boundary *containing* the requested instant, and those boundaries
@@ -355,23 +469,28 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   // correct across all of them.
   useEffect(() => {
     const t = setInterval(() => {
-      let ref: number | null = null;
-      for (const n of selRef.current) {
+      // Who leads and who gets pulled back is decided in planSync — including
+      // the rule that an ended tile never leads while another is still
+      // playing, which is what stopped both tiles flickering at the end of
+      // the footage.
+      const tiles = selRef.current.flatMap(n => {
         const v = vids.current[n];
         const frags = tileFrags.current[n];
-        if (!v || !frags?.length) continue;
-        const at = epochAt(frags, v.currentTime);
-        if (at == null) continue;
-        if (ref == null) { ref = at; setClockMs(at * 1000); continue; }
-        // Resync drifted tiles. Tiles start playing as their own first fragment
-        // lands, a few hundred ms apart, and that offset persists — the old
-        // engine avoided it by cutting every tile from one build. "Sync lock ·
-        // all at same time" is the promise this tab makes, so hold the tiles to
-        // the leader rather than letting them wander.
-        if (Math.abs(at - ref) > SYNC_TOLERANCE_S && v.readyState >= 2 && !v.seeking) {
-          const media = mediaTimeFor(frags, ref);
-          if (media != null) v.currentTime = media;
-        }
+        if (!v || !frags?.length) return [];
+        return [{ name: n, frags, currentTime: v.currentTime, ended: v.ended,
+                  seekable: v.readyState >= 2 && !v.seeking,
+                  advancing: !v.paused && !v.seeking && v.readyState >= 3 }];
+      });
+      const { clock, seeks } = planSync(tiles, SYNC_TOLERANCE_S);
+      if (clock != null) setClockMs(clock * 1000);
+      if (!syncLockRef.current) {
+        // Free-running tiles: no drift pull — each reports its own time.
+        setTileClocks(Object.fromEntries(tiles.map(t => [t.name, epochAt(t.frags, t.currentTime)])));
+        return;
+      }
+      for (const s of seeks) {
+        const v = vids.current[s.name];
+        if (v) v.currentTime = s.mediaTime;
       }
     }, 500);
     return () => clearInterval(t);
@@ -391,16 +510,57 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
   }, []);
   reloadRef.current = reloadAtClock;
 
-  const jumpTo = useCallback((range: { earliest: number; latest: number }) => {
+  const jumpTo = useCallback((name: string, range: { earliest: number; latest: number }) => {
     // range is ms here (from classifyClipError); land on the near edge.
     const nowMs = clockMs ?? viewRef.current.end;
     const target = nowMs < range.earliest ? range.earliest : Math.max(range.earliest, range.latest - CHUNK_MS);
+    // Sync lock off: only the tile that asked moves.
+    if (!syncLock) { loadAt(target / 1000, [name]); return; }
     doSeek(target / 1000);
-  }, [clockMs, doSeek]);
+  }, [clockMs, doSeek, loadAt, syncLock]);
 
-  const clockText = clockMs != null ? fmtWall(clockMs / 1000) : '—— ——:——:——';
+  const toggleSync = () => {
+    const next = !syncLock;
+    setSyncLock(next); syncLockRef.current = next;
+    if (!next) return;
+    // Re-locking: bring every tile back onto the one clock (in place when the
+    // playlists already cover it).
+    setTileClocks({});
+    if (clockRef.current != null) doSeek(clockRef.current / 1000);
+  };
+  // Sync lock off: a click on a tile plays/pauses just that tile.
+  const toggleTile = (name: string) => {
+    if (syncLock) return;
+    const v = vids.current[name];
+    if (!v || !hlses.current[name]) return;
+    if (v.paused) v.play().catch(() => {}); else v.pause();
+  };
+
+  const clockText = !syncLock ? 'Sync off · each tile on its own clock'
+    : clockMs != null ? fmtWall(clockMs / 1000) : '—— ——:——:——';
   const cols = sel.length <= 1 ? '1fr' : '1fr 1fr';
-  const lanes = sel.map(n => ({ label: regName(n), range: ranges[n] ?? null, gaps: gaps[n] ?? [] }));
+  // Each lane's AI markers, as a band under its footage — the same rule as the
+  // single player: only with `ai_analytics`, and only for a camera configured
+  // to produce something (activities, person/vehicle indexing, motion).
+  const { me } = useAuth();
+  const canMarks = !!me?.permissions?.ai_analytics;
+  const laneSpecs = useMemo(() => sel.map(n => {
+    const cam = registry.find(c => c.slug === n);
+    return { camera: n, kinds: cameraHasAi(cam) ? indexedKinds(cam) : null };
+  }), [sel, registry]);
+  const laneMarks = useLaneMarks(laneSpecs, view, canMarks && sel.length > 0,
+                                 typeof window !== 'undefined' ? window.innerWidth : 1200);
+  const lanes = sel.map(n => ({
+    label: regName(n), range: ranges[n] ?? null, gaps: gaps[n] ?? [],
+    // No coverage answer (yet, or the NVR refused) = no markers: never draw
+    // one that cannot be shown to have footage under it.
+    // Sync off: every lane carries its own head (Timeline then hides the
+    // shared one); `undefined`, not null, is what keeps the shared head.
+    playhead: syncLock ? undefined : (tileClocks[n] ?? null),
+    marks: covs && laneMarks[n]
+      ? clipToFootage(laneMarks[n], covSpans(covs.byCam[n], covs.win.from, covs.win.to))
+      : undefined,
+  }));
 
   // Add-camera picker candidates: not already selected, matching the query
   // (display name or slug). Keeps the rail compact with 100+ cameras — only the
@@ -411,18 +571,27 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
         <div style={{ display: 'grid', gridTemplateColumns: cols, gap: 10 }}>
           {!sel.length && <div className="empty">Pick cameras from the panel on the right.</div>}
           {sel.map(n => (
-            <div key={n} className="lv-tile" style={{ cursor: 'default', aspectRatio: '16/9' }}>
-              <video ref={el => { vids.current[n] = el; }} muted playsInline onEnded={onTileEnded}
+            <div key={n} className="lv-tile" onClick={() => toggleTile(n)}
+                 title={syncLock ? undefined : 'Click to play / pause this camera'}
+                 style={{ cursor: syncLock ? 'default' : 'pointer', aspectRatio: '16/9' }}>
+              <video ref={el => { vids.current[n] = el; }} muted playsInline onEnded={() => onTileEnded(n)}
                      onCanPlay={() => onTileReady(n)} onPlaying={() => onTileReady(n)}
                      onWaiting={() => onTileWaiting(n)}
                      style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#0a0e13' }} />
-              {tileStatus[n] != null && <NoFootage state={tileStatus[n]!} onJump={jumpTo} onRetry={() => clockMs != null && loadAt(clockMs / 1000)} />}
-              {tileStatus[n] == null && !vids.current[n]?.src && <NoFootage state={{ kind: 'idle' }} />}
+              {tileStatus[n] != null && <NoFootage state={tileStatus[n]!} syncLock={syncLock}
+                onJump={r => jumpTo(n, r)}
+                onRetry={() => clockMs != null && loadAt(clockMs / 1000, syncLock ? undefined : [n])} />}
+              {/* null means ready; undefined means this tile has not loaded yet.
+                  HLS ManagedMediaSource attaches a child <source>, leaving
+                  video.src empty even while frames are playing. */}
+              {tileStatus[n] === undefined && <NoFootage state={{ kind: 'loading' }} />}
               <div style={{ position: 'absolute', left: 9, bottom: 8, pointerEvents: 'none' }}>
                 <div style={{ fontSize: 11.5, fontWeight: 500, color: '#fff', textShadow: '0 1px 3px rgba(0,0,0,.7)' }}>
                   {regName(n)}
                 </div>
-                <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: '#DCE3EC' }}>{n}</div>
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: '#DCE3EC' }}>
+                  {n}{!syncLock && tileClocks[n] != null && ` · ${fmtWall(tileClocks[n]!)}`}
+                </div>
               </div>
             </div>
           ))}
@@ -470,18 +639,25 @@ export function MultiPlayer({ nvrCams, registry }: { nvrCams: NvrCamera[]; regis
               viewStart={view.start} viewEnd={view.end}
               range={null} gaps={[]} lanes={lanes}
               playhead={clockMs != null ? clockMs / 1000 : null}
-              onSeek={sec => doSeek(sec)}
+              onSeek={(sec, _slop, lane) => {
+                // Sync off: a click on a lane moves only that camera.
+                if (!syncLock && lane != null && sel[lane]) seekTile(sel[lane], sec);
+                else doSeek(sec);
+              }}
               onViewChange={(start, end) => setView({ start, end })}
             />
           )}
           <div className="d-hint" style={{ margin: '4px 16px 14px' }}>
-            One lane per camera — filled where footage exists on the NVR. Click or scrub the timeline to move all
-            tiles together; scroll to zoom. Sync lock keeps every tile on the same clock.
+            One lane per camera — filled where footage exists on the NVR; the thin band under a lane marks its AI
+            activity (person, vehicle, motion, events). Click or scrub the timeline to move all tiles together;
+            scroll to zoom. Sync lock keeps every tile on the same clock; turn it off and each lane gets its own playhead —
+            click a lane to move just that camera, click a tile to pause it, and ±30s steps each from where it is.
           </div>
         </div>
       </div>
 
-      <CameraRail {...{ sel, nvrCams, regName, toggleCam, camFilter, setCamFilter, addOpen, setAddOpen }} />
+      <CameraRail {...{ sel, nvrCams, regName, toggleCam, camFilter, setCamFilter, addOpen, setAddOpen,
+                        syncLock, toggleSync }} />
     </div>
   );
 }

@@ -60,9 +60,16 @@ class FakeDetector:
 
 
 @pytest.fixture
-def cfg() -> AppConfig:
+def cfg(tmp_path, monkeypatch) -> AppConfig:
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return AppConfig.from_yaml(os.path.join(here, "config.yaml"))
+    c = AppConfig.from_yaml(os.path.join(here, "config.yaml"))
+    # Pinned and hermetic: model choice is test_capacity.py's subject. No
+    # download, no timing runs eating a fake's scripted detections, and no
+    # capacity cache written into a real models volume.
+    c.models.detector_weights = "yolov8n.pt"
+    c.models.models_dir = str(tmp_path)
+    monkeypatch.setattr(engine_mod, "measure_fps", lambda det: 100.0)
+    return c
 
 
 def person(x1=20, y1=150, x2=60, y2=400, conf=0.9) -> Detection:
@@ -132,15 +139,45 @@ def test_people_gathering_reads_its_behaviour_settings_on_the_live_path(cfg):
     assert Rig(cfg, two, ai_config("people_gathering", **base, proximity_factor=1.0)).run(0.0, 30).events == []
 
 
-def test_a_person_in_a_restricted_zone_raises_on_the_first_frame(cfg):
-    rig = Rig(cfg, [person()], ai_config("restricted_zone_entry", cooldown_s=60)).run(100.0, 1)
+def test_a_person_in_a_restricted_zone_raises_as_soon_as_the_track_is_confirmed(cfg):
+    # NOT on the first frame any more: the zone activities now require a
+    # CONFIRMED track, so a single-frame false positive costs nothing. The
+    # event is delayed by `tracking.confirm_after_seconds`, not lost, because
+    # the person is still inside the zone when confirmation arrives.
+    rig = Rig(cfg, [person()], ai_config("restricted_zone_entry", cooldown_s=60)).run(100.0, 3)
     [ev] = rig.events
-    assert ev.started_at == 100.0 and ev.zone.key == "left"
+    assert ev.zone.key == "left"
+    assert ev.started_at == pytest.approx(100.0 + cfg.tracking.confirm_after_seconds, abs=0.3)
+
+
+def test_one_frame_in_a_restricted_zone_raises_nothing(cfg):
+    rig = Rig(cfg, [person()], ai_config("restricted_zone_entry", cooldown_s=60))
+    rig.run(100.0, 0.2)                      # a single frame, then the person is gone
+    rig.detector.detections = []
+    rig.run(100.2, 2)
+    assert rig.events == []
 
 
 def test_a_person_standing_in_a_restricted_zone_raises_once_not_every_cooldown(cfg):
     rig = Rig(cfg, [person()], ai_config("restricted_zone_entry", cooldown_s=5)).run(100.0, 60)
     assert len(rig.events) == 1
+
+
+def test_a_person_hidden_long_enough_to_be_retired_and_revived_raises_once(cfg):
+    # Occluded for longer than max_age, so the track is retired; back in the
+    # same place inside the re-association window, so it is revived under the
+    # same id. The queued retirement used to be announced anyway, wiping the
+    # stay and its cooldown for a person still in the zone - a second event.
+    trk = cfg.tracking
+    rig = Rig(cfg, [person()], ai_config("restricted_zone_entry", cooldown_s=60))
+    rig.run(100.0, 10)                                       # in the zone, confirmed, one event
+    rig.detector.detections = []
+    hidden = trk.max_age_seconds + trk.reassociate_within_seconds / 2
+    rig.run(110.0, hidden)                                   # retired, not yet announced
+    rig.detector.detections = [person()]
+    rig.run(110.0 + hidden, 20)                              # revived, stays inside
+    assert rig.pipeline.snapshot()["tracker"]["reassociations"] >= 1, "precondition"
+    assert len(rig.events) == 1, [(e.started_at, e.track_id) for e in rig.events]
 
 
 def test_a_person_walking_up_across_a_tripwire_is_one_entry_on_the_live_path(cfg):
@@ -160,13 +197,35 @@ def test_a_person_walking_up_across_a_tripwire_is_one_entry_on_the_live_path(cfg
 
 
 def test_a_vehicle_that_disappears_past_the_tracker_age_starts_again(cfg):
+    # Gone past the tracker's MEMORY, not just its age: max_age retires the
+    # track and the re-association window is what could still bring it back.
+    # This used to hide the car for max_age + 2 s - exactly the edge of that
+    # window - and passed only because a revived identity's retirement was
+    # still announced and wiped its timer (see the test below).
+    trk = cfg.tracking
+    gone = trk.max_age_seconds + trk.reassociate_within_seconds + 2
     rig = Rig(cfg, [car()], ai_config("stray_parking", required_duration_s=20))
     rig.run(0.0, 15)
     rig.detector.detections = []
-    rig.run(15.0, cfg.tracking.max_age_seconds + 2)        # gone long enough to retire
+    rig.run(15.0, gone)
     rig.detector.detections = [car()]
-    rig.run(15.0 + cfg.tracking.max_age_seconds + 2, 15)
+    rig.run(15.0 + gone, 15)
     assert rig.events == [] and rig.pipeline.tracks_retired >= 1
+
+
+def test_a_parked_vehicle_hidden_briefly_keeps_its_timer(cfg):
+    # Retired and revived inside the window: the same car, still parked, so its
+    # timer carries on rather than restarting under a fresh identity.
+    trk = cfg.tracking
+    hidden = trk.max_age_seconds + trk.reassociate_within_seconds / 2
+    rig = Rig(cfg, [car()], ai_config("stray_parking", required_duration_s=20))
+    rig.run(0.0, 15)
+    rig.detector.detections = []
+    rig.run(15.0, hidden)
+    rig.detector.detections = [car()]
+    rig.run(15.0 + hidden, 10)
+    [ev] = rig.events
+    assert ev.attributes["parked_s"] >= 20.0
 
 
 def test_a_camera_without_a_running_activity_costs_no_detector_call(cfg):
@@ -283,7 +342,7 @@ def _settle(predicate, timeout=5.0):
     return False
 
 
-def test_the_activity_path_gets_its_own_detector_only_when_an_activity_runs(cfg, monkeypatch):
+def test_the_activity_path_shares_one_detector_and_only_loads_when_an_activity_runs(cfg, monkeypatch):
     from analytics import detector as detector_mod, plates as plates_mod, selection as selection_mod
 
     built = []
@@ -311,7 +370,12 @@ def test_the_activity_path_gets_its_own_detector_only_when_an_activity_runs(cfg,
         engine.add_camera(CAM, "rtsp://relay/b", (), analytics_config=ai_config(
             "stray_parking", required_duration_s=600))
         assert _settle(lambda: engine._activity_pipeline is not None)
-        assert len(built) == 2 and engine._activity_detector is not engine._detector
+        # ONE COMPILED MODEL, BOTH PATHS. Two LATENCY instances cost 0.090 CPU-s
+        # per frame and 94 ms p50 against 0.059 and 54 ms for one THROUGHPUT
+        # model with a request pool, measured on this appliance. The paths stay
+        # independent in every other way; they share the weights.
+        assert len(built) == 1 and engine._activity_detector is engine._detector
+        assert engine.snapshot()["models"]["detector_shared"] is True
         assert engine.snapshot()["activity_pipeline"]["motion_gated"] is False
 
         submitted = []
@@ -362,3 +426,32 @@ def test_the_activity_path_does_not_import_deepstream():
                 if any("deepstream" in n.lower() for n in names):
                     offenders.append(str(path.relative_to(root)))
     assert not offenders, offenders
+
+
+def test_an_activity_only_camera_still_loads_a_detector(cfg, monkeypatch):
+    """Sharing must not mean "only when Smart Search wants one"."""
+    from analytics import detector as detector_mod, plates as plates_mod, selection as selection_mod
+
+    built = []
+
+    def fake_build_selected(*a, **kw):
+        d = FakeDetector([car()])
+        built.append(d)
+        return d
+
+    monkeypatch.setattr(detector_mod, "build_selected", fake_build_selected)
+    monkeypatch.setattr(selection_mod, "DetectorSelector", lambda c: object())
+    monkeypatch.setattr(plates_mod, "build", lambda c, d: None)
+    cfg.source.frame_source = "sampler"
+    cfg.sink.url = ""
+    cfg.events.url = ""
+    cfg.plates.enabled = False
+    cfg.lifecycle.poll_seconds = POLL
+    engine = engine_mod.AnalyticsEngine(cfg)
+    try:
+        engine.add_camera(CAM, "rtsp://relay/b", (), analytics_config=ai_config(
+            "stray_parking", required_duration_s=600))
+        assert _settle(lambda: engine._activity_pipeline is not None)
+        assert built and engine._activity_detector is not None
+    finally:
+        engine.stop()

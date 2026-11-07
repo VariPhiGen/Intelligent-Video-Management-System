@@ -21,8 +21,11 @@
  * the form, ResultCard a hit, EventClipModal the popup, searchUi the shared
  * score bands. This file is the layout and the empty states.
  */
+import { LoadingSkeleton } from '@/components/LoadingSkeleton';
+import { ViewTransition } from '@/components/ViewTransition';
 import { useCallback, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useAuth } from '@/lib/auth';
 
 import type { SearchCamera } from '@/lib/smartsearch';
 
@@ -30,6 +33,7 @@ import { EventClipModal } from './EventClipModal';
 import { ResultCard } from './ResultCard';
 import { AnprPanel } from './AnprPanel';
 import { FacesPanel } from './FacesPanel';
+import { AssistantPanel } from './AssistantPanel';
 import { SearchFilters } from './SearchFilters';
 import { trackerSuffix } from './trackerId';
 import { WEAK_TOP_SCORE, tabCount } from './searchUi';
@@ -38,6 +42,7 @@ import { useSmartSearch } from './useSmartSearch';
 const PAGE_SIZE = 12;
 
 export function SmartSearchPage() {
+  const { isAdmin } = useAuth();
   const nav = useNavigate();
   const s = useSmartSearch();
   const { mode, outcome, withheld, stats, busy, err, reachable, configured, recorderDown } = s;
@@ -60,10 +65,10 @@ export function SmartSearchPage() {
   // meaning "search OR faces" — and the tab bar's own comment below records
   // that two tabs reading as active at once is a bug that already happened
   // once here.
-  type View = 'search' | 'anpr' | 'faces';
+  type View = 'search' | 'anpr' | 'faces' | 'assistant';
   const [view, setView] = useState<View>(
     sp.get('mode') === 'anpr' || seededPlate ? 'anpr'
-      : sp.get('mode') === 'faces' ? 'faces' : 'search');
+      : sp.get('mode') === 'assistant' ? 'assistant' : sp.get('mode') === 'faces' ? 'faces' : 'search');
   const hasSearched = outcome !== null;
   const count = outcome?.results.length ?? 0;
   // The selected camera, if the operator has excluded it from indexing. Drives
@@ -138,7 +143,7 @@ export function SmartSearchPage() {
   const pagedCards = cards.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
 
   return (
-    <div className="fade">
+    <ViewTransition view={`${view}:${mode}`}>
       {eventClip && (
         <EventClipModal
           cam={eventClip.cam}
@@ -168,32 +173,34 @@ export function SmartSearchPage() {
       </div>
 
       <div className="tabs page-tabs">
+        <button aria-pressed={view === 'assistant'} className={`tab${view === 'assistant' ? ' active' : ''}`} onClick={() => setView('assistant')}>Assistant</button>
         {/* `!anpr &&` on both: ANPR is a third view, not a filter, but `mode`
             keeps its last value while it is open — so without this the tab it
             was opened from stays lit and two tabs read as active at once. */}
-        <div className={`tab${view === 'search' && mode === 'people' ? ' active' : ''}`} onClick={() => { setView('search'); s.switchMode('people'); }}>
+        <button type="button" aria-pressed={view === 'search' && mode === 'people'} className={`tab${view === 'search' && mode === 'people' ? ' active' : ''}`} onClick={() => { setView('search'); s.switchMode('people'); }}>
           People{tabCount(stats.people)}
-        </div>
-        <div className={`tab${view === 'search' && mode === 'vehicles' ? ' active' : ''}`} onClick={() => { setView('search'); s.switchMode('vehicles'); }}>
+        </button>
+        <button type="button" aria-pressed={view === 'search' && mode === 'vehicles'} className={`tab${view === 'search' && mode === 'vehicles' ? ' active' : ''}`} onClick={() => { setView('search'); s.switchMode('vehicles'); }}>
           Vehicles{tabCount(stats.vehicles)}
-        </div>
+        </button>
         {/* ANPR is a lookup, not a ranked search, so it owns its own view
             rather than adding a filter to Vehicles. No count badge: a plate
             index size says nothing useful before you have a plate to look up. */}
-        <div className={`tab${view === 'anpr' ? ' active' : ''}`} onClick={() => setView('anpr')}>
+        <button type="button" aria-pressed={view === 'anpr'} className={`tab${view === 'anpr' ? ' active' : ''}`} onClick={() => setView('anpr')}>
           ANPR
-        </div>
+        </button>
         {/* Faces takes a photograph, not text — SFace has no text encoder — so
             it is a view of its own rather than a filter on People. No count
             badge for ANPR's reason inverted: the number here is small by
             nature (a usable face appears on a few percent of person passes)
             and a small count beside a big one reads as a fault. */}
-        <div className={`tab${view === 'faces' ? ' active' : ''}`} onClick={() => setView('faces')}>
+        <button type="button" aria-pressed={view === 'faces'} className={`tab${view === 'faces' ? ' active' : ''}`} onClick={() => setView('faces')}>
           Faces
-        </div>
+        </button>
       </div>
 
-      {configured === false && (
+      {view === 'assistant' && <AssistantPanel />}
+      {view !== 'assistant' && configured === false && (
         <div className="panel ss-offline">
           <div className="panel-body">
             <b>Smart Search is not configured.</b>
@@ -205,7 +212,7 @@ export function SmartSearchPage() {
         </div>
       )}
 
-      {reachable === false && configured !== false && (
+      {view !== 'assistant' && reachable === false && configured !== false && (
         <div className="panel ss-offline">
           <div className="panel-body">
             <b>Search index unavailable.</b>
@@ -233,6 +240,21 @@ export function SmartSearchPage() {
 
       {view === 'faces' && <FacesPanel cameras={s.camOptions} />}
 
+      {view === 'search' && <>
+        {/* Configured in Administration; an admin is pointed there while it is
+            off, operators simply see the explicit filters. */}
+        {isAdmin && s.planner && !s.planner.ready && <div className="hint" style={{ marginBottom: 12 }}>
+          Sentences like “person in red on cam 2 yesterday at 10 PM” can set the camera and time
+          for you. Set this up in <a href="#/admin?tab=query-interpretation">Administration → Query interpretation</a>.
+        </div>}
+        {s.planner?.ready && <label style={{ display: 'block', marginBottom: 12 }}>
+          <input type="checkbox" checked={s.interpret} onChange={e => s.setInterpret(e.target.checked)} />
+          {' '}Interpret camera and time from my query
+        </label>}
+        {s.appliedSummary && <div className="panel"><div className="panel-body">{s.appliedSummary}</div></div>}
+        {s.clarification && <div className="panel" role="status"><div className="panel-body">{s.clarification} Edit your query or use the explicit filters.</div></div>}
+      </>}
+
       {view === 'search' && <SearchFilters
         mode={mode}
         query={s.query} setQuery={s.setQuery} run={s.run} busy={busy}
@@ -250,7 +272,7 @@ export function SmartSearchPage() {
 
       {view === 'search' && err && <div className="panel row-err ss-error"><div className="panel-body">{err}</div></div>}
 
-      {view === 'search' && busy && <div className="ss-loading"><span className="spinner" /> Searching the index…</div>}
+      {view === 'search' && busy && <LoadingSkeleton label="Searching the index…" variant="cards" count={3} />}
 
       {/* Everything matched belongs to footage this VMS does not hold — a
           different problem from "nothing matched", and a different fix. */}
@@ -363,6 +385,6 @@ export function SmartSearchPage() {
         </div>
       )}
 
-    </div>
+    </ViewTransition>
   );
 }

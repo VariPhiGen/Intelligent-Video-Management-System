@@ -32,6 +32,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from broker.config import AppConfig, CaptureConfig, NoticeConfig  # noqa: E402
 from broker.engine import FrameEngine  # noqa: E402
@@ -84,6 +85,8 @@ class StubMotion:
 
 
 class StubPublisher:
+    # Deliberately only publish() and snapshot(): the worker must not need to
+    # ask anything else about a camera to stamp its frames.
     def __init__(self, rec=None, raises=None):
         self._rec = rec
         self.notices: list = []
@@ -372,3 +375,123 @@ class TestHealth:
     def test_health_reports_the_sampling_configuration(self, engine):
         h = engine.health()
         assert h["sample_fps"] == 2.0 and h["ring_slots"] == 8
+
+
+class FakeTime:
+    """The worker reads time.time(); this is that clock, driven by the test."""
+
+    def __init__(self, t=1000.0):
+        self.now = t
+
+    def time(self):
+        return self.now
+
+
+class FakeCapture:
+    """Enough of cv2.VideoCapture for one session, replaying a source: each
+    grab() moves the clock to that frame's arrival and reports its timestamp."""
+
+    def __init__(self, w, seq, clock, fps=25.0):
+        self.w, self.seq, self.clock, self.fps, self.i = w, seq, clock, fps, 0
+
+    def grab(self):
+        if self.i >= len(self.seq):
+            self.w._stop.set()                 # end the session, not the test
+            return False
+        self.clock.now = self.seq[self.i][1]
+        self.i += 1
+        return True
+
+    def get(self, prop):
+        import cv2
+        return self.fps if prop == cv2.CAP_PROP_FPS else self.seq[self.i - 1][0]
+
+    def retrieve(self):
+        return True, frame()
+
+    def release(self):
+        pass
+
+
+class ClockedPublisher(StubPublisher):
+    """Records, with each notice, the arrival of the frame it announces."""
+
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+        self.arrivals: list = []
+
+    def publish(self, camera, notice):
+        super().publish(camera, notice)
+        self.arrivals.append(self.clock.now)
+
+
+def session(monkeypatch, seq, policy="auto", open_seconds=0.0):
+    """Run one real CameraWorker capture session over a source."""
+    import broker.worker as worker_mod
+    import sources as S
+    clock = FakeTime(seq[0][1] - open_seconds)
+    monkeypatch.setattr(worker_mod, "time", clock)
+    pub = ClockedPublisher(clock)
+    cfg = config(sample_fps=5.0)
+    cfg.capture.clock_policy = policy
+    w = CameraWorker("cam-x", "rtsp://relay/x", cfg, pub)
+    w.motion = StubMotion(Recorder())
+    w._ring = StubRing()
+
+    def opening():
+        clock.now += open_seconds            # FFmpeg reading ahead while it opens
+        return FakeCapture(w, seq, clock)
+    w._open = opening
+    w._run()
+    return w, pub, S
+
+
+class TestEveryCameraGetsTheSameClock:
+    """No camera is special: the worker stamps every stream through the one
+    contract in broker/clock.py, told only what the stream itself declares."""
+
+    def test_it_asks_nothing_about_the_camera(self, monkeypatch):
+        # StubPublisher has no per-camera lookups; asking one would raise here.
+        import sources as S
+        w, pub, _ = session(monkeypatch, S.restamped(seconds=5))
+        assert pub.notices
+
+    def test_the_clock_decides_the_discipline_from_the_stream(self, monkeypatch):
+        import sources as S
+        assert session(monkeypatch, S.restamped(seconds=6))[0]._sampler.mode == "paced"
+        assert session(monkeypatch, S.native(seconds=6))[0]._sampler.mode == "source"
+
+    def test_the_configured_policy_reaches_the_clock(self, monkeypatch):
+        import sources as S
+        w, _, _ = session(monkeypatch, S.native(seconds=3), policy="paced")
+        assert w._sampler.clock.policy == "paced" and w._sampler.mode == "paced"
+
+    def test_how_long_the_open_took_reaches_the_clock(self, monkeypatch):
+        import sources as S
+        w, pub, _ = session(monkeypatch, S.native(seconds=3), open_seconds=0.6)
+        first_ts = pub.notices[0][1]["ts"]
+        assert first_ts == pytest.approx(pub.arrivals[0] - 0.6)
+
+    @pytest.mark.parametrize("kind", ["native", "native_stalls", "native_holes", "jittery",
+                                      "restamped", "restamped_lossy", "wrapped", "missing",
+                                      "long_stall"])
+    def test_every_notice_keeps_the_contract(self, monkeypatch, kind):
+        import sources as S
+        seq = getattr(S, kind)()
+        _, pub, _ = session(monkeypatch, seq)
+        stamped = [(n["ts"], a) for (_, n), a in zip(pub.notices, pub.arrivals)]
+        S.assert_contract(stamped, stamped)
+
+    def test_three_cameras_with_three_different_clocks(self, monkeypatch):
+        # One restamped, one clean, one with no timestamps at all - each through
+        # a real worker, each keeping the contract, each on its own discipline.
+        import sources as S
+        modes = {}
+        for name, seq in (("hop", S.restamped(seconds=8)), ("clean", S.native_holes(seconds=8)),
+                          ("blind", S.missing(seconds=8))):
+            w, pub, _ = session(monkeypatch, seq)
+            stamped = [(n["ts"], a) for (_, n), a in zip(pub.notices, pub.arrivals)]
+            S.assert_contract(stamped, stamped)
+            modes[name] = w._sampler.mode
+        assert modes == {"hop": "paced", "clean": "source", "blind": "paced"}

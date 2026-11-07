@@ -55,10 +55,26 @@ volumes:
   search_crops:
   search_models:
   redis_data:
+  # Heatmap overlay objects. A NAMED VOLUME on the existing Docker storage, not
+  # a bind mount: MinIO needs POSIX ownership/permissions, and a /mnt/<drive>
+  # bind mount on this host is drvfs, which cannot do chown — MinIO exits with
+  # "Unable to initialize backend" on one (verified 2026-09-25). Sized for the
+  # current test only: 5 cameras x 17 objects/day x ~300 KB is tens of MB.
+  minio_data:
+  # Retained device state and queued commands for the VMS broker (mqtt profile).
+  mosquitto_data:
   nvr_data:
   evidence_data:
+  # Data Collection frames. SEPARATE FROM evidence_data on purpose: these are
+  # deletable working images for model training on an operational clock, not an
+  # append-only legal register, so an operator must be able to reclaim the space
+  # with `docker volume rm` without touching evidence packages.
+  dataset_data:
   caddy_data:
   caddy_config:
+  # Home Assistant's /config (homeassistant profile): its database, entities,
+  # integrations and tokens. A named volume, never a bind mount.
+  ha_config:
 
 services:
 
@@ -155,6 +171,93 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── MinIO (S3 object store for heatmap overlay artifacts) ───────────────────
+  # BUILT LOCALLY, BY COMPOSE — see deploy/minio/Dockerfile for why. MinIO
+  # withdrew its public images (minio/minio refuses pulls on Docker Hub; quay.io
+  # and registry.min.io have none), so the Dockerfile lifts the binary out of a
+  # digest-pinned public build and packages it. `./vms build` builds it, and
+  # `./vms up` builds it on a fresh host where the image does not exist yet.
+  #
+  # THE S3 PORT IS PUBLISHED ON LOOPBACK, and it has to be. The api runs with
+  # `network_mode: host` (as 14 services here do), so it is NOT on vms_internal:
+  # from host networking the name `minio` does not resolve and a bridge-only 9000
+  # is unreachable. Publishing 9000 on 127.0.0.1 is what lets the api reach the
+  # store, while keeping it off every external interface -- same posture as the
+  # console. Containers that ARE on vms_internal (minio_init) still use
+  # http://minio:9000 directly and do not go through the published port.
+  #
+  # The host port is ${MINIO_API_PORT:-9000} so a host that already runs another
+  # MinIO on 9000 can move it. The api's HEATMAP_S3_ENDPOINT default is built
+  # from the SAME variable, so the two cannot drift apart -- only an explicit
+  # HEATMAP_S3_ENDPOINT override in .env would decouple them.
+  minio:
+    build:
+      context: deploy/minio
+    image: minio-community:local
+    container_name: vms_minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    networks:
+      - vms_internal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── MinIO bucket bootstrap (one-shot, idempotent, runs on every `up`) ───────
+  # Uses the API image because it already carries boto3 (a camera-mgmt
+  # dependency for the dataset S3 mirror) — no `mc` client, which is equally
+  # unpullable, and no extra image to maintain. Creating a bucket that already
+  # exists is a no-op, so this is safe to re-run for ever.
+  minio_init:
+    image: variphi-vms-api
+    # Never pulled: this tag is built locally by `api`, and does not exist in any
+    # registry. Without this, a fresh host's `up` tries to pull it before it has
+    # built anything and aborts every other image with "pull access denied".
+    pull_policy: never
+    container_name: vms_minio_init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      # PINNED, not ${HEATMAP_S3_ENDPOINT}: this container sits on vms_internal
+      # and reaches MinIO by container name. The api's endpoint is a loopback
+      # address that would resolve here to this container itself.
+      HEATMAP_S3_ENDPOINT:   http://minio:9000
+      HEATMAP_S3_BUCKET:     ${HEATMAP_S3_BUCKET:-vms-heatmaps}
+      HEATMAP_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      HEATMAP_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    entrypoint: ["python3", "-c"]
+    command:
+      - |
+        import os, boto3, botocore
+        s3 = boto3.client("s3", endpoint_url=os.environ["HEATMAP_S3_ENDPOINT"],
+                          aws_access_key_id=os.environ["HEATMAP_S3_ACCESS_KEY"],
+                          aws_secret_access_key=os.environ["HEATMAP_S3_SECRET_KEY"],
+                          region_name="us-east-1",
+                          config=botocore.config.Config(signature_version="s3v4"))
+        b = os.environ["HEATMAP_S3_BUCKET"]
+        try:
+            s3.create_bucket(Bucket=b); print(f"minio_init: created bucket {b}")
+        except s3.exceptions.BucketAlreadyOwnedByYou:
+            print(f"minio_init: bucket {b} already exists")
+        except s3.exceptions.BucketAlreadyExists:
+            print(f"minio_init: bucket {b} already exists")
+        print("minio_init: buckets =", [x["Name"] for x in s3.list_buckets()["Buckets"]])
+    networks:
+      - vms_internal
+
   # ── MediaMTX (single camera pull → RTSP/HLS fan-out) ────────────────────────
   mediamtx:
     # -ffmpeg variant, same 1.9.1 server. FFmpeg is needed on PATH for the
@@ -170,7 +273,8 @@ services:
       MTX_LOGLEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ./deploy/mediamtx.yml:/mediamtx.yml:ro
-    # Binds :8654 (RTSP), :8322 (RTSPS), :8988 (HLS), :9987 (API), :9988 (metrics)
+    # Binds :8654 (RTSP), :8322 (RTSPS), :8988 (HLS), :8889 (WebRTC/WHEP),
+    # :8189 (WebRTC ICE/UDP), :9987 (API), :9988 (metrics)
 
   # ── Keycloak DB bootstrap (one-shot, idempotent) ────────────────────────────
   keycloak_db_init:
@@ -254,6 +358,7 @@ services:
       # `up`. Generated by scripts/gen-secrets.sh — see sync_seed_passwords().
       VMS_ADMIN_PASSWORD:      ${VMS_ADMIN_PASSWORD:-}
       VMS_OPERATOR_PASSWORD:   ${VMS_OPERATOR_PASSWORD:-}
+      KC_REMEMBER_ME_DAYS:         ${KC_REMEMBER_ME_DAYS:-30}
     volumes:
       - ./deploy/keycloak/sync-client.py:/sync-client.py:ro
     command: ["python3", "/sync-client.py"]
@@ -296,6 +401,16 @@ services:
       # Local wall clock for recording-schedule windows and report timestamps
       # (must match the NVR's TZ so schedules line up with segment filenames).
       TZ:                      ${TZ:-UTC}
+      # Optional outbound integrations: no destination is created or enabled by these defaults.
+      EVENTS_ENABLED:          ${EVENTS_ENABLED:-true}
+      EVENTS_PUBLIC_BASE_URL:  ${EVENTS_PUBLIC_BASE_URL:-}
+      EVENTS_DEPLOYMENT_ID:    ${EVENTS_DEPLOYMENT_ID:-vms}
+      EVENTS_RETENTION_DAYS:   ${EVENTS_RETENTION_DAYS:-7}
+      EVENTS_INCLUDE_PLATES:   ${EVENTS_INCLUDE_PLATES:-false}
+      EVENTS_ROUTER_INTERVAL_S: ${EVENTS_ROUTER_INTERVAL_S:-1}
+      EVENTS_SENDER_INTERVAL_S: ${EVENTS_SENDER_INTERVAL_S:-1}
+      EVENTS_LEASE_S:          ${EVENTS_LEASE_S:-60}
+      SITE_TIMEZONE:           ${SITE_TIMEZONE:-UTC}
       # ── Identity (OIDC / Keycloak) ──
       DEV_AUTH:                ${DEV_AUTH:-false}
       OIDC_ISSUER:             ${OIDC_ISSUER:-http://localhost:8085/realms/vms}
@@ -318,6 +433,9 @@ services:
       NVR_API_URL:             ${NVR_API_URL:-http://127.0.0.1:8009}
       NVR_RECORD_HOST:         ${NVR_RECORD_HOST:-127.0.0.1}
       NVR_DEFAULT_RETENTION_DAYS: ${NVR_DEFAULT_RETENTION_DAYS:-30}
+      # Canonical unit. Unset = the day value above, converted. See .env.example.
+      NVR_RETENTION_MINUTES:   ${NVR_RETENTION_MINUTES:-}
+      NVR_SUB_RETENTION_MINUTES: ${NVR_SUB_RETENTION_MINUTES:-}
       NVR_SYNC_ENABLED:        ${NVR_SYNC_ENABLED:-true}
       NVR_SYNC_INTERVAL:       ${NVR_SYNC_INTERVAL:-60}
       # ── Motion service (proxied behind the single login) ──
@@ -344,6 +462,24 @@ services:
       # mentioning the variable gets the turnkey default. Unlike motion/nvr the
       # index need not be co-located; on some sites it is a separate GPU host,
       # so this may be a remote URL.
+      # ── The peripherals bridge (P2) ──
+      # PASSED THROUGH EXPLICITLY OR THE OFF SWITCH DOES NOT EXIST: this
+      # service reads its own environment and has no env_file, so a value set
+      # in .env alone would reach nothing. Same trap as
+      # ANALYTICS_FACE_AUTO_DOWNLOAD further down.
+      #
+      # Every default is empty/off, so an appliance with no broker reports
+      # `not_configured` — a supported deployment, and a different fact from
+      # `offline`.
+      MQTT_URL:                ${MQTT_URL:-}
+      MQTT_USERNAME:           ${MQTT_USERNAME:-}
+      MQTT_PASSWORD:           ${MQTT_PASSWORD:-}
+      MQTT_TLS_VERIFY:         ${MQTT_TLS_VERIFY:-true}
+      MQTT_TOPIC_PREFIX:       ${MQTT_TOPIC_PREFIX:-vms}
+      HA_URL:                  ${HA_URL:-}
+      HA_TOKEN:                ${HA_TOKEN:-}
+      BRIDGE_VERIFY_INTERVAL_S: ${BRIDGE_VERIFY_INTERVAL_S:-300}
+      BRIDGE_STATE_STALE_S:    ${BRIDGE_STATE_STALE_S:-300}
       SMARTSEARCH_API_URL:     ${SMARTSEARCH_API_URL-http://127.0.0.1:8013}
       SMARTSEARCH_API_KEY:     ${SMARTSEARCH_API_KEY:-}
       # The WRITE side — which index this VMS feeds cameras to. Same
@@ -354,40 +490,75 @@ services:
       KEYCLOAK_ADMIN_USER:     ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       INTERNAL_API_KEY:        ${INTERNAL_API_KEY:-dev-internal-key-change-me}
-      # ── DeepStream analytics pipeline (same appliance, shared directory) ──
-      # This API projects one <slug>.json per camera into the directory below,
-      # which the pipeline container mounts as its config/camera_config and
-      # scans on boot. Nothing is pushed over the network: set DEEPSTREAM_HOME
-      # in .env to the pipeline checkout's root and the two stay in step.
-      # That variable is the ONLY thing to change if the pipeline moves — no
-      # path here is specific to any one install.
+      # ── DeepStream analytics pipeline (same appliance, HTTP) ──
+      # Each camera's full config envelope is POSTed to the pipeline's control
+      # API (services/deepstream_client.py); the pipeline writes and owns its
+      # own config files, so there is no shared directory to mount.
+      # Loopback: both are host-networked. Authenticated with INTERNAL_API_KEY.
       # OFF: AI activities execute on the CPU Activity Engine in `analytics`.
-      # DeepStream stays in the tree; set true to project configs to it again.
-      DEEPSTREAM_PROJECTION_ENABLED:  ${DEEPSTREAM_PROJECTION_ENABLED:-false}
-      DEEPSTREAM_CONFIG_DIR:          /deepstream-config
-      DEEPSTREAM_PROJECTION_INTERVAL: ${DEEPSTREAM_PROJECTION_INTERVAL:-300}
-      # Where the pipeline sees those same files, and its REST API. Written
-      # configs are pushed to it so edits go live immediately instead of at
-      # the pipeline's next restart. Loopback: both are host-networked.
-      DEEPSTREAM_PIPELINE_CONFIG_DIR: ${DEEPSTREAM_PIPELINE_CONFIG_DIR:-/apps/deepstream-yolo-e2e/config/camera_config}
-      DEEPSTREAM_API_URL:             ${DEEPSTREAM_API_URL:-http://127.0.0.1:8081}
-    volumes:
-      # Read-write: this API is the sole writer of the pipeline's camera
-      # configs (see services/deepstream_projection.py). The pipeline reads
-      # them and must not write here.
+      # DeepStream stays in the tree; set true to push cameras to it again.
+      DEEPSTREAM_SYNC_ENABLED:  ${DEEPSTREAM_SYNC_ENABLED:-false}
+      DEEPSTREAM_API_URL:       ${DEEPSTREAM_API_URL:-http://127.0.0.1:8081}
+      DEEPSTREAM_SYNC_INTERVAL: ${DEEPSTREAM_SYNC_INTERVAL:-60}
+      # Where the pipeline posts results back when it is the AI engine
+      # (DEEPSTREAM_SYNC_ENABLED=true): handed to it in each camera's envelope.
+      # Empty = http://127.0.0.1:<API_PORT>; set it when the pipeline runs on
+      # another box.
+      DEEPSTREAM_CALLBACK_URL:  ${DEEPSTREAM_CALLBACK_URL:-}
+      # ── Data Collection ──────────────────────────────────────────────────
+      DATASET_DIR:             ${DATASET_DIR:-/dataset-frames}
+      # In-flight snapshots per dataset run. See backend/config.py.
+      DATASET_SNAPSHOT_CONCURRENCY: ${DATASET_SNAPSHOT_CONCURRENCY:-2}
+      # How long a LOOSE annotation's still is kept. MINUTES, the canonical
+      # retention unit since migration 042 — a _DAYS knob here would reintroduce
+      # the drift that change removed. Stamped at INSERT, so a change takes
+      # effect for annotations created after this container restarts; existing
+      # rows keep the expiry they were born with. An annotation attached to a
+      # dataset never expires. See .env.example for the re-basing SQL.
+      ANNOTATION_TTL_MINUTES:  ${ANNOTATION_TTL_MINUTES:-2880}
+      # Must be reachable FROM THIS CONTAINER. Under network_mode: host that
+      # means 127.0.0.1 for a Label Studio on this box — not a compose service
+      # name, which does not resolve here.
+      LABELSTUDIO_URL:         ${LABELSTUDIO_URL:-}
+      LABELSTUDIO_API_KEY:     ${LABELSTUDIO_API_KEY:-}
+      LABELSTUDIO_PROJECT_ID:  ${LABELSTUDIO_PROJECT_ID:-}
+      # ── Heatmap object store (MinIO) ───────────────────────────────────────
+      # The API is the ONLY thing that talks to the store: DeepStream posts the
+      # picture to the API and the API decides where the bytes go. The keys are
+      # MinIO's root credentials, taken from the same variables the minio
+      # service is started with so there is one pair to rotate, not two.
       #
-      # Derived from DEEPSTREAM_HOME (the pipeline checkout root) so relocating
-      # the pipeline is a one-line edit in .env rather than a change to this
-      # file. DEEPSTREAM_CONFIG_DIR_HOST overrides the derived path outright,
-      # for the rare install whose config dir sits outside the checkout. The
-      # /opt/deepstream fallback is a placeholder, not a working default: with
-      # neither variable set the bind mount resolves to an empty directory, the
-      # projection writes into it harmlessly, and the reconcile loop logs the
-      # pipeline as unreachable.
-      - ${DEEPSTREAM_CONFIG_DIR_HOST:-${DEEPSTREAM_HOME:-/opt/deepstream}/config/camera_config}:/deepstream-config
+      # NOT in depends_on, deliberately. An unreachable store must cost a
+      # heatmap upload, never the API's boot: `is_configured()` only inspects
+      # this URL, the client is built on first use, and every read falls back
+      # to bytes already in the row.
+      HEATMAP_S3_ENDPOINT:     ${HEATMAP_S3_ENDPOINT:-http://127.0.0.1:${MINIO_API_PORT:-9000}}
+      HEATMAP_S3_BUCKET:       ${HEATMAP_S3_BUCKET:-vms-heatmaps}
+      HEATMAP_S3_ACCESS_KEY:   ${MINIO_ROOT_USER:-minioadmin}
+      HEATMAP_S3_SECRET_KEY:   ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      # ── Time-lapse (services/timelapse.py) — stills share the store above, under
+      # `timelapse/`. Per-camera switches default OFF; these are appliance knobs.
+      TIMELAPSE_CAPTURE_ENABLED:      ${TIMELAPSE_CAPTURE_ENABLED:-true}
+      TIMELAPSE_CAPTURE_CONCURRENCY:  ${TIMELAPSE_CAPTURE_CONCURRENCY:-2}
+      TIMELAPSE_RENDER_RETENTION_DAYS: ${TIMELAPSE_RENDER_RETENTION_DAYS:-30}
+      TIMELAPSE_MAX_RENDER_FRAMES:    ${TIMELAPSE_MAX_RENDER_FRAMES:-20000}
+      TIMELAPSE_NVENC:                ${TIMELAPSE_NVENC:-false}
+      # CREDENTIALS ONLY. The destination bucket/prefix are chosen per import in
+      # the UI; these two only PREFILL that form. Leave the keys blank to use an
+      # instance role or a mounted ~/.aws instead.
+      AWS_ACCESS_KEY_ID:       ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY:   ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION:              ${AWS_REGION:-}
+      AWS_S3_BUCKET:           ${AWS_S3_BUCKET:-}
+      AWS_S3_PREFIX:           ${AWS_S3_PREFIX:-}
+    volumes:
       # Built evidence packages + the appliance evidence-signing key persist here.
       # Bytes are video-sized, so on a volume, not Postgres.
       - evidence_data:/evidence-exports
+      - dataset_data:/dataset-frames
+      # Read-only, only so the time-lapse disk guard can measure the disk the stills live on
+      # (services/timelapse.disk_usage): stills must never fill it to where the NVR deletes footage.
+      - minio_data:/data/timelapse-disk:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -395,7 +566,33 @@ services:
         condition: service_healthy
       keycloak:
         condition: service_started
-    command: ["/bin/sh", "-c", "python -m backend.migrate && uvicorn backend.main:app --host 0.0.0.0 --port ${API_PORT:-8091} --workers 4 --loop uvloop --access-log"]
+    # ONE WORKER, NOT FOUR, AND IT HAS TO STAY ONE until somebody finds the
+    # actual bug. With `--workers 4` uvicorn child processes died roughly 13
+    # times every 24 h on the GPU appliance -- silently: no OOM (cgroup
+    # `memory.events` showed `oom_kill 0`, `memory.peak` 1.17 GB against no
+    # limit), nothing in `dmesg`/`journalctl`, and no Python traceback. All the
+    # log said was `Child process [PID] died`, followed by a fresh `startup.*`
+    # burst from its replacement.
+    #
+    # That is not cosmetic, because a Data Collection run is an in-process
+    # asyncio task living inside ONE worker. Kill the worker and the run dies
+    # with it; `updated_at` stops moving; ten minutes later `_reap_if_stale`
+    # (routers/datasets.py) flips the row to `failed`. Datasets 15, 16 and 17
+    # all died that way, each reaped ~10 min after a logged child death.
+    #
+    # DO NOT DEBUG THIS FROM `docker inspect`: RestartCount stays 0 throughout,
+    # because the *container* never restarts -- only its children do. The
+    # signal is `Child process .* died` in the logs.
+    #
+    # Evidence for the change (2026-10-09..12): 60 h on one worker produced
+    # zero deaths, and four collections completed back to back -- including
+    # 6,358 scans keeping 500 frames (dataset 19), a far heavier run than
+    # either of the ones that died under four workers.
+    #
+    # The cost is real: a quarter of the request concurrency. Raise it again
+    # only together with a fix for the deaths, or by moving collection out of
+    # the request workers onto a queue so a recycled worker stops being fatal.
+    command: ["/bin/sh", "-c", "python -m backend.migrate && uvicorn backend.main:app --host 0.0.0.0 --port ${API_PORT:-8091} --workers 1 --loop uvloop --access-log"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:${API_PORT:-8091}/health || exit 1"]
       interval: 15s
@@ -434,6 +631,8 @@ services:
       NVR_DISABLE_NVENC:          ${NVR_DISABLE_NVENC:-}
       NVR_ALERT_WEBHOOK_URL:      ${NVR_ALERT_WEBHOOK_URL:-}
       NVR_ALERT_INTERVAL_SECONDS: ${NVR_ALERT_INTERVAL_SECONDS:-60}
+      # Seconds one snapshot ffmpeg may run before it is killed.
+      NVR_SNAPSHOT_TIMEOUT:       ${NVR_SNAPSHOT_TIMEOUT:-45}
     volumes:
       - nvr_data:/data/nvr
       - ./services/nvr/config:/app/config:ro
@@ -471,6 +670,8 @@ services:
       # The one place the sample rate is decided, once consumers read from here.
       FRAMES_SAMPLE_FPS: ${FRAMES_SAMPLE_FPS:-5}
       FRAMES_RING_SLOTS: ${FRAMES_RING_SLOTS:-4}
+      # FFmpeg decode threads per camera (0 = auto, one per core).
+      FRAMES_DECODE_THREADS: ${FRAMES_DECODE_THREADS:-1}
       REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6380/0}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Where the rings are written. See the volumes block for why this is a
@@ -531,6 +732,9 @@ services:
       # broker | sampler. Broker is the default: this service is new, so there
       # is no legacy decoder to preserve.
       ANALYTICS_FRAME_SOURCE: ${ANALYTICS_FRAME_SOURCE:-broker}
+      # The broker's rate, so the detector-capacity estimate counts frames the
+      # broker actually sends (analytics/capacity.py). One setting, not two.
+      ANALYTICS_CAPACITY_CAMERA_FPS: ${FRAMES_SAMPLE_FPS:-5}
       ANALYTICS_SHM_DIR: /frames
       REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6380/0}
       ANALYTICS_DETECTOR_BACKEND: ${ANALYTICS_DETECTOR_BACKEND:-auto}
@@ -546,6 +750,10 @@ services:
       # services/analytics/config.yaml — change both together, which
       # tests/test_compose_defaults.py enforces.
       ANALYTICS_NESTED_CONTAINMENT: ${ANALYTICS_NESTED_CONTAINMENT:-0.9}
+      # The detector's confidence floor, for every camera and both detection
+      # paths. Passed through so it can be tuned from .env without a rebuild;
+      # the default mirrors services/analytics/config.yaml (detect.confidence).
+      ANALYTICS_DETECT_CONFIDENCE: ${ANALYTICS_DETECT_CONFIDENCE:-0.4}
       # WHERE ACCEPTED OBSERVATIONS GO. Defaulted ON, and the pairing that
       # governs it is the reason why.
       #
@@ -611,6 +819,194 @@ services:
       retries: 3
       start_period: 40s
 
+  # ── MQTT broker (--profile mqtt): the bus between the bridge and devices ───
+  #   COMPOSE_PROFILES=...,mqtt   with MQTT_USERNAME / MQTT_PASSWORD in .env
+  #
+  # THE VMS'S OWN BROKER, for a site that has no Home Assistant with one. The
+  # peripherals bridge publishes commands and subscribes to state here; the
+  # mqtt-modbus translator (below) or an HA on this box does the other half.
+  # A site whose HA already runs a broker points MQTT_URL at that instead and
+  # leaves this profile off.
+  #
+  # BOUND TO 127.0.0.1, PASSWORD ONLY, PERSISTENT. A broker on every interface
+  # with anonymous access is a remote switch for every relay behind it — and
+  # that is exactly the apt-package default (`listener 1883 0.0.0.0` +
+  # `allow_anonymous true`), so this does not use the host's mosquitto even
+  # when one is installed. Persistence keeps retained device state across a
+  # restart, so the wall does not come back `unknown` for every device.
+  #
+  # The config and password file are rendered from .env at start by
+  # deploy/mosquitto/entrypoint.sh; there is nothing to edit in the container.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: vms_mosquitto
+    profiles: ["mqtt"]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/vms-entrypoint.sh"]
+    environment:
+      MQTT_PORT:     ${MQTT_PORT:-1883}
+      MQTT_BIND:     ${MQTT_BIND:-127.0.0.1}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      # Set to open a TLS listener on every interface for off-host clients;
+      # needs server.crt/server.key in deploy/mosquitto/certs/.
+      MQTT_TLS_PORT: ${MQTT_TLS_PORT:-}
+    volumes:
+      - ./deploy/mosquitto/entrypoint.sh:/vms-entrypoint.sh:ro
+      - ./deploy/mosquitto/certs:/mosquitto/certs:ro
+      - mosquitto_data:/mosquitto/data
+    # Host networking, like everything the api reaches on 127.0.0.1.
+    network_mode: host
+    healthcheck:
+      # Authenticated, so it also proves the rendered password file works.
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p \"$$MQTT_PORT\" -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t '$$SYS/broker/uptime' -C 1 -W 3 >/dev/null"]
+      interval: 20s
+      timeout: 6s
+      retries: 3
+      start_period: 10s
+
+  # ── mqtt-modbus (--profile modbus): one coil on an RS-485 relay board ──────
+  #   COMPOSE_PROFILES=...,modbus   with MQTT_URL and the MODBUS_* block in .env
+  #
+  # THE TRANSLATOR BETWEEN THE VMS AND A RELAY. The VMS speaks only MQTT (its
+  # peripherals bridge, above); this subscribes to one command topic, writes
+  # one Modbus RTU coil, and publishes the coil's state back. For a single
+  # siren it replaces Home Assistant; for a site with a gate and meters, swap
+  # it for HA and the VMS side does not change.
+  #
+  # NO SERIAL DEVICE HERE, on purpose. Compose refuses to start a container
+  # whose mapped device does not exist on the host, and with MODBUS_DRY_RUN=1
+  # there is none: the whole chain — rule -> alert -> MQTT -> here -> state ->
+  # wall — runs and logs "would write coil 0 = ON" before a wire is connected.
+  # The device mapping lives in docker-compose.modbus.yml, which ./vms adds by
+  # itself once MODBUS_PORT names a path that exists.
+  #
+  # SAFETY. MODBUS_MAX_ON_S writes the coil OFF that long after any ON whether
+  # or not an `off` arrives, and the coil is written OFF on start, on broker
+  # loss and on shutdown. That is defence in depth behind the VMS's own pulse
+  # follow-up — NOT a substitute for a hardware timer relay in series. See
+  # services/mqtt-modbus/README.md before connecting a siren.
+  mqtt-modbus:
+    build:
+      context: ./services/mqtt-modbus
+      network: host
+    container_name: vms_mqtt_modbus
+    profiles: ["modbus"]
+    restart: unless-stopped
+    environment:
+      # The same broker the VMS bridge publishes to.
+      MQTT_URL:             ${MQTT_URL:-}
+      MQTT_USERNAME:        ${MQTT_USERNAME:-}
+      MQTT_PASSWORD:        ${MQTT_PASSWORD:-}
+      MQTT_TLS_VERIFY:      ${MQTT_TLS_VERIFY:-true}
+      MODBUS_DRY_RUN:       ${MODBUS_DRY_RUN:-1}
+      MODBUS_PORT:          ${MODBUS_PORT:-/dev/ttyUSB0}
+      MODBUS_BAUD:          ${MODBUS_BAUD:-9600}
+      MODBUS_SLAVE_ID:      ${MODBUS_SLAVE_ID:-1}
+      MODBUS_COIL:          ${MODBUS_COIL:-0}
+      MODBUS_MAX_ON_S:      ${MODBUS_MAX_ON_S:-60}
+      # These two are the binding's `address` and `state_topic`, exactly.
+      MODBUS_COMMAND_TOPIC: ${MODBUS_COMMAND_TOPIC:-vms/siren/site-siren/set}
+      MODBUS_STATE_TOPIC:   ${MODBUS_STATE_TOPIC:-vms/siren/site-siren/state}
+      LOG_LEVEL:            ${LOG_LEVEL:-info}
+    # Host networking, like everything else that talks to a 127.0.0.1 broker.
+    network_mode: host
+    # No HTTP. The translator touches a heartbeat file on every message and
+    # on every (re)connect; older than two minutes means it is not serving.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/mqtt-modbus.heartbeat').st_mtime < 120 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Device gateway (COMPOSE_PROFILES=...,gateway) ───────────────────────────
+  # The VMS's Webhook driver calls this; this speaks each device's own protocol
+  # (Modbus RTU-over-TCP relay boards, multicast paging speakers). One URL per
+  # device: POST switches it, GET is a read-only health check the bridge runs
+  # every BRIDGE_VERIFY_INTERVAL_S and shows on the device wall. A new protocol
+  # is a new module here, not a VMS change. services/device-gateway/README.md.
+  # SECURITY: no auth of its own; binds 127.0.0.1 and is reached only by the
+  # api (host network) — nothing else on the LAN can switch a device through it.
+  device-gateway:
+    build:
+      context: ./services/device-gateway
+      network: host
+    container_name: vms_device_gateway
+    profiles: ["gateway"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      GATEWAY_BIND: ${GATEWAY_BIND:-127.0.0.1}
+      GATEWAY_PORT: ${GATEWAY_PORT:-8099}
+      GATEWAY_MULTICAST_IF: ${GATEWAY_MULTICAST_IF:-}
+      GATEWAY_DEFAULT_SOUND: ${GATEWAY_DEFAULT_SOUND:-tone}
+      GATEWAY_RELAY_MAX_ON_S: ${GATEWAY_RELAY_MAX_ON_S:-600}
+      GATEWAY_TIMEOUT_S: ${GATEWAY_TIMEOUT_S:-1}
+      GATEWAY_SOUNDS_DIR: /sounds
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ${GATEWAY_SOUNDS_HOST_DIR:-./deploy/sounds}:/sounds:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('GATEWAY_PORT','8099')+'/health', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Home Assistant (--profile homeassistant): the executor for HA devices ───
+  #   COMPOSE_PROFILES=...,homeassistant   then HA_URL=http://127.0.0.1:8123
+  #
+  # VMS OWNS THE RULES, HA ONLY EXECUTES. The api reaches it through the bridge's
+  # homeassistant driver (POST /api/services/...); no VMS logic lives in HA's
+  # YAML or automations. NOTHING may depends_on this: with the profile off, or
+  # HA down, the VMS starts and runs exactly as before.
+  #
+  # Host networking because discovery (mDNS / SSDP / DHCP sniffing) and Modbus
+  # RTU-over-TCP to LAN relay boards need it, the same reason as device-gateway;
+  # Linux-only for the same reason. HA listens on 0.0.0.0:8123 until
+  # `http: server_host` is set in its configuration.yaml — open it for
+  # onboarding, then narrow it.
+  #
+  # PINNED, not :stable. HA ships monthly and renames entity ids; an appliance
+  # must move only when we move it. The verify loop catches what still drifts.
+  # /config is a NAMED VOLUME: back it up with the rest of the appliance.
+  ha:
+    image: ghcr.io/home-assistant/home-assistant:${HA_IMAGE_TAG:-2026.10.2}
+    container_name: vms_ha
+    profiles: ["homeassistant"]
+    restart: unless-stopped
+    network_mode: host
+    # Bluetooth adapter management and recovery (HA raises a repair without
+    # them). With host networking NET_ADMIN reaches the host's network stack,
+    # which is why this is the only service granted it — and still not
+    # --privileged, which HA's docs suggest and nothing here needs.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Bluetooth goes through the host's BlueZ over the system D-Bus socket
+    # mounted below. Docker's default AppArmor profile (docker-default) denies
+    # D-Bus messages, so HA's bluetooth integration fails with "AppArmor policy
+    # prevents this sender ... AddMatch" and sits in setup_retry. Unconfined
+    # AppArmor lifts only that; it is still not --privileged (no host devices,
+    # no extra capabilities beyond the two above).
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      TZ: ${HA_TZ:-Asia/Kolkata}
+    volumes:
+      - ha_config:/config
+      # Bluetooth discovery; harmless without an adapter.
+      - /run/dbus:/run/dbus:ro
+    healthcheck:
+      # /manifest.json needs no token, so this proves the HTTP server is up
+      # without a credential in the compose file.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8123/manifest.json', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
   # ── Motion detection (CPU-only, analyses relay streams) ─────────────────────
   # Watches cameras with motion_detection=true FROM THE RELAY — zero extra load
   # on the physical camera, no camera credentials. Cameras are synced in at
@@ -635,6 +1031,13 @@ services:
       # too, and this line is what makes the .env switch work on its own.
       MOTION_FRAME_SOURCE: ${MOTION_FRAME_SOURCE:-capture}
       REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6380/0}
+      # WHERE MOTION ACTIVITY GOES: the runs of motion the playback timeline
+      # marks, posted to /api/playback/timeline/presence on the api. The API
+      # root, host-networked like this service; the key is the api's own
+      # INTERNAL_API_KEY, so the two always agree. Empty URL = not reported
+      # (the incident log and /api/motion are unaffected either way).
+      MOTION_EVENTS_URL: ${MOTION_EVENTS_URL:-http://127.0.0.1:${API_PORT:-8091}}
+      MOTION_INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
     volumes:
       - ./services/motion/config.yaml:/app/config.yaml:ro
     depends_on:
@@ -680,6 +1083,8 @@ services:
       SEARCHDB_URL: ${SEARCHDB_URL:-postgresql://search:search_secret@127.0.0.1:5434/smartsearch}
       SEARCH_CROP_DIR: ${SEARCH_CROP_DIR:-/data/search/crops}
       SEARCH_RETENTION_DAYS: ${SEARCH_RETENTION_DAYS:-30}
+      # Canonical unit. Unset = the day value above, converted.
+      SEARCH_RETENTION_MINUTES: ${SEARCH_RETENTION_MINUTES:-}
       # Face search's two OpenCV Zoo models, fetched on first use and verified
       # by digest. Same switch as ANALYTICS_FACE_AUTO_DOWNLOAD — both services
       # read the same shared volume, so either one fetching is enough.
@@ -769,9 +1174,19 @@ services:
       # the packaging harness fails on any binary it cannot account for, and a
       # .pt file is exactly that. The volume keeps the download to once.
       - search_models:/models
+    # LONG FORM ON PURPOSE — the short list form is miscompiled by the overlay
+    # merge. docker-compose.broker.yml re-declares this depends_on as a map
+    # ({searchdb: service_healthy}); merging that map over a short LIST, compose
+    # v2.27 spreads the override's condition across every inherited entry, so
+    # `mediamtx` silently became service_healthy. mediamtx has no healthcheck,
+    # so the whole `up` aborted with "dependency failed to start: container
+    # vms_mediamtx has no healthcheck configured" and api/keycloak/motion/
+    # analytics never started. Map-over-map merges per key, which is correct.
     depends_on:
-      - mediamtx
-      - searchdb
+      mediamtx:
+        condition: service_started
+      searchdb:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8013/health', timeout=4).status == 200 else 1)"]
       interval: 30s

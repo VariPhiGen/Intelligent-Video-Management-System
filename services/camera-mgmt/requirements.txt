@@ -43,3 +43,35 @@ onvif-zeep==0.2.12
 openpyxl==3.1.5
 # §63 BSA chain-of-custody certificate for evidence packages (pure-Python, air-gap safe)
 fpdf2==2.8.1
+# The bridge outbound port (P2). Used by services/bridge/mqtt.py only.
+aiomqtt>=2.0
+
+# S3 mirror for Data Collection datasets. Imported lazily inside
+# services/s3_upload.py so the module still loads where it is absent.
+boto3==1.35.76
+
+# Kafka producer for the QA review sink (services/qa_sink.py). Imported lazily
+# so an appliance with no sink configured still starts without it. Pure Python
+# — no librdkafka — which keeps the air-gapped install story unchanged.
+aiokafka==0.12.0
+
+# Burns the annotation's box onto a copy of the frame for the QA review sink
+# (services/image_label.py). Already present transitively in the image; pinned
+# here because this is now a DIRECT dependency and a transitive one can vanish
+# on an unrelated version bump.
+Pillow==12.3.0
+
+# Email and SFTP event destinations (services/event_delivery/adapters/email.py,
+# sftp.py). Imported lazily inside the adapters; both are pure Python on top of
+# the cryptography pin above.
+aiosmtplib==3.0.2
+asyncssh==2.17.0
+
+# IANA zone data for patrol schedules in a site's local time (zoneinfo; the slim
+# image has no system tzdata).
+tzdata==2025.2
+
+# Heatmap ranges: the 5-minute heat arrays are summed and rendered here
+# (blur, colour map, blend) exactly as the analytics service renders them.
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<4.12

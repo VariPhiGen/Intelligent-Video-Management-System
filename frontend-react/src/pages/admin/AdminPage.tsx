@@ -1,18 +1,28 @@
 /**
  * AdminPage.tsx — Administration: Audit log | System health | Storage |
- * Activity types, plus whatever tabs optional extensions contribute (in the
+ * Activity types | Label classes | Annotation Publishing | Query interpretation |
+ * DeepStream, plus
+ * whatever tabs optional
+ * extensions contribute (in the
  * commercial tiers, Users and Roles & permissions lead the row).
  *
  * A non-admin who holds the capability gating an extension's tab reaches this
  * page too, and sees only that tab — every core tab is admin-only.
  */
+import { ViewTransition } from '@/components/ViewTransition';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '@/lib/auth';
 import { HealthTab } from './HealthTab';
 import { StorageTab } from './StorageTab';
 import { ActivityTypesTab } from './ActivityTypesTab';
+import { LabelClassesTab } from './LabelClassesTab';
+import { EventIntegrationsTab } from './EventIntegrationsTab';
+import { QaSinkTab } from './QaSinkTab';
+import { QueryInterpretationTab } from './QueryInterpretationTab';
 import { AuditTab } from './AuditTab';
+import { DeepStreamTab } from './DeepStreamTab';
 import { extensionAdminTabs } from '@/extensions';
+import { useTabOverflow } from '@/components/useTabOverflow';
 
 type TabKey = string;
 
@@ -21,6 +31,11 @@ const CORE_TABS: [TabKey, string][] = [
   ['health', 'System health'],
   ['storage', 'Storage'],
   ['types', 'Activity types'],
+  ['label-classes', 'Label classes'],
+  ['qa-sink', 'Annotation Publishing'],
+  ['integrations', 'Event Integrations'],
+  ['query-interpretation', 'Query interpretation'],
+  ['deepstream', 'DeepStream'],
 ];
 
 const extTab = (t: { key: string; label: string }) => [t.key, t.label] as [TabKey, string];
@@ -57,6 +72,7 @@ export function AdminPage() {
     setParams(next, { replace: true });
   };
   const activeExtTab = extensionAdminTabs.find(t => t.key === tab);
+  const tabBar = useTabOverflow<HTMLDivElement>(tab);
 
   if (!visibleTabs.length) {
     return (
@@ -73,14 +89,14 @@ export function AdminPage() {
   }
 
   return (
-    <div className="fade">
+    <ViewTransition view={tab}>
       {/* Title lives in the topbar (like Live View) — tabs lead the page. The
           primary action rides at the end of the tab row, outside the pill, and
           only on the tab where it applies. */}
       <div className="tabrow">
-        <div className="tabs page-tabs">
+        <div ref={tabBar.ref} className={`tabs page-tabs${tabBar.className}`}>
           {visibleTabs.map(([k, label]) => (
-            <div key={k} className={`tab${tab === k ? ' active' : ''}`} onClick={() => setTab(k)}>{label}</div>
+            <button type="button" key={k} aria-pressed={tab === k} className={`tab${tab === k ? ' active' : ''}`} onClick={() => setTab(k)}>{label}</button>
           ))}
         </div>
         {activeExtTab?.action?.()}
@@ -90,9 +106,14 @@ export function AdminPage() {
       {tab === 'health' && <HealthTab />}
       {tab === 'storage' && <StorageTab />}
       {tab === 'types' && <ActivityTypesTab />}
+      {tab === 'label-classes' && <LabelClassesTab />}
+      {tab === 'qa-sink' && <QaSinkTab />}
+      {tab === 'integrations' && <EventIntegrationsTab />}
+      {tab === 'query-interpretation' && <QueryInterpretationTab />}
+      {tab === 'deepstream' && <DeepStreamTab />}
       {extensionAdminTabs.map(t => tab === t.key
         ? <div key={t.key}>{t.render()}</div>
         : null)}
-    </div>
+    </ViewTransition>
   );
 }

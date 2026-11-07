@@ -4,8 +4,19 @@
  * base (coverage green, gaps red, hour grid) redrawn only when the view/data
  * changes; head (playhead) redrawn on every position tick. Click = seek,
  * drag = pan, wheel = zoom (10 min – 7 days).
+ *
+ * Single lane: an optional marker strip under the footage bar
+ * (timelineMarks.ts). Thin person / vehicle / motion rows show when a tracked
+ * object was in view or something moved; the events row below them shows AI
+ * events — intervals as bars, point events as diamonds, in their activity's
+ * colour. Hover shows what it was; click seeks to it.
+ *
+ * Multi lane: each lane may carry its camera's marks, drawn as a thin band in
+ * the gap under its footage bar — an overview of where to look, not a second
+ * strip per camera. Clicking there seeks every tile, like anywhere on a lane.
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { hitMark, type PresenceKind, type TimelineMark } from './timelineMarks';
 
 /**
  * Colours come from the live theme (CSS custom properties, inherited from
@@ -22,6 +33,9 @@ function palette(el: Element) {
     gap: v('--red', '#ef4444'),
     grid: v('--tl-grid', 'rgba(255,255,255,.06)'),
     head: v('--accent', '#F18A3B'),
+    person: v('--tl-person', '#6366F1'),
+    vehicle: v('--tl-vehicle', '#0D9488'),
+    motion: v('--tl-motion', '#B8457A'),
   };
 }
 
@@ -29,6 +43,14 @@ export interface Lane {
   label: string;
   range: { earliest: number; latest: number } | null;   // epoch seconds
   gaps: { start: number; end: number }[];               // epoch seconds
+  /** Multi only: this camera's markers, drawn as a band under its lane. */
+  marks?: TimelineMark[];
+  /**
+   * Multi only, sync lock off: this camera's own position (epoch seconds),
+   * drawn as a head confined to its lane. Present on any lane → every lane
+   * draws its own head and the shared `playhead` is not drawn.
+   */
+  playhead?: number | null;
 }
 
 export interface TimelineProps {
@@ -41,13 +63,30 @@ export interface TimelineProps {
    *  players' timelines can never drift apart. */
   lanes?: Lane[];
   playhead: number | null;                               // epoch seconds
-  /** slopSec widens tiny painted gaps so clicks on them register as "in gap". */
-  onSeek: (epochSec: number, slopSec: number) => void;
+  /** slopSec widens tiny painted gaps so clicks on them register as "in gap".
+   *  `lane` is the index of the lane clicked (multi only). */
+  onSeek: (epochSec: number, slopSec: number, lane?: number) => void;
   onViewChange: (startMs: number, endMs: number) => void;
+  /** Single lane only: events drawn in a strip under the footage bar. Passing
+   *  the prop (even empty) reserves the strip, so the bar does not jump in
+   *  height as marks load. */
+  marks?: TimelineMark[];
+  /** Clicking a mark; without it a click in the strip seeks like anywhere else. */
+  onMarkClick?: (mark: TimelineMark) => void;
+  /** Presence rows to reserve above the events row, top to bottom — the kinds
+   *  this camera indexes. Reserved even while empty, like `marks`. */
+  presenceRows?: PresenceKind[];
 }
 
 const LANE_H_MULTI = 40;   // per-camera band height when showing lanes
 const LANE_H_SINGLE = 60;  // the original single-lane height
+const MARK_STRIP_H = 18;   // the event row under a single lane
+const PRESENCE_ROW_H = 8;  // each person / vehicle row above it
+
+function fmtClock(epochSec: number): string {
+  const d = new Date(epochSec * 1000), pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 export function Timeline(props: TimelineProps) {
   const contRef = useRef<HTMLDivElement>(null);
@@ -55,8 +94,14 @@ export function Timeline(props: TimelineProps) {
   const headRef = useRef<HTMLCanvasElement>(null);
   const size = useRef({ w: 0, h: 0 });
   const eatClick = useRef(false);
+  const [hover, setHover] = useState<{ mark: TimelineMark; x: number } | null>(null);
   const p = useRef(props);
   p.current = props;
+
+  const rowsOf = (pr: TimelineProps) => pr.presenceRows ?? [];
+  /** Height of the marker strip, 0 when this timeline has none. */
+  const stripOf = (pr: TimelineProps) =>
+    (pr.marks && !pr.lanes ? MARK_STRIP_H + rowsOf(pr).length * PRESENCE_ROW_H : 0);
 
   const timeToPx = (ms: number, w: number) => {
     const { viewStart, viewEnd } = p.current;
@@ -93,7 +138,8 @@ export function Timeline(props: TimelineProps) {
     const { viewStart, viewEnd } = p.current;
     const lanes = lanesOf(p.current);
     const multi = !!p.current.lanes;
-    const laneH = h / lanes.length;
+    const strip = stripOf(p.current);
+    const laneH = (h - strip) / lanes.length;
     const inset = multi ? 7 : 0;   // multi lanes read as separate bars
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -128,12 +174,15 @@ export function Timeline(props: TimelineProps) {
           ctx.fillRect(x1, top, Math.max(2, x2 - x1), bh);
         }
       }
+      if (multi && lane.marks?.length) drawLaneMarks(ctx, w, top + bh + 1, lane.marks, C);
       if (multi && i > 0) {
         ctx.strokeStyle = C.grid;
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.moveTo(0, i * laneH); ctx.lineTo(w, i * laneH); ctx.stroke();
       }
     });
+
+    if (strip) drawMarks(ctx, w, h - strip, strip, C);
 
     ctx.strokeStyle = C.grid;
     ctx.lineWidth = 1;
@@ -142,6 +191,89 @@ export function Timeline(props: TimelineProps) {
       const x = timeToPx(t, w);
       ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
     }
+  };
+
+  /** The strip: a hairline under the footage, a thin bar row per presence
+   *  kind, then the events row — intervals as bars at least 3px wide, point
+   *  events as diamonds. */
+  const drawMarks = (ctx: CanvasRenderingContext2D, w: number, top: number, _sh: number,
+                     C: ReturnType<typeof palette>) => {
+    const { viewStart, viewEnd, marks = [] } = p.current;
+    const rows = rowsOf(p.current);
+    ctx.strokeStyle = C.grid;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, top + 0.5); ctx.lineTo(w, top + 0.5); ctx.stroke();
+    const visible = (m: TimelineMark) =>
+      !((m.end ?? m.start) * 1000 < viewStart - 60_000 || m.start * 1000 > viewEnd + 60_000);
+
+    rows.forEach((kind, i) => {
+      const rowTop = top + i * PRESENCE_ROW_H;
+      ctx.fillStyle = C[kind];
+      ctx.globalAlpha = 0.85;
+      for (const m of marks) {
+        if (m.row !== kind || !visible(m)) continue;
+        const x1 = timeToPx(m.start * 1000, w);
+        const x2 = timeToPx((m.end ?? m.start) * 1000, w);
+        ctx.fillRect(x1, rowTop + 2, Math.max(2, x2 - x1), PRESENCE_ROW_H - 3);
+      }
+      ctx.globalAlpha = 1;
+    });
+
+    const evTop = top + rows.length * PRESENCE_ROW_H;
+    const mid = evTop + MARK_STRIP_H / 2;
+    const r = Math.min(5, MARK_STRIP_H / 2 - 2);
+    for (const m of marks) {
+      if (m.row !== 'event' || !visible(m)) continue;
+      const sMs = m.start * 1000;
+      const eMs = (m.end ?? m.start) * 1000;
+      ctx.fillStyle = m.color;
+      const x1 = timeToPx(sMs, w);
+      if (m.end != null) {
+        const x2 = timeToPx(eMs, w);
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(x1, mid - 3, Math.max(3, x2 - x1), 6);
+        ctx.globalAlpha = 1;
+      }
+      // Every mark starts with a diamond, so an interval's start reads as
+      // precisely as a point event and a click target is never 1px wide.
+      ctx.beginPath();
+      ctx.moveTo(x1, mid - r); ctx.lineTo(x1 + r, mid); ctx.lineTo(x1, mid + r); ctx.lineTo(x1 - r, mid);
+      ctx.closePath(); ctx.fill();
+    }
+  };
+
+  /** Multi lane: every mark as a 4px tick band in the lane's lower gap —
+   *  presence in its kind's colour, events in their activity's. */
+  const drawLaneMarks = (ctx: CanvasRenderingContext2D, w: number, y: number,
+                         marks: TimelineMark[], C: ReturnType<typeof palette>) => {
+    const { viewStart, viewEnd } = p.current;
+    ctx.globalAlpha = 0.9;
+    for (const m of marks) {
+      const sMs = m.start * 1000, eMs = (m.end ?? m.start) * 1000;
+      if (eMs < viewStart || sMs > viewEnd) continue;
+      ctx.fillStyle = m.row === 'event' ? m.color : C[m.row];
+      const x1 = timeToPx(sMs, w);
+      ctx.fillRect(x1, y, Math.max(2, timeToPx(eMs, w) - x1), 4);
+    }
+    ctx.globalAlpha = 1;
+  };
+
+  /** The mark under a pointer event, when it is inside the strip. */
+  const markAt = (e: React.MouseEvent): { mark: TimelineMark; x: number } | null => {
+    const cont = contRef.current;
+    const strip = stripOf(p.current);
+    if (!cont || !strip) return null;
+    const rect = cont.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const top = rect.height - strip;
+    if (y < top) return null;
+    // Which row the pointer is in decides which marks it can hit.
+    const rows = rowsOf(p.current);
+    const i = Math.floor((y - top) / PRESENCE_ROW_H);
+    const row = i < rows.length ? rows[i] : 'event';
+    const mark = hitMark((p.current.marks ?? []).filter(m => m.row === row), x,
+                         s => timeToPx(s * 1000, rect.width), row === 'event' ? 5 : 3);
+    return mark ? { mark, x } : null;
   };
 
   const drawHead = () => {
@@ -153,24 +285,34 @@ export function Timeline(props: TimelineProps) {
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    const { playhead } = p.current;
-    if (playhead == null) return;
-    const px = timeToPx(playhead * 1000, w);
-    if (px < 0 || px > w) return;
     const head = palette(cont).head;
-    ctx.strokeStyle = head;
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
-    ctx.fillStyle = head;
-    ctx.beginPath();
-    ctx.moveTo(px - 5, 0); ctx.lineTo(px + 5, 0); ctx.lineTo(px, 7);
-    ctx.closePath(); ctx.fill();
+    const draw = (epoch: number, top: number, bottom: number) => {
+      const px = timeToPx(epoch * 1000, w);
+      if (px < 0 || px > w) return;
+      ctx.strokeStyle = head;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
+      ctx.fillStyle = head;
+      ctx.beginPath();
+      ctx.moveTo(px - 5, top); ctx.lineTo(px + 5, top); ctx.lineTo(px, top + 7);
+      ctx.closePath(); ctx.fill();
+    };
+    const lanes = p.current.lanes;
+    if (lanes?.some(l => l.playhead !== undefined)) {
+      // Independent tiles: one head per lane, kept inside its own band.
+      const laneH = h / lanes.length;
+      lanes.forEach((l, i) => { if (l.playhead != null) draw(l.playhead, i * laneH, (i + 1) * laneH); });
+      return;
+    }
+    const { playhead } = p.current;
+    if (playhead != null) draw(playhead, 0, h);
   };
 
   /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => { drawBase(); drawHead(); },
-    [props.viewStart, props.viewEnd, props.range, props.gaps, props.lanes]);
-  useEffect(() => { drawHead(); }, [props.playhead]);
+    [props.viewStart, props.viewEnd, props.range, props.gaps, props.lanes, props.marks,
+     props.presenceRows]);
+  useEffect(() => { drawHead(); }, [props.playhead, props.lanes]);
 
   // Repaint when the dashboard theme toggles — the canvas colours are read from
   // CSS vars, so they don't update on their own.
@@ -213,11 +355,17 @@ export function Timeline(props: TimelineProps) {
     if (eatClick.current) { eatClick.current = false; return; }
     const cont = contRef.current;
     if (!cont) return;
+    const hit = p.current.onMarkClick ? markAt(e) : null;
+    if (hit) { p.current.onMarkClick!(hit.mark); return; }
     const rect = cont.getBoundingClientRect();
     const { viewStart, viewEnd, onSeek } = p.current;
     const epoch = (viewStart + ((e.clientX - rect.left) / rect.width) * (viewEnd - viewStart)) / 1000;
     const slop = ((viewEnd - viewStart) / 1000 / rect.width) * 1.5; // widen tiny painted gaps
-    onSeek(epoch, slop);
+    const lanes = p.current.lanes;
+    const lane = lanes?.length
+      ? Math.min(lanes.length - 1, Math.max(0, Math.floor(((e.clientY - rect.top) / rect.height) * lanes.length)))
+      : undefined;
+    onSeek(epoch, slop, lane);
   };
 
   const onMouseDown = (e: React.MouseEvent) => {
@@ -259,12 +407,16 @@ export function Timeline(props: TimelineProps) {
 
   const lanes = props.lanes;
   const laneH = lanes ? LANE_H_MULTI : LANE_H_SINGLE;
-  const height = (lanes ? lanes.length : 1) * laneH;
+  const height = (lanes ? lanes.length : 1) * laneH + stripOf(props);
+  const hm = hover?.mark;
 
   return (
-    <>
-      <div ref={contRef} className="pb-timeline" title="Click to seek · drag to pan · scroll to zoom"
-           style={{ height }} onClick={onClick} onMouseDown={onMouseDown}>
+    <div className="pb-timeline-wrap">
+      <div ref={contRef} className="pb-timeline"
+           title={hover ? undefined : 'Click to seek · drag to pan · scroll to zoom'}
+           style={{ height, cursor: hover ? 'pointer' : undefined }}
+           onClick={onClick} onMouseDown={onMouseDown}
+           onMouseMove={e => setHover(markAt(e))} onMouseLeave={() => setHover(null)}>
         <canvas ref={baseRef} />
         <canvas ref={headRef} />
         {/* Camera names float over their lane (multi only), never intercepting
@@ -276,6 +428,20 @@ export function Timeline(props: TimelineProps) {
           </span>
         ))}
       </div>
+      {hm && (
+        <div className="pb-mark-tip" role="tooltip" style={{ left: hover.x }}>
+          <div className="pb-mark-tip-head">
+            <span className="pb-mark-dot" style={{ background: hm.color }} />{hm.label}
+          </div>
+          <div>
+            {fmtClock(hm.start)}
+            {hm.end != null && ` – ${fmtClock(hm.end)}`}
+            {hm.objectClass && ` · ${hm.objectClass}`}
+            {hm.zone && ` · ${hm.zone}`}
+            {hm.confidence != null && ` · ${Math.round(hm.confidence * 100)}%`}
+          </div>
+        </div>
+      )}
       <div className="pb-labels">
         {labels.map((l, i) => (
           <span key={i} style={{ position: 'absolute', left: `${l.pct}%`, transform: 'translateX(-50%)' }}>
@@ -283,6 +449,6 @@ export function Timeline(props: TimelineProps) {
           </span>
         ))}
       </div>
-    </>
+    </div>
   );
 }

@@ -1,0 +1,2 @@
+# Drop server.crt and server.key (and optionally ca.crt) here to open the
+# TLS listener; see deploy/mosquitto/entrypoint.sh. Never commit them.

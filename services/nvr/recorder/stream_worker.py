@@ -37,6 +37,7 @@ Reconnection strategy:
 """
 
 import logging
+import math
 import os
 import random
 import re
@@ -486,7 +487,7 @@ class StreamWorker:
         except (ValueError, IndexError):
             duration = self._probe_duration(str(filepath))
 
-        if duration is None or duration <= 0:
+        if not self._valid_segment_duration(filepath, start_epoch, duration):
             logger.warning(
                 "Camera '%s': skipping segment with invalid duration: %s",
                 self.camera, filepath,
@@ -571,7 +572,7 @@ class StreamWorker:
                 if now - stat.st_mtime < 5.0:
                     continue
                 duration = self._probe_duration(str(ts_file))
-                if duration is None or duration <= 0:
+                if not self._valid_segment_duration(ts_file, start_epoch, duration):
                     continue
                 seg = Segment(
                     camera=self.camera,
@@ -593,6 +594,29 @@ class StreamWorker:
                     self.camera, ts_file.name, e,
                 )
         return added
+
+    def _valid_segment_duration(self, filepath: Path, start_epoch: float,
+                                duration: float | None) -> bool:
+        """Reject broken media clocks instead of claiming hours of coverage.
+
+        CSV and ffprobe both inherit source PTS jumps, so probing again cannot
+        validate them. Compare with elapsed wall time from the filename to the
+        last write, capped at now. Allow three target segments for long GOPs,
+        plus 30 seconds of timestamp/flush tolerance for genuinely long files.
+        Keep rejected footage on disk for recovery; never invent its timing.
+        """
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            return False
+        elapsed = max(0.0, min(filepath.stat().st_mtime, time.time()) - start_epoch)
+        limit = max(3 * self.segment_duration, elapsed + 30.0)
+        if duration > limit:
+            logger.warning(
+                "Camera '%s': rejecting segment %s: media duration %.3fs "
+                "exceeds wall-clock limit %.3fs (possible timestamp jump)",
+                self.camera, filepath.name, duration, limit,
+            )
+            return False
+        return True
 
     def _parse_filename_time(self, filename: str) -> float | None:
         """Extract Unix epoch from segment filename like camera_20260317_143210.ts

@@ -5,7 +5,7 @@ analytics service (`services/analytics/analytics/activities/`), configured per
 camera from `Camera.analytics_config` as AI Config stores it and pushed there
 by services/analytics_client.py. When an activity's own logic decides something
 happened, the engine posts it to `POST /api/analytics/events` with
-`source: "cpu"`. (The DeepStream pipeline could post here too if its projection
+`source: "cpu"`. (The DeepStream pipeline could post here too if its push
 is switched back on; nothing here depends on which producer it is.)
 
 Nothing here detects anything: this module is where decisions made elsewhere
@@ -39,7 +39,7 @@ import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Literal, Mapping, Optional, Sequence, Union
+from typing import Any, Iterable, Literal, Mapping, NamedTuple, Optional, Sequence, Union
 
 import structlog
 from pydantic import AwareDatetime, BaseModel, Field
@@ -195,12 +195,17 @@ def prepare(
     cameras_by_slug: Mapping[str, Any],
     *,
     now: datetime,
-    default_retention_days: int,
+    default_retention_minutes: int,
+    resolve=None,
 ) -> tuple[list[dict], list[dict]]:
     """Validate a batch against the registry. Returns (rows to store, rejections).
 
     Per event rather than per batch: one camera removed mid-flight must not cost
     the other cameras' events in the same POST.
+
+    `resolve(event, camera)` → (camera as of the event, preset or None): a PTZ camera whose AI follows its presets
+    is judged by the preset it was confirmed at when the event happened — that preset's activities and region
+    names (services/ptz_views.event_resolver).
     """
     rows: list[dict] = []
     rejected: list[dict] = []
@@ -214,6 +219,9 @@ def prepare(
         if camera is None:
             reject(i, "unknown_camera", ev)
             continue
+        preset = None
+        if resolve is not None:
+            camera, preset = resolve(ev, camera)
         if ev.activity not in configured_activities(camera):
             reject(i, "activity_not_configured", ev)
             continue
@@ -223,8 +231,13 @@ def prepare(
         if ev.started_at > now + FUTURE_SKEW:
             reject(i, "in_future", ev)
             continue
-        retention = getattr(camera, "retention_days", None) or default_retention_days
-        expires_at = ev.started_at + timedelta(days=retention)
+        # MINUTES, and from the camera's own footage retention: an AI event
+        # describes a moment of footage, so it cannot outlive the footage it
+        # describes. A camera kept for twenty minutes leaves twenty minutes of
+        # events behind, not a day's worth rounded up.
+        retention = (getattr(camera, "retention_minutes", None)
+                     or default_retention_minutes)
+        expires_at = ev.started_at + timedelta(minutes=retention)
         if expires_at <= now:
             reject(i, "outside_retention", ev)
             continue
@@ -239,6 +252,8 @@ def prepare(
             "camera_id": camera.id,
             "activity": ev.activity,
             "zone": zone[:120] if zone else None,
+            "preset_id": uuid.UUID(str(preset["id"])) if preset and preset.get("id") else None,
+            "preset_name": (preset.get("name") or None) if preset else None,
             "started_at": ev.started_at,
             "ended_at": ev.ended_at,
             "confidence": ev.confidence,
@@ -252,7 +267,20 @@ def prepare(
     return rows, rejected
 
 
-async def record(db: AsyncSession, rows: Sequence[dict]) -> dict[str, int]:
+class RecordResult(NamedTuple):
+    """What the ingest actually did.
+
+    `inserted` exists because the rule engine must fire on a NEW detection and
+    never on a replayed one. Counts alone cannot tell those apart, and a
+    producer re-sending its buffer after a restart is routine — firing a gate
+    rule for each replay would not be.
+    """
+    counts: dict
+    inserted: list
+    closed: list = []
+
+
+async def record(db: AsyncSession, rows: Sequence[dict], *, cameras=None, labels=None) -> RecordResult:
     """Store prepared rows. Idempotent; closing an open event is the one update.
 
     `xmax = 0` on the RETURNING row is PostgreSQL's tell for "this was an
@@ -261,6 +289,8 @@ async def record(db: AsyncSession, rows: Sequence[dict]) -> dict[str, int]:
     a plain duplicate.
     """
     counts = {"inserted": 0, "closed": 0, "duplicates": 0}
+    inserted: list = []
+    closed: list = []
     table = AnalyticsEvent.__table__
     for row in rows:
         stmt = pg_insert(table).values(**row)
@@ -275,16 +305,25 @@ async def record(db: AsyncSession, rows: Sequence[dict]) -> dict[str, int]:
                 table.c.camera_id == stmt.excluded.camera_id,
                 table.c.activity == stmt.excluded.activity,
             ),
-        ).returning(literal_column("(xmax = 0)").label("inserted"))
+        ).returning(literal_column("(xmax = 0)").label("inserted"), *table.c)
         got = (await db.execute(stmt)).first()
         if got is None:
             counts["duplicates"] += 1
         elif got.inserted:
             counts["inserted"] += 1
+            inserted.append(row)
         else:
             counts["closed"] += 1
+            closed.append(dict(got._mapping))
+        if got is not None and cameras and row['camera_id'] in cameras:
+            from .event_delivery.envelope import ai_event_envelope
+            from .event_delivery.outbox import enqueue
+            await enqueue(db, ai_event_envelope(dict(got._mapping),
+                'created' if got.inserted else 'closed', cameras[row['camera_id']],
+                accepted_at=datetime.now(timezone.utc),
+                activity_label=(labels or {}).get(row['activity'], humanize(row['activity']))))
     await db.commit()
-    return counts
+    return RecordResult(counts, inserted, closed)
 
 
 # ── Reading ───────────────────────────────────────────────────────────────────
@@ -333,6 +372,8 @@ def shape(row: Mapping[str, Any], *, slug: str, name: Optional[str],
         "camera": {"id": str(row["camera_id"]), "slug": slug, "name": name or slug},
         "activity": activity_meta(row["activity"], catalog),
         "zone": row["zone"],
+        "preset": ({"id": str(row["preset_id"]), "name": row.get("preset_name")}
+                   if hasattr(row, "get") and row.get("preset_id") else None),
         "started_at": _iso(started),
         "ended_at": _iso(ended),
         "duration_s": round((ended - started).total_seconds(), 1) if ended else None,

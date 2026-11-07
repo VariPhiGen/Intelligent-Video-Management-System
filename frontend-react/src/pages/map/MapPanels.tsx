@@ -7,7 +7,7 @@
  */
 import { useEffect, useState } from 'react';
 
-import type { Camera } from '@/lib/types';
+import type { Camera, CameraRegistration } from '@/lib/types';
 import { zoneOf } from '@/lib/cameras';
 
 import { parseGps } from './mapHelpers';
@@ -230,18 +230,24 @@ export function HaDetailPanel({ device, pins, canManage, editMode, onRemove }: {
  *  links into Live / Playback. */
 export function CameraDetailPanel({
   camera, snapUrl, motionState, autoPlaced, editMode,
-  onSaveGps, onCopyGps, onOpenLive, onOpenPlayback, onRemove,
+  registration, canRegister,
+  onSaveGps, onCopyGps, onOpenLive, onOpenPlayback, onRemove, onRegister,
 }: {
   camera: Camera | null;
   snapUrl: string | null;
   motionState?: string;
   autoPlaced: boolean;
   editMode: boolean;
+  /** This camera's coverage on the current plan, or null if never registered. */
+  registration: CameraRegistration | null;
+  /** camera_manage — registration is configuration, same gate as the route. */
+  canRegister: boolean;
   onSaveGps: (cam: Camera, value: string) => void;
   onCopyGps: (text: string) => void;
   onOpenLive: () => void;
   onOpenPlayback: (slug: string) => void;
   onRemove: (cam: Camera) => void;
+  onRegister: () => void;
 }) {
   return (
     <div className="panel" style={{ marginBottom: 0 }}>
@@ -294,7 +300,40 @@ export function CameraDetailPanel({
                 </div>
               )}
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {/* Coverage sits above the navigation actions because it says
+                something about THIS map, which is what the operator is looking
+                at. Shown to everyone; only camera_manage gets the button. */}
+            <div style={{
+              marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--line, #2a2f38)',
+            }}>
+              <div style={{ fontSize: 11.5, fontWeight: 650, marginBottom: 4 }}>Coverage</div>
+              {registration ? (
+                <div style={{ fontSize: 11.5, color: 'var(--muted)', marginBottom: 6 }}>
+                  Registered from {registration.landmark_pairs.length} landmarks
+                  {registration.reprojection_error_m != null
+                    // Metres only where the plan is georeferenced; the
+                    // normalized figure is shown otherwise rather than a
+                    // unitless number nobody can act on.
+                    ? <> · about {registration.reprojection_error_m.toFixed(2)} m accuracy</>
+                    : <> · error {registration.reprojection_error.toFixed(4)} of the plan</>}
+                  {registration.footprint.length < 3 && (
+                    <div style={{ color: 'var(--warn, #e0a030)', marginTop: 3 }}>
+                      This view does not overlap the plan — check it is the right one.
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ fontSize: 11.5, color: 'var(--dim)', marginBottom: 6 }}>
+                  Not registered — the map knows where this camera is, not what it sees.
+                </div>
+              )}
+              {canRegister && (
+                <button className="btn-ghost btn-sm" style={{ width: '100%' }} onClick={onRegister}>
+                  {registration ? 'Recalibrate coverage' : 'Register coverage'}
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
               <button className="btn-ghost btn-sm" onClick={onOpenLive}>Open in Live</button>
               <button className="btn-ghost btn-sm" onClick={() => onOpenPlayback(camera.slug)}>Open in Playback</button>
               {editMode && (

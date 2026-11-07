@@ -2,7 +2,7 @@
 
 The index is built by the GPU appliance (person crops off Kafka, vehicles off
 the ANPR ingest) and lives with the GPU that builds it, so this is an HTTP hop
-rather than a shared directory like the DeepStream projection.
+to a service that may sit on another host.
 
 The service has no auth of its own, and on this deployment it is not even
 co-located — it answers on a public name, so anything that can route to it can

@@ -45,3 +45,34 @@ describe('camera.config_changed', () => {
       .toBe('Camera config changed · cam34-n17v');
   });
 });
+
+/**
+ * Retention is minute-granular, so the trail cannot say "N days" any more. The
+ * server records both the exact `retention_minutes` and a human `retention`
+ * label; the log prints the label, because the question this row answers is
+ * "how long did you keep it?" and "43200" is not that answer.
+ */
+describe('retention.changed', () => {
+  function retention(detail: Record<string, any>): AuditEntry {
+    return { action: 'retention.changed', target: 'cam34-n17v', detail } as AuditEntry;
+  }
+
+  it('prints the human label the server rendered', () => {
+    expect(formatAction(retention({ retention_minutes: 20, retention: '20 minutes' })))
+      .toBe('Retention changed · 20 minutes');
+    expect(formatAction(retention({ retention_minutes: 43200, retention: '30 days' })))
+      .toBe('Retention changed · 30 days');
+  });
+
+  it('falls back to the exact minutes when an entry carries no label', () => {
+    // Entries written before the label was recorded still have to be readable:
+    // the audit table is hash-chained, so nothing rewrites them.
+    expect(formatAction(retention({ retention_minutes: 90 })))
+      .toBe('Retention changed · 90 minutes');
+  });
+
+  it('says a reset to the default is a reset, not a period of zero', () => {
+    expect(formatAction(retention({ retention_minutes: null })))
+      .toBe('Retention changed · reset to default');
+  });
+});

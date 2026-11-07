@@ -37,24 +37,60 @@ from backend.models import (
 from backend.routers.audit import router as audit_router
 from backend.routers.auth import router as auth_router
 from backend.routers.cameras import router as cameras_router
+from backend.routers.datasets import router as datasets_router
+from backend.routers.annotations import router as annotations_router
+from backend.routers.label_classes import router as label_classes_router
+from backend.routers.qa_sink import router as qa_sink_router
+from backend.routers.event_integrations import router as event_integrations_router
+from backend.routers.event_feed import router as event_feed_router
+from backend.services.event_delivery import sender as event_sender
 from backend.routers.discovery import router as discovery_router
+from backend.routers.analytics_engine import router as analytics_engine_router
 from backend.routers.events import router as events_router
+from backend.routers.heatmaps import router as heatmaps_router
+from backend.routers.timelapse import router as timelapse_router
+from backend.routers.people_distribution import router as people_distribution_router
 from backend.routers.hls import router as hls_router
 from backend.routers.motion import router as motion_router
 from backend.routers.nvr import router as nvr_router
 from backend.routers.search import router as search_router
+from backend.routers.search_planner import router as search_planner_router
+from backend.routers.search_assistant import router as search_assistant_router
+from backend.routers.search_ingest import router as search_ingest_router
+from backend.routers.timeline import router as timeline_router
 from backend.routers.peripherals import router as peripherals_router
+from backend.routers.homeassistant import router as homeassistant_router
+from backend.routers.alerts import router as alerts_router
+from backend.routers.rules import router as rules_router
+from backend.routers.ptz import router as ptz_router
+from backend.routers.registration import plan_router as registration_plan_router
+from backend.routers.registration import router as registration_router
 from backend.routers.sitemaps import router as sitemaps_router
-from backend.security import require_authenticated
+from backend.routers.branding import router as branding_router
+from backend.routers.deepstream_admin import router as deepstream_admin_router
+# (users/roles routes moved to backend/extensions/identity in the open-core split; the extension mounts them)
+from backend.security import require_authenticated, require_role
 from backend.services.policy import require_capability
+from backend.services import background
 from backend.services import deepstream_client
 from backend.services import health as health_svc
 from backend.services import ai_events
+from backend.services import annotation_store
+from backend.services import qa_sink
+from backend.services import heatmaps as heatmaps_svc
+from backend.services import timelapse as timelapse_svc
+from backend.services import stream_codec as stream_codec_svc
+from backend.services import ptz_track as ptz_track_svc
+from backend.services import timeline as timeline_svc
+from backend.services import rules_engine
+from backend.services import bridge
+from backend.services.bridge import pending as bridge_pending
 from backend.services import analytics_client
 from backend.services import frames_client
 from backend.services import motion_client
 from backend.services import smartsearch_sync
 from backend.services import leader
+from backend.services import ptz_control
 from backend.services import nvr_client
 from backend.services import relay
 
@@ -86,10 +122,32 @@ _motion_sync_task: asyncio.Task | None = None
 _frames_sync_task: asyncio.Task | None = None
 _analytics_sync_task: asyncio.Task | None = None
 _events_retention_task: asyncio.Task | None = None
+_heatmap_retention_task: asyncio.Task | None = None
+_timelapse_capture_task: asyncio.Task | None = None
+_timelapse_render_task: asyncio.Task | None = None
+_timelapse_retention_task: asyncio.Task | None = None
+_presence_retention_task: asyncio.Task | None = None
+_stream_codec_task: asyncio.Task | None = None
+_ptz_track_task: asyncio.Task | None = None
+_alert_retention_task: asyncio.Task | None = None
+_annotation_adoption_task: asyncio.Task | None = None
+_annotation_retention_task: asyncio.Task | None = None
+_qa_sink_relay_task: asyncio.Task | None = None
+_event_router_task: asyncio.Task | None = None
+_event_sender_task: asyncio.Task | None = None
+_bridge_state_task: asyncio.Task | None = None
+_bridge_verify_task: asyncio.Task | None = None
+_bridge_pending_task: asyncio.Task | None = None
+_bridge_hold_task: asyncio.Task | None = None
+_bridge_publisher_task: asyncio.Task | None = None
+_bridge_ha_config_task: asyncio.Task | None = None
+_bridge_ha_state_task: asyncio.Task | None = None
 _smartsearch_sync_task: asyncio.Task | None = None
 _gpu_task: asyncio.Task | None = None
-_deepstream_projection_task: asyncio.Task | None = None
+_deepstream_sync_task: asyncio.Task | None = None
 _audit_kc_task: asyncio.Task | None = None
+_ptz_reaper_task: asyncio.Task | None = None
+_ptz_keepwarm_task: asyncio.Task | None = None
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -246,6 +304,155 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         name="events_retention")
     log.info("startup.events_retention_started")
 
+    # 6c-bis. Heatmap overlays: the same per-row deadline, for the same reason.
+    # A heat picture of a period whose footage is gone has nothing left to
+    # check it against, so it goes when the footage does.
+    global _heatmap_retention_task
+    _heatmap_retention_task = asyncio.create_task(
+        leader.run_as_leader("heatmap_retention", heatmaps_svc.retention_loop),
+        name="heatmap_retention")
+    log.info("startup.heatmap_retention_started")
+
+    # 6c-bis-ii. Time-lapse: capture (stills on each camera's schedule), render
+    # (the video queue + the nightly "yesterday"), retention (expiry + size
+    # caps). All leader-only: two replicas capturing would double every still
+    # and two renderers would race for the same queue row.
+    global _timelapse_capture_task, _timelapse_render_task, _timelapse_retention_task
+    _timelapse_capture_task = asyncio.create_task(
+        leader.run_as_leader("timelapse_capture", timelapse_svc.capture_loop),
+        name="timelapse_capture")
+    _timelapse_render_task = asyncio.create_task(
+        leader.run_as_leader("timelapse_render", timelapse_svc.render_loop),
+        name="timelapse_render")
+    _timelapse_retention_task = asyncio.create_task(
+        leader.run_as_leader("timelapse_retention", timelapse_svc.retention_loop),
+        name="timelapse_retention")
+    log.info("startup.timelapse_started")
+
+    # 6c-ter. Playback presence (person/vehicle markers): the same per-row
+    # deadline — a marker over footage that aged out points at nothing.
+    global _presence_retention_task
+    _presence_retention_task = asyncio.create_task(
+        leader.run_as_leader("presence_retention", timeline_svc.retention_loop),
+        name="presence_retention")
+    log.info("startup.presence_retention_started")
+
+    # 6c-quater. Cameras on a JPEG stream (registered on an i-PRO camera's first ONVIF profile) record but can never
+    # play live — HLS is H.264/H.265 only. Move them to their best video profile by themselves, audited; leader-only,
+    # a pass at start-up then every 30 min (services/stream_codec.py).
+    global _stream_codec_task
+    _stream_codec_task = asyncio.create_task(
+        leader.run_as_leader("stream_codec_repair", stream_codec_svc.repair_loop),
+        name="stream_codec_repair")
+
+    # 6c-ter. Where every PTZ camera points + the history of who moved it (services/ptz_track). Leader-only:
+    # one GetStatus per PTZ head per poll, not one per worker.
+    global _ptz_track_task
+    _ptz_track_task = asyncio.create_task(
+        leader.run_as_leader("ptz_track", ptz_track_svc.loop), name="ptz_track")
+
+    # 6d. Alerts: sweep the ones nobody resolved and nobody held. Unlike 6c
+    # there is no per-row expires_at to read — alerts are a small working set
+    # that may sit under legal hold for years, so the exemptions live in the
+    # sweep itself (see rules_engine.purge_expired_alerts).
+    global _alert_retention_task
+    _alert_retention_task = asyncio.create_task(
+        leader.run_as_leader("alert_retention", rules_engine.alert_retention_loop),
+        name="alert_retention")
+    log.info("startup.alert_retention_started")
+
+    # 6d-bis. Annotations: index any file whose row never landed. ONE worker —
+    # several would race to insert the same primary key, and the sidecar's id
+    # IS that key.
+    global _annotation_adoption_task
+    _annotation_adoption_task = asyncio.create_task(
+        leader.run_as_leader("annotation_adoption",
+                             annotation_store.adoption_loop),
+        name="annotation_adoption")
+    log.info("startup.annotation_adoption_started")
+
+    # 6d-ter. Annotations: the stills expire on their own clock. The precedent
+    # is 6c-ter (presence) — a per-row deadline on data derived from footage
+    # that has aged out. Deliberately NOT the NVR's RetentionManager, which
+    # sweeps by mtime over its own volume and cannot read `expires_at` here.
+    global _annotation_retention_task
+    _annotation_retention_task = asyncio.create_task(
+        leader.run_as_leader("annotation_retention",
+                             annotation_store.retention_loop),
+        name="annotation_retention")
+    log.info("startup.annotation_retention_started")
+
+    # 6d-quater. Annotations: drain the QA publish outbox. ONE worker, and
+    # for a different reason than its two neighbours above — they would race
+    # on a primary key, this one would send the same annotation to an external
+    # reviewer four times. Their schema's unique columns would reject three of
+    # them, so the duplicates are harmless over there; the point is that this
+    # appliance should not be generating them.
+    #
+    # Elected fail-OPEN, like the adoption and retention loops. If Valkey is
+    # gone, four workers publishing is wasteful and survivable. Fail-closed
+    # would mean a Valkey outage silently stops operator annotations reaching
+    # review, which is the worse failure of the two.
+    global _event_router_task, _event_sender_task
+    _event_router_task = asyncio.create_task(leader.run_as_leader("event_router", event_sender.router_loop), name="event_router")
+    _event_sender_task = asyncio.create_task(leader.run_as_leader("event_sender", event_sender.sender_loop), name="event_sender")
+    global _qa_sink_relay_task
+    _qa_sink_relay_task = asyncio.create_task(
+        leader.run_as_leader("qa_sink_relay", qa_sink.relay_loop),
+        name="qa_sink_relay")
+    log.info("startup.qa_sink_relay_started")
+
+    # 6e. The peripherals bridge. ONE worker subscribes: four would race on
+    # peripherals.last_state, the one column the device wall renders, and the
+    # honesty of that wall is what the whole feature rests on.
+    #
+    # run_as_leader is fail-OPEN, which is correct HERE — if Valkey is gone,
+    # several workers writing the same state value is wasteful, not wrong.
+    # It would NOT be correct for an actuation gate, which fails closed in
+    # rules_engine.may_actuate. The two rules look alike and mean the opposite.
+    #
+    # Outbound commands are deliberately NOT elected: any worker may publish,
+    # several MQTT clients publishing is normal, and every v1 command is
+    # idempotent.
+    # NOT elected: every worker needs its own publish session, or three
+    # requests in four are refused with `offline`. Observed on the appliance.
+    global _bridge_publisher_task
+    _bridge_publisher_task = asyncio.create_task(
+        bridge.publisher_loop(), name="bridge_publisher")
+    # NOT elected either: every worker's HA driver must follow the connection
+    # an admin saved, or the worker that did not take the save keeps the old
+    # token. See bridge.ha_config_loop.
+    global _bridge_ha_config_task
+    _bridge_ha_config_task = asyncio.create_task(
+        bridge.ha_config_loop(), name="bridge_ha_config")
+    global _bridge_state_task, _bridge_verify_task
+    _bridge_state_task = asyncio.create_task(
+        leader.run_as_leader("bridge_state", bridge.state_loop),
+        name="bridge_state")
+    _bridge_verify_task = asyncio.create_task(
+        leader.run_as_leader("bridge_verify", bridge.verify_loop),
+        name="bridge_verify")
+    # Home Assistant's live state, over its WebSocket. Elected for the same
+    # reason as bridge_state: the wall's rows want one writer per source.
+    global _bridge_ha_state_task
+    _bridge_ha_state_task = asyncio.create_task(
+        leader.run_as_leader("bridge_ha_state", bridge.ha_state_loop),
+        name="bridge_ha_state")
+    # The durable pulse sweep. Elected for tidiness rather than safety: the
+    # claim is an UPDATE guarded on state, so a second sweep would simply find
+    # nothing — and `close` is idempotent besides.
+    global _bridge_pending_task
+    _bridge_pending_task = asyncio.create_task(
+        leader.run_as_leader("bridge_pending", bridge_pending.sweep_loop),
+        name="bridge_pending")
+    # "Until the zone is empty" holds: reads occupancy every second and ends
+    # a hold by making its OFF due, which the sweep above then sends.
+    global _bridge_hold_task
+    _bridge_hold_task = asyncio.create_task(
+        leader.run_as_leader("bridge_hold", bridge_pending.hold_loop),
+        name="bridge_hold")
+    log.info("startup.bridge_started")
+
     # 7. GPU metric sampler (topbar gauge). Off the request path by design —
     # see _gpu_sampler. Sampled once here so /health is populated immediately
     # rather than reporting "no GPU" for the first interval after a restart.
@@ -255,19 +462,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     log.info("startup.gpu_sampler_started",
              present=_gpu_state["present"], count=_gpu_state["count"])
 
-    # 8. Registry→DeepStream sync: project every camera's config to the shared
-    # directory, then push the changes into the running pipeline. The sweep
-    # runs inline here rather than only as the loop's first tick because the
-    # pipeline may be booting alongside us and reads that directory exactly
-    # once, at its own startup — the files need to be right before then.
-    global _deepstream_projection_task
-    if settings.deepstream_projection_enabled:
+    # 8. Registry→DeepStream sync: push every camera's envelope to the
+    # pipeline's control API, then keep re-asserting it. The first sweep runs
+    # inline so cameras reach an already-running pipeline without waiting a
+    # full interval; the loop re-adds whatever it loses on its own restarts.
+    global _deepstream_sync_task
+    if settings.deepstream_sync_enabled:
         await deepstream_client.sync_now("startup")
-        _deepstream_projection_task = asyncio.create_task(
+        _deepstream_sync_task = asyncio.create_task(
             leader.run_as_leader("deepstream_sync", deepstream_client.reconcile_loop), name="deepstream_sync"
         )
         log.info("startup.deepstream_sync_started",
-                 dir=settings.deepstream_config_dir, api=settings.deepstream_api_url)
+                 api=deepstream_client._base())
 
     # 9. Audit: poll Keycloak for auth events (failed logins, lockouts, logouts)
     # that never reach our handlers, and enable event storage on the realm.
@@ -279,6 +485,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         log.info("startup.audit_kc_events_started")
 
+    # 10. PTZ reaper: stops in-flight PTZ moves whose worker died before its
+    # watchdog fired (see services/ptz_control.reaper_loop). Leader-elected
+    # like the reconcile loops — one sweeper, not one per worker — and started
+    # unconditionally: it is a safety loop, not a feature toggle, and on a
+    # fleet with no PTZ cameras its sweep matches nothing.
+    global _ptz_reaper_task
+    _ptz_reaper_task = asyncio.create_task(
+        leader.run_as_leader("ptz_reaper", ptz_control.reaper_loop), name="ptz_reaper"
+    )
+    log.info("startup.ptz_reaper_started")
+
+    # 11. PTZ keep-warm. Runs in EVERY worker, deliberately NOT leader-elected:
+    # the ONVIF session pool is process-local, so each worker has to warm its
+    # own. It only acts on cameras with a live control lease or a fresh
+    # "in-play" marker, so on an idle system it does nothing each tick.
+    global _ptz_keepwarm_task
+    _ptz_keepwarm_task = asyncio.create_task(
+        ptz_control.keepwarm_loop(), name="ptz_keepwarm"
+    )
+    log.info("startup.ptz_keepwarm_started")
+
+    # 12. Loops registered by optional extensions (services/background). Started
+    # last so an extension loop can rely on everything above being up; the core
+    # names none of them.
+    background.start_all()
+
     yield
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
@@ -286,15 +518,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     for task in (_monitor_task, _relay_sync_task, _nvr_sync_task,
                  _motion_sync_task, _gpu_task,
-                 _deepstream_projection_task, _audit_kc_task,
+                 _deepstream_sync_task, _audit_kc_task,
                  _smartsearch_sync_task, _frames_sync_task,
-                 _analytics_sync_task, _events_retention_task):
+                 _analytics_sync_task, _events_retention_task,
+                 _heatmap_retention_task, _presence_retention_task, _stream_codec_task, _ptz_track_task,
+                 _timelapse_capture_task, _timelapse_render_task, _timelapse_retention_task,
+                 _alert_retention_task,
+                 _annotation_adoption_task,
+                 _annotation_retention_task,
+                 _qa_sink_relay_task, _event_router_task, _event_sender_task,
+                 _bridge_state_task, _bridge_verify_task,
+                 _bridge_pending_task, _bridge_hold_task, _bridge_publisher_task,
+                 _bridge_ha_config_task, _bridge_ha_state_task,
+                 _ptz_reaper_task, _ptz_keepwarm_task):
         if task and not task.done():
             task.cancel()
             try:
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+
+    await background.stop_all()
 
     # Close the uptime history cleanly: cameras are unmonitored from here on.
     # Runs AFTER the monitor is cancelled so no straggling poll overwrites it.
@@ -347,6 +591,15 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(
     cameras_router, prefix="/api", dependencies=[Depends(require_authenticated)]
 )
+# ONVIF PTZ. Same /api/cameras/{id}/... namespace as the cameras router but a
+# module of its own: PTZ is the only camera surface with live-control semantics
+# (control leases, a deadman watchdog, a command rate nothing else here sees).
+# Reads (capabilities, presets, status) need only an authenticated principal;
+# moving self-gates on `ptz_control` and preset/home writes on `camera_manage`,
+# declared per-route in routers/ptz.py.
+app.include_router(
+    ptz_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
 # Camera discovery (ONVIF scan / probe / promote) — native since the discovery
 # microservice was folded into this backend. Onboarding cameras is admin-only.
 app.include_router(
@@ -363,6 +616,16 @@ app.include_router(motion_router, prefix="/api/motion")
 app.include_router(
     search_router, prefix="/api/search", dependencies=[Depends(require_authenticated)]
 )
+app.include_router(search_assistant_router, prefix="/api/search", dependencies=[Depends(require_authenticated)])
+app.include_router(
+    search_planner_router, prefix="/api/search", dependencies=[Depends(require_authenticated)]
+)
+# DeepStream's door into Smart Search (observations + producer heartbeat). Only
+# the internal service key gets through, and only while DeepStream is the AI
+# engine — see routers/search_ingest.py and services/detection_engine.py.
+app.include_router(
+    search_ingest_router, prefix="/api/search", dependencies=[Depends(require_authenticated)]
+)
 # User and role administration is not mounted here: it is the identity
 # extension (backend/extensions/identity), loaded below with the others.
 # Enforcement stays core — see services/policy.py.
@@ -376,17 +639,125 @@ app.include_router(
 app.include_router(
     sitemaps_router, prefix="/api", dependencies=[Depends(require_authenticated)]
 )
+# Branding (client logo + Video Wall title). Reads for any authenticated principal;
+# changes are admin-only inside the router.
+app.include_router(
+    branding_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# Administration → DeepStream: admin-only proxy onto the pipeline's model API
+# (list / upload ONNX / restart). Admin is enforced per-route inside the router.
+app.include_router(
+    deepstream_admin_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# Camera-to-plan registration (Map tab coverage). Reads for any authenticated
+# principal — the map draws footprints for everyone who can see the map — while
+# calibrating and deleting self-gate on camera_manage inside the router, the
+# same split the sitemaps mount above uses and the same capability that guards
+# PTZ presets and home positions.
+app.include_router(
+    registration_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+app.include_router(
+    registration_plan_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# Home Assistant connection and entity import. Every route self-gates inside
+# the router: the connection (a token with owner rights over HA) is admin-only,
+# listing and importing entities is peripheral_manage.
+app.include_router(
+    homeassistant_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
 # Peripherals inventory. Reads for any authenticated principal (the page is
 # gated by the ui-only `peripherals` capability); writes self-gate on the
 # grantable peripheral_manage capability inside the router.
 app.include_router(
     peripherals_router, prefix="/api", dependencies=[Depends(require_authenticated)]
 )
+# Automation rules (migration 039). Reads are open to any authenticated
+# principal — the SPA shows the disarm banner to everyone who can see the page —
+# and every write self-gates on the grantable `rule_manage` capability inside
+# the router. Arming is the authority that matters and it has its own endpoint;
+# see routers/rules.py.
+app.include_router(
+    rules_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# The alerts those rules raise. Reads self-gate on `alerts_view` and the
+# state-machine writes on `alerts_ack` — separate capabilities, because seeing
+# what fired and marking it handled are different authorities.
+app.include_router(
+    alerts_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
 # AI activity events. POST is the pipeline's ingest and self-gates on the
 # internal key; reads self-gate on the ai_analytics capability — see
 # routers/events.py.
 app.include_router(
     events_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# Heatmap overlays. POST is the analytics service's upload and self-gates on
+# the internal key; reads self-gate on `ai_analytics` (a heatmap is a record of
+# where people were) and the runtime switch on `camera_manage` — see
+# routers/heatmaps.py.
+app.include_router(
+    heatmaps_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# AI detection status for Administration -> System health: which model and
+# runtime, why, and whether it keeps up. A read-only summary, never a proxy to
+# the analytics API (which can add and remove cameras) — see the router.
+app.include_router(
+    analytics_engine_router, prefix="/api", dependencies=[Depends(require_role("admin"))]
+)
+# Time-lapse. Every route self-gates on timelapse_view / timelapse_manage — see
+# routers/timelapse.py for why those, and why a download needs only the first.
+app.include_router(
+    timelapse_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# People Distribution (zone occupancy). Same shape as the heatmap above: POST is
+# the pipeline's ingest and self-gates on the internal key, reads self-gate on
+# `ai_analytics` because where people stood is a record about people. Numbers
+# only -- no images, no object store, and no events.
+app.include_router(
+    people_distribution_router, prefix="/api",
+    dependencies=[Depends(require_authenticated)]
+)
+# Playback timeline presence (person/vehicle markers). POST is the analytics
+# service's ingest and self-gates on the internal key; reads self-gate on
+# ai_analytics — see routers/timeline.py.
+app.include_router(
+    timeline_router, prefix="/api", dependencies=[Depends(require_authenticated)]
+)
+# Data Collection (AI Workspace). Every route self-gates on the grantable
+# `data_collection` capability inside the router — it is server-enforced, not a
+# page toggle, because collection writes footage-derived stills to disk and can
+# push them to an external annotation service. The include-level
+# require_authenticated is belt to that suspenders: it adds nothing for a
+# correctly-gated route, and it means a future route added to this router
+# without its capability dependency fails closed (401) instead of open — the
+# same posture every other capability-gated mount here already has, and the
+# invariant the authz-wiring test on the ai branch asserts structurally.
+# Operator-drawn boxes. Creating one is gated on `playback_search` (it is an
+# operator act); managing the pile is gated on `data_collection`. Both live in
+# the router, which is why routers/nvr.py no longer carves annotations out.
+app.include_router(
+    annotations_router, prefix="/api",
+    dependencies=[Depends(require_authenticated)])
+# The label taxonomy those datasets and annotations are labelled against.
+# Writes are admin — naming the fleet's vocabulary is administration. The LIST
+# is not: it feeds the annotate picker on Playback, and gating it on admin
+# meant a non-admin could be allowed to draw a box and unable to choose a
+# class for it. See routers/label_classes.py.
+app.include_router(
+    label_classes_router, prefix="/api",
+    dependencies=[Depends(require_authenticated)])
+# Where drawn boxes go for review by somebody who is not on this appliance.
+# Admin-only throughout, read included — and for a stronger reason than the
+# taxonomy next door: this form is the decision to send frames of identifiable
+# people off the box, to a system an erasure request raised here cannot reach.
+app.include_router(event_integrations_router, prefix="/api", dependencies=[Depends(require_authenticated)])
+app.include_router(event_feed_router, prefix="/api", dependencies=[Depends(require_authenticated)])
+app.include_router(
+    qa_sink_router, prefix="/api",
+    dependencies=[Depends(require_authenticated)])
+app.include_router(
+    datasets_router, prefix="/api", dependencies=[Depends(require_authenticated)]
 )
 # Live-preview HLS relay → MediaMTX. Unauthenticated and streamed, mirroring the
 # Caddy /hls/* handler, so a single-port front door (cloudflared) can serve the

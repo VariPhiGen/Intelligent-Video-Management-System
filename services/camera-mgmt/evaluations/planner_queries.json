@@ -1,0 +1,1752 @@
+[
+  {
+    "query": "Find a person wearing a red shirt on cam2 yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on North Gate yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on Yard yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on cam2 today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on North Gate today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on Yard today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on cam2 in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on North Gate in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on Yard in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on cam2 on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on North Gate on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on Yard on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on cam2",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on North Gate",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt on Yard",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a red shirt",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "shirt"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on cam2 yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on North Gate yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on Yard yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on cam2 today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on North Gate today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on Yard today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on cam2 in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on North Gate in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on Yard in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on cam2 on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on North Gate on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on Yard on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on cam2",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on North Gate",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket on Yard",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person wearing a blue jacket",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "blue",
+        "jacket"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on cam2 yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on North Gate yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on Yard yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack yesterday at 10 PM",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on cam2 today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on North Gate today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on Yard today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack today",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on cam2 in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on North Gate in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on Yard in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack in the last 30 minutes",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on cam2 on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on North Gate on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on Yard on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on 2026-10-20",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on cam2",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on North Gate",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack on Yard",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a person with a black backpack",
+    "domain": "people",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "black",
+        "backpack"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on cam2 yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on North Gate yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on Yard yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on cam2 today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on North Gate today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on Yard today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on cam2 in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on North Gate in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on Yard in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on cam2 on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on North Gate on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on Yard on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on cam2",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on North Gate",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car on Yard",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a white car",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "white",
+        "car"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on cam2 yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on North Gate yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on Yard yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck yesterday at 10 PM",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "point",
+        "day_offset": -1,
+        "start_time": "22:00:00"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on cam2 today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on North Gate today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on Yard today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck today",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "day_offset": 0
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on cam2 in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on North Gate in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on Yard in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck in the last 30 minutes",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "recent",
+        "recent_minutes": 30
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on cam2 on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on North Gate on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on Yard on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on 2026-10-20",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "day",
+        "date": "2026-10-20"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on cam2",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "cam2"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on North Gate",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "North Gate"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck on Yard",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [
+        "Yard"
+      ],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  },
+  {
+    "query": "Find a red truck",
+    "domain": "vehicles",
+    "timezone": "Asia/Kolkata",
+    "expected": {
+      "camera_refs": [],
+      "time": {
+        "kind": "none"
+      },
+      "visual_terms": [
+        "red",
+        "truck"
+      ]
+    }
+  }
+]

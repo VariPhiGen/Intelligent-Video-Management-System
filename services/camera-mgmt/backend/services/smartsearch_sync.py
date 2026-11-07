@@ -25,6 +25,7 @@ import httpx
 import structlog
 
 from ..config import settings
+from . import retention_units
 
 log = structlog.get_logger(__name__)
 
@@ -60,28 +61,34 @@ def _stream_url(slug: str) -> str:
     return f"rtsp://{settings.nvr_record_host}:{settings.rtsp_port}/{slug}"
 
 
-def effective_retention_days(retention_days: Optional[int]) -> int:
-    """The camera's recording retention as a CONCRETE number of days.
+def effective_retention_minutes(retention_minutes: Optional[int]) -> int:
+    """The camera's recording retention as a CONCRETE number of MINUTES.
 
     Resolved here rather than pushed as None-means-default, because "default"
     means two different numbers on either side of this call: the NVR falls back
-    to ``nvr_default_retention_days`` and the index to its own
+    to its own appliance default and the index to its own
     ``SEARCH_RETENTION_DAYS``, and nothing keeps those two in step. An appliance
     dropped to a two-day recording policy would keep thirty days of crops cut
     from that footage — the index outliving the recording it describes, which is
     the exact failure this sync exists to prevent. Sending the resolved figure
     makes the index follow the footage by construction.
+
+    Minutes for the same reason the column is minutes: a camera kept for twenty
+    minutes must not leave a day of person crops behind it. The crop IS the
+    footage as far as a data subject is concerned, and the granularity of the
+    promise has to match the granularity of the policy.
     """
-    return retention_days or settings.nvr_default_retention_days
+    return retention_units.effective_retention_minutes(retention_minutes)
 
 
 async def add_camera(slug: str, domains: Optional[list[str]] = None,
-                     retention_days: Optional[int] = None) -> bool:
+                     retention_minutes: Optional[int] = None) -> bool:
     """Start indexing ``slug`` from its relay URL. 409 (already there) is OK."""
     params: list[tuple[str, str]] = [("rtsp_url", _stream_url(slug))]
     for d in domains or []:
         params.append(("domains", d))
-    params.append(("retention_days", str(effective_retention_days(retention_days))))
+    params.append(("retention_minutes",
+                   str(effective_retention_minutes(retention_minutes))))
     try:
         resp = await _get_client().post(f"{_base()}/cameras/{slug}", params=params)
         if resp.status_code in (200, 409):
@@ -110,18 +117,18 @@ async def remove_camera(slug: str) -> bool:
 
 
 async def restart_camera(slug: str, domains: Optional[list[str]] = None,
-                         retention_days: Optional[int] = None) -> bool:
+                         retention_minutes: Optional[int] = None) -> bool:
     """Re-assert a camera's desired state.
 
     No longer a remove+add: ``add_camera`` is an upsert upstream, so this is one
     idempotent instruction. The pair was a race with four reconcile loops
     running, and it also dropped the capture thread on a mere domain change.
     """
-    return await add_camera(slug, domains, retention_days)
+    return await add_camera(slug, domains, retention_minutes)
 
 
 async def list_cameras() -> Optional[dict[str, tuple[list[str], Optional[int]]]]:
-    """Slug → (indexed domains, retention days), or None if unreachable.
+    """Slug → (indexed domains, retention MINUTES), or None if unreachable.
 
     Returns the STATE, not just the names: reconcile has to be able to notice a
     camera that is present but indexing the wrong things, or holding them for
@@ -133,7 +140,7 @@ async def list_cameras() -> Optional[dict[str, tuple[list[str], Optional[int]]]]
         resp = await _get_client().get(f"{_base()}/cameras")
         resp.raise_for_status()
         body: dict[str, Any] = resp.json()
-        return {c["name"]: (list(c.get("domains") or []), c.get("retention_days"))
+        return {c["name"]: (list(c.get("domains") or []), c.get("retention_minutes"))
                 for c in body.get("cameras", [])}
     except (httpx.HTTPError, ValueError) as exc:
         log.warning("smartsearch.sync.list.unreachable", error=str(exc))
@@ -161,7 +168,7 @@ async def reconcile(desired: dict[str, tuple[list[str], Optional[int]]],
     for slug in sorted(set(desired) & set(current)):
         had_domains, had_retention = current[slug]
         want_domains, want_retention = desired[slug]
-        want_retention = effective_retention_days(want_retention)
+        want_retention = effective_retention_minutes(want_retention)
         # Retention drift is checked alongside domain drift because it has the
         # same failure shape and a worse consequence: a push that failed leaves
         # the index holding crops past the deadline the camera advertises, and
@@ -181,12 +188,13 @@ async def reconcile(desired: dict[str, tuple[list[str], Optional[int]]],
 async def reconcile_loop() -> None:
     """Background task: periodic registry→index reconciliation.
 
-    Desired set is every ENABLED, REGISTERED camera that has not opted OUT
-    (migration 030, default true). An opt-OUT rather than an opt-in, because
-    search covering only some cameras is worse than search covering all of them:
-    a nil result reads as "this person was never recorded" rather than "this
-    camera was never indexed". The SPA carries `search_indexing` on every camera
-    so it can tell those two apart wherever results are shown.
+    Desired set is every ENABLED, REGISTERED camera that has opted IN
+    (`search_indexing`, default FALSE since migration 038) and has at least one
+    domain selected. It shipped as an opt-OUT and the reason was real — a nil
+    result reads as "this person was never recorded" rather than "this camera
+    was never indexed" — but that is an argument for SAYING which cameras were
+    not looked at, not for indexing every camera an operator ever registers. The
+    SPA carries `search_indexing` on every camera and names the gaps.
     """
     from sqlalchemy import select
 
@@ -202,7 +210,7 @@ async def reconcile_loop() -> None:
                     await db.execute(
                         select(
                             Camera.slug, Camera.enabled, Camera.search_indexing,
-                            Camera.search_domains, Camera.retention_days,
+                            Camera.search_domains, Camera.retention_minutes,
                         ).where(Camera.stage == CameraStage.REGISTERED.value)
                     )
                 ).all()

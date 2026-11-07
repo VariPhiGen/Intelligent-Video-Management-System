@@ -14,11 +14,16 @@
  * `peripheralsData.ts` draws for the Peripherals pages), and the device list
  * itself is that module's demo data.
  */
-import { Fragment, useMemo } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+
+import { useToast } from '@/components/Toast';
+import { useAuth } from '@/lib/auth';
 import {
-  toneColor, type Device, type DeviceCategory,
-} from '../peripherals/peripheralsData';
+  bridgeHealth, canControl, sendCommand, type BridgeState,
+} from '@/lib/bridge';
+import { toneColor, type Device } from '../peripherals/peripheralsData';
+import { overridesFor } from '../peripherals/StatusPanel';
 import type { MapDot } from './mapHelpers';
 
 /** Shape of `GET /motion/events` entries — `camera` is the registry slug.
@@ -110,25 +115,51 @@ export function HaLayer({
 
 // ── HA control panel (right panel, view === 'ha') ────────────────────────
 
-const KIND_LABEL: Record<DeviceCategory, string> = {
-  'Lighting': 'Toggle light',
-  'Access control': 'Lock / Unlock',
-  'Audio · Sensors': 'Activate siren',
-};
-
 /** Name, kind, what the device reports, and the action a bridge would perform.
  *
- * The action button is DISABLED and says why. It used to flip local component
- * state — clicking "Lock" turned the chip to LOCKED and nothing else happened,
- * which reads as control on a page full of live camera data. There is no
- * Home-Assistant bridge, so the honest surface is a disabled button with the
- * reason attached, and a state chip that says UNKNOWN until something
- * reports one. */
+ * The action button is REAL since P2. It used to flip local component state —
+ * clicking "Lock" turned the chip to LOCKED and nothing else happened, which
+ * reads as control on a page full of live camera data. It then became a
+ * disabled button with the reason attached, which was honest while there was no
+ * bridge. Now it sends the command, and when it cannot it still says which
+ * precondition is missing — the same `canControl` the device wall uses, so the
+ * two surfaces can never disagree about whether a device may be operated. */
 export function HaControlPanel({ device }: { device: Device }) {
   const nav = useNavigate();
+  const toast = useToast();
+  const { me } = useAuth();
   const col = toneColor(device.tone);
-  const actionLabel = KIND_LABEL[device.category];
+  // The wall's own override pair, so the map and the wall always offer the
+  // same commands for a device — including an HA lock's Unlock/Lock and a
+  // scene's single Run. One button here: the half NOT already in effect.
+  const pair = overridesFor(device);
+  const next = pair.find(p => !p.active) ?? pair[0];
+  const actionLabel = next.label;
   const known = !!device.lastState;
+  const [bridge, setBridge] = useState<BridgeState>('not_configured');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    bridgeHealth()
+      .then(h => { if (!cancelled) setBridge(h.state); })
+      .catch(() => { /* leave not_configured; a failed read is not evidence */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const allowed = canControl(me?.permissions, device, bridge);
+  const command = next.command;
+
+  async function press() {
+    setBusy(true);
+    try {
+      await sendCommand(device.id, command);
+      toast(`${device.name}: ${command} sent`);
+    } catch (e: any) {
+      toast(`${device.name}: ${e.message}`, 'err');
+    }
+    setBusy(false);
+  }
 
   return (
     <>
@@ -153,14 +184,20 @@ export function HaControlPanel({ device }: { device: Device }) {
           Bridge address: <code>{device.externalId}</code>
         </div>
       )}
-      <button className="btn btn-sm" style={{ width: '100%', marginBottom: 10 }} disabled
-        title="No Home-Assistant bridge is configured — nothing can switch this device yet">
-        {actionLabel}
+      <button className="btn btn-sm" style={{ width: '100%', marginBottom: 10 }}
+        disabled={!allowed.ok || busy}
+        title={allowed.ok ? `${actionLabel} ${device.name}` : allowed.reason}
+        onClick={press}>
+        {busy ? '…' : actionLabel}
       </button>
-      <div style={{ fontSize: 11, color: 'var(--dim)', marginBottom: 14, lineHeight: 1.5 }}>
-        Control needs the Home-Assistant bridge. Placement and inventory are live;
-        switching a device is not.
-      </div>
+      {!allowed.ok && (
+        // The reason, in the panel as well as the tooltip: on a map a tooltip
+        // is easy to miss and a dead button with no explanation reads as a
+        // broken product.
+        <div style={{ fontSize: 11, color: 'var(--dim)', marginBottom: 14, lineHeight: 1.5 }}>
+          {allowed.reason}
+        </div>
+      )}
       <button className="btn-primary btn-sm" style={{ width: '100%' }} onClick={() => nav('/peripherals')}>
         Open peripherals →
       </button>

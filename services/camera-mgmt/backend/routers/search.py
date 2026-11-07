@@ -291,8 +291,13 @@ async def searchable_cameras(
 
 
 @router.post("/plates")
+async def plates_route(body: PlatesQuery, request: Request, db: AsyncSession = Depends(get_db)):
+    return await search_plates(body, request, db)
+
+
 async def search_plates(
-    body: PlatesQuery, request: Request, db: AsyncSession = Depends(get_db)
+    body: PlatesQuery, request: Request, db: AsyncSession = Depends(get_db),
+    *, camera_slugs: Optional[list[str]] = None
 ) -> dict[str, Any]:
     """Plate sightings for this VMS's cameras, grouped by plate.
 
@@ -314,6 +319,9 @@ async def search_plates(
         if body.camera not in slugs:
             raise HTTPException(404, detail="Unknown camera")
         slugs = [body.camera]
+    if camera_slugs is not None:
+        cameras = [c for c in cameras if c.slug in camera_slugs]
+        slugs = [s for s in slugs if s in camera_slugs]
     if not slugs:
         return {"plates": [], "plates_active": None, "sightings": 0, "cameras": 0}
 
@@ -451,10 +459,23 @@ async def _finish(
 async def search_people(
     body: PeopleQuery, request: Request, db: AsyncSession = Depends(get_db)
 ) -> dict[str, Any]:
+    return await execute_people(body, request, db)
+
+
+async def execute_people(
+    body: PeopleQuery, request: Request, db: AsyncSession, *,
+    camera_slugs: Optional[list[str]] = None,
+    searchable: Optional[tuple[list[Camera], Optional[dict[str, dict]]]] = None,
+) -> dict[str, Any]:
+    """The person search. `camera_slugs` narrows the searchable set (None = all
+    of it); `searchable` lets a caller that already fetched the inventory skip
+    a second recorder round-trip."""
     principal = await get_principal(request)
     await policy_svc.require(principal, CAPABILITY)
 
-    cameras, recorder = await _searchable(db)
+    cameras, recorder = searchable if searchable is not None else await _searchable(db)
+    if camera_slugs is not None:
+        cameras = [c for c in cameras if c.slug in camera_slugs]
     slugs = [c.slug for c in cameras if c.slug and (recorder is None or c.slug in recorder)]
 
     sensor_id: Optional[str] = None
@@ -535,6 +556,17 @@ async def search_people(
 
 
 @router.post("/people/by-image")
+async def people_image_route(
+    request: Request, top_k: int = Query(default=24, ge=1, le=96),
+    score_threshold: float = Query(default=.15, ge=0, le=1),
+    camera: Optional[str] = Query(default=None, max_length=255),
+    time_from: Optional[str] = Query(default=None, max_length=64),
+    time_to: Optional[str] = Query(default=None, max_length=64),
+    db: AsyncSession = Depends(get_db),
+):
+    return await search_people_by_image(request, top_k, score_threshold, camera, time_from, time_to, db)
+
+
 async def search_people_by_image(
     request: Request,
     top_k: int = Query(default=24, ge=1, le=96),
@@ -543,6 +575,7 @@ async def search_people_by_image(
     time_from: Optional[str] = Query(default=None, max_length=64),
     time_to: Optional[str] = Query(default=None, max_length=64),
     db: AsyncSession = Depends(get_db),
+    *, camera_slugs: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Search-by-example: the body is a crop image (raw JPEG bytes — typically a
     box the operator drew on a playback frame), everything else mirrors
@@ -566,6 +599,9 @@ async def search_people_by_image(
     cameras, recorder = await _searchable(db)
     slugs = [c.slug for c in cameras if c.slug and (recorder is None or c.slug in recorder)]
 
+    if camera_slugs is not None:
+        cameras = [c for c in cameras if c.slug in camera_slugs]
+        slugs = [s for s in slugs if s in camera_slugs]
     sensor_ids: Optional[list[str]] = slugs
     if camera:
         match = next((c for c in cameras if c.slug == camera), None)
@@ -848,16 +884,37 @@ async def recent_faces(
 async def search_vehicles(
     body: VehiclesQuery, request: Request, db: AsyncSession = Depends(get_db)
 ) -> dict[str, Any]:
+    return await execute_vehicles(body, request, db)
+
+
+async def execute_vehicles(
+    body: VehiclesQuery, request: Request, db: AsyncSession, *,
+    camera_slugs: Optional[list[str]] = None,
+    registered: Optional[list[Camera]] = None,
+) -> dict[str, Any]:
+    """The vehicle search. `camera_slugs` narrows the registry (None = every
+    camera, unfiltered upstream); `registered` reuses a caller's lookup."""
     principal = await get_principal(request)
     await policy_svc.require(principal, CAPABILITY)
 
-    cameras = await _registered(db)
+    cameras = registered if registered is not None else await _registered(db)
     # A named camera narrows the search in the index rather than after it, so
     # the recent window fills with that camera's vehicles instead of being
     # filled by the busiest one and then emptied by the filter. Validated
     # against the registry: an unknown slug is a 404, never an unfiltered
     # search, which is how the retiring index once answered this.
     camera_ids: Optional[list[str]] = None
+    if camera_slugs is not None:
+        # A planner scope narrows upstream the same way. An empty scope means
+        # nothing to search — never an unfiltered one.
+        cameras = [c for c in cameras if c.slug in camera_slugs]
+        camera_ids = [c.slug for c in cameras if c.slug]
+        if not camera_ids:
+            return await _finish(
+                request, principal, domain="vehicles", query=body.query, top_k=body.top_k,
+                scoped=search_scope.ScopeResult(), upstream_count=0,
+                extra_detail={"camera": body.camera}, shape=lambda item: {},
+            )
     if body.camera:
         match = next((c for c in cameras if c.slug == body.camera), None)
         if match is None:

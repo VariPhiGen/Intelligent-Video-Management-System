@@ -44,7 +44,13 @@ export function formatAction(e: AuditEntry): string {
     case 'camera.created': return `Camera added${suffix}`;
     case 'camera.deleted': return `Camera deleted${suffix}`;
     case 'retention.changed':
-      return `Retention changed${d.retention_days != null ? ` · ${d.retention_days} days` : ' · reset to default'}`;
+      // `retention` is the server's human spelling ("45 minutes" / "30 days").
+      // `retention_minutes` is the exact figure it was rendered from, and the
+      // fallback for an entry written before the label was recorded.
+      return `Retention changed${
+        d.retention ? ` · ${d.retention}`
+        : d.retention_minutes != null ? ` · ${d.retention_minutes} minutes`
+        : ' · reset to default'}`;
     case 'user.created': return `User invited${suffix}`;
     case 'user.updated': return `User updated${suffix}`;
     case 'user.deleted': return `User deleted${suffix}`;

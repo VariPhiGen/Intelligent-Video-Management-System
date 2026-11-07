@@ -1,9 +1,9 @@
 """retention.py — the timer that keeps the index bounded.
 
-`store.write_batch` stamps every row with `expires_at` from `retention_days`,
+`store.write_batch` stamps every row with `expires_at` from `retention_minutes`,
 and until this existed **nothing ever acted on it**. There was a sweep —
 `scripts/retention.py` — but no cron entry, no compose sidecar and no thread
-called it, so `retention_days: 30` was policy on paper: rows and their JPEGs
+called it, so `retention_minutes: 43200` was policy on paper: rows and their JPEGs
 accumulated forever, at ~5.7 kB per row plus the crop, on a service whose own
 plan named storage as the binding constraint.
 
@@ -91,7 +91,16 @@ class RetentionThread:
         # common sweep expensive. 0 disables it.
         self._crop_root = crop_root
         self._orphan_every_n = int(orphan_every_n)
-        self._interval = float(interval_seconds)
+        # Ceiling, not the interval itself. Expiry is stamped from each
+        # camera's RECORDING retention, which can now be minutes, and an
+        # hourly sweep would leave a twenty-minute camera's crops searchable
+        # for up to eighty — the index outliving the footage by four times the
+        # policy, which is the exact failure this module exists to prevent.
+        # `_sweep_interval` divides the shortest retention on the appliance by
+        # SWEEP_DIVISOR and clamps it into [MIN_INTERVAL, _max_interval],
+        # mirroring the recorder's own pacing (nvr/storage/retention.py) so the
+        # two services delete on comparable clocks.
+        self._max_interval = float(interval_seconds)
         # Not at t=0: boot is when the database is least likely to be up and
         # most likely to be busy, and a sweep that fails there just logs an
         # error into the first page of the service's life. A minute in, the
@@ -103,26 +112,54 @@ class RetentionThread:
         self._last: dict[str, Any] | None = None
         self._sweeps = 0
 
+    #: Sweep at least this many times per retention period, bounding how long
+    #: an expired row can outlive its deadline at 1/4 of the period. Matches
+    #: the recorder's RetentionManager.SWEEP_DIVISOR.
+    SWEEP_DIVISOR = 4
+    #: Never sweep more often than this, whatever the retention. A sweep is a
+    #: DELETE over every domain table; a crop cannot be finer-grained than the
+    #: minute of footage it came from anyway.
+    MIN_INTERVAL_S = 60.0
+
     @property
     def enabled(self) -> bool:
         """0 or negative disables the sweep — for an operator who runs the
         script from cron instead, or is debugging what a sweep deleted."""
-        return self._interval > 0
+        return self._max_interval > 0
+
+    def _sweep_interval(self) -> float:
+        """How long to wait before the next sweep.
+
+        Derived after every pass rather than once at startup: the registry
+        pushes retention changes at runtime, so a camera dropped to twenty
+        minutes has to pull the sweep in without a restart. A fleet on the
+        default thirty days gets the configured interval exactly as before.
+        """
+        try:
+            shortest = self._store.shortest_retention_minutes()
+        except Exception:  # noqa: BLE001 — pacing must never kill the thread
+            log.exception("Retention: could not read shortest retention")
+            return self._max_interval
+        if not shortest or shortest <= 0:
+            return self._max_interval
+        want = (shortest * 60.0) / self.SWEEP_DIVISOR
+        return min(self._max_interval, max(self.MIN_INTERVAL_S, want))
 
     def start(self) -> None:
         if not self.enabled:
             log.warning(
                 "Retention sweep DISABLED (interval=%s). Expired rows and crop "
                 "files will accumulate until scripts/retention.py is run by hand.",
-                self._interval)
+                self._max_interval)
             return
         if self._thread is not None:
             return
         self._thread = threading.Thread(
             target=self._run, name="retention-sweep", daemon=True)
         self._thread.start()
-        log.info("Retention sweep every %.0fs (first in %.0fs)",
-                 self._interval, self._initial_delay)
+        log.info("Retention sweep at most every %.0fs (first in %.0fs); the "
+                 "actual cadence follows the shortest camera retention",
+                 self._max_interval, self._initial_delay)
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -196,7 +233,7 @@ class RetentionThread:
                 # for anything else, because a thread that dies takes the only
                 # bound on index growth with it and says nothing.
                 log.exception("Retention sweep raised — thread continuing")
-            self._stop.wait(self._interval)
+            self._stop.wait(self._sweep_interval())
 
     def snapshot(self) -> dict[str, Any]:
         """Lock-free-ish view for /health. Never blocks on a running sweep."""
@@ -204,7 +241,12 @@ class RetentionThread:
             last, sweeps = self._last, self._sweeps
         return {
             "enabled": self.enabled,
-            "interval_seconds": self._interval if self.enabled else None,
+            # What the NEXT wait will be, not the configured ceiling: on an
+            # appliance with a minute-scale camera those differ by an order of
+            # magnitude, and /health reporting the ceiling would describe a
+            # cadence the service is not running on.
+            "interval_seconds": (self._sweep_interval() if self.enabled else None),
+            "max_interval_seconds": self._max_interval if self.enabled else None,
             "orphan_sweep_every_n": (self._orphan_every_n
                                      if self.orphan_sweep_enabled else None),
             # None means nothing is reconciling the index against the

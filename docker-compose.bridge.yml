@@ -40,6 +40,11 @@ services:
       # (172.16.0.0/12). Linux uses the base file alone and keeps loopback binds.
       MTX_RTSPADDRESS:    "0.0.0.0:8654"
       MTX_RTSPSADDRESS:   "0.0.0.0:8322"
+      # Same reason for the UDP/RTP pair (base file pins them to 127.0.0.1:8656/7,
+      # off MediaMTX's default :8000/:8001 so they cannot collide with whatever
+      # else holds those ports on the appliance).
+      MTX_RTPADDRESS:     "0.0.0.0:8656"
+      MTX_RTCPADDRESS:    "0.0.0.0:8657"
       MTX_APIADDRESS:     "0.0.0.0:9987"
       MTX_METRICSADDRESS: "0.0.0.0:9988"
 
@@ -105,6 +110,18 @@ services:
       SMARTSEARCH_API_URL:   ${SMARTSEARCH_API_URL-http://smartsearch:8013}
       SMARTSEARCH_INDEX_URL: ${SMARTSEARCH_INDEX_URL-http://smartsearch:8013}
       KEYCLOAK_ADMIN_URL:  http://keycloak:${KEYCLOAK_PORT:-8085}
+      # The heatmap object store, and the same loopback trap as the NVR, motion
+      # and Smart Search entries above: `minio` publishes 9000 on the HOST's
+      # loopback for the Linux/host-network deployment, but in bridge mode
+      # 127.0.0.1 inside the api container is the api itself, so the base
+      # file's default (and any .env carrying it) resolves to nothing and every
+      # archived heatmap fails with "Could not connect to the endpoint URL".
+      # The live overlay still works when this is wrong -- it stays in its row --
+      # so the failure shows up only at the first half-hour boundary, hours
+      # after a deployment looked healthy. Hence unconditional, not
+      # `${VAR-default}`: there is no bridge-mode deployment for which a
+      # loopback S3 endpoint is correct.
+      HEATMAP_S3_ENDPOINT: http://minio:9000
       RELAY_INTERNAL_HOST: mediamtx
       OIDC_JWKS_URL:       http://keycloak:${KEYCLOAK_PORT:-8085}/realms/vms/protocol/openid-connect/certs
 
@@ -130,6 +147,9 @@ services:
       # where nothing reads it, and the alternative is a "Connection refused"
       # loop that only appears once someone layers the overlay.
       REDIS_URL: redis://redis:6379/0
+      # Motion activity goes to the api by service name: the base file's
+      # 127.0.0.1 is this container's own loopback on the bridge.
+      MOTION_EVENTS_URL: http://api:${API_PORT:-8091}
 
   # Analytics IS host-networked in the base file now (it has to reach the
   # frame broker and Smart Search, both host-networked there), so it needs the

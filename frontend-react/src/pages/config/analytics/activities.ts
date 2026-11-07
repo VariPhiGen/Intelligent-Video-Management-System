@@ -39,6 +39,8 @@ export type ActivityStatus = 'available' | 'hold' | 'unregistered';
 export type ZoneRule = 'optional' | 'required' | 'tripwire';
 
 export interface ActivityMeta {
+  search_aliases?: string[];
+  suggested_aliases?: string[];
   key: string;
   label: string;
   color: string;

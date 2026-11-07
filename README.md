@@ -1,26 +1,77 @@
 # Variphi VMS
 
-An on-premise video management system — a network video recorder for IP
-cameras. Find the cameras on your network, pull each one exactly once, record
-them continuously, and get clips and snapshots back out, behind one web UI and
-one login.
+**Live video. Searchable recordings. AI analytics. On your hardware.**
 
-It runs entirely on hardware you control: `./vms up -d` brings the whole stack
-up in Docker on a single host, with no cloud account and no phone-home.
+Variphi VMS brings IP cameras, continuous recording, playback, and AI analytics
+into one web workspace with one login. Watch a site live, follow activity on a
+recording timeline, and understand how people use a space through occupancy
+and dwell-time trends.
+
+It runs entirely on hardware you control: `./vms up -d` brings the stack up in
+Docker on a single host, with no cloud account and no phone-home.
+
+[Product tour](#product-tour) · [Features](#features) · [Quick start](#quick-start) · [Architecture](#architecture)
 
 Licensed under **AGPL-3.0** — see [`LICENSE`](LICENSE), and [`NOTICE`](NOTICE)
 for third-party attribution.
 
-```
-Browser ── Keycloak login (OIDC) ──▶  Variphi SPA + API  :8091 (API_PORT)
-                                        │ /api/cameras       unified camera table (Postgres)
-                                        │ /api/discovery/*   native ONVIF scan / probe / promote
-                                        │ /api/nvr/*         → NVR service :8009 (127.0.0.1 only)
-                                        ▼
-   cameras ──single pull──▶ MediaMTX :8654 ──▶ rtsp://<SERVER_IP>:8654/<slug>
-                                        │                      ▲
-                                        └── NVR records from the relay ── consumers (DeepStream etc.)
-```
+## Product tour
+
+Real product screens from a running Variphi deployment. For publication, people
+in the footage are pixelated, burned-in camera text and wall signage are blurred,
+and site-specific camera names and addresses are replaced; the charts, counts and
+event markers are as captured. Click any screenshot to view it at full size.
+
+### Watch live
+
+Open a camera from the live grid for a larger view, recording status, camera
+health, snapshot tools, and a direct path into playback. Multi-camera grids
+and a dedicated video wall support wider site monitoring.
+
+[![Variphi Live View showing an indoor sports hall, recording status, camera list, and playback shortcut](assets/screenshots/live-auditorium-2.png)](assets/screenshots/live-auditorium-2.png)
+
+### Investigate recordings with AI markers
+
+Scrub recorded footage with **person presence and people-gathering markers**
+alongside recording coverage. Use previous/next marker controls to step through
+activity, change the timeline scale, and inspect the corresponding video.
+
+[![Recorded video with person and people-gathering markers, a time ruler, and playback controls](assets/screenshots/playback-ai-markers.png)](assets/screenshots/playback-ai-markers.png)
+
+### Find footage with Smart Search
+
+Describe a person's appearance in plain language, narrow the search by camera
+and time, and open a matching result in playback. Here, **“person in a white
+shirt”** returns matches from one camera, with the matched person highlighted in
+each preview.
+
+[![Smart Search results for person in a white shirt on one camera, showing highlighted people, similarity scores, camera filters, and Open Playback buttons](assets/screenshots/smart-search-auditorium-2.png)](assets/screenshots/smart-search-auditorium-2.png)
+
+### Understand people distribution
+
+For a single camera, People Distribution combines current zone counts with
+historical occupancy and dwell time. Compare peak and average people in each
+interval, then see average and longest stays across the day.
+
+[![People Distribution for one camera showing current occupancy, peak and average people in zone, and dwell-time charts](assets/screenshots/people-distribution-auditorium-2.png)](assets/screenshots/people-distribution-auditorium-2.png)
+
+### See where activity concentrates
+
+Heatmap Overlay shows where people spent time in the selected period. Here
+the overlay makes the busiest court areas visible against
+the camera image; colours are relative to the busiest spot in that period.
+
+[![Heatmap overlay highlighting activity hotspots across an indoor court](assets/screenshots/heatmap-auditorium-2.png)](assets/screenshots/heatmap-auditorium-2.png)
+
+### Explore AI analytics
+
+The AI Detections dashboard brings detection volume, camera activity, and
+object breakdowns into one view. The Events tab provides a separate activity
+feed for reviewing what happened and opening the associated footage.
+
+[![Variphi AI Detections dashboard with detection metrics, hourly activity charts, and top cameras](assets/screenshots/ai-detections.png)](assets/screenshots/ai-detections.png)
+
+[![Variphi AI Events dashboard showing recorded camera activity and event review tools](assets/screenshots/ai-events.png)](assets/screenshots/ai-events.png)
 
 ---
 
@@ -56,6 +107,8 @@ Browser ── Keycloak login (OIDC) ──▶  Variphi SPA + API  :8091 (API_PO
 | ✅ | Face detection and search-by-photo |
 | ✅ | Smart Search — forensic search by description, plate or face |
 | ✅ | AI activity events, Entry / Exit crossings, detections dashboard |
+| ✅ | People Distribution — current zone counts, peak/average occupancy, and dwell-time history |
+| ✅ | AI markers in playback — person presence, activity events, and previous/next navigation |
 | 🚧 | GPU acceleration — available as a build arg, not yet selected automatically |
 | 🗓️ | DeepStream GPU pipeline as a supported deployment shape |
 | 🗓️ | Vision-language search — describe an event in plain language ("someone leaving a bag by the gate") and find it, including relationships CLIP cannot match |
@@ -121,6 +174,17 @@ issue tracker rather than inferring one from this list.
 ---
 
 ## Architecture
+
+```
+Browser ── Keycloak login (OIDC) ──▶  Variphi SPA + API  :8091 (API_PORT)
+                                        │ /api/cameras       unified camera table (Postgres)
+                                        │ /api/discovery/*   native ONVIF scan / probe / promote
+                                        │ /api/nvr/*         → NVR service :8009 (127.0.0.1 only)
+                                        ▼
+   cameras ──single pull──▶ MediaMTX :8654 ──▶ rtsp://<SERVER_IP>:8654/<slug>
+                                        │                      ▲
+                                        └── NVR records from the relay ── consumers (DeepStream etc.)
+```
 
 Cameras live in ONE table across their whole lifecycle: a network scan inserts
 rows at `stage='discovered'`, probing/verification advance them, and promotion

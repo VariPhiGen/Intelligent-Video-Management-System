@@ -7,7 +7,10 @@ services/camera-mgmt/docs/
 .env.*
 !.env.example
 *.secret
-certs/
+# Contents, not the directory: `certs/` would also hide the README that says
+# what to drop there, and git cannot re-include a file under an ignored dir.
+**/certs/*
+!deploy/mosquitto/certs/README
 
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
@@ -58,3 +61,13 @@ npm-debug.log*
 *.onnx
 *.engine
 *.safetensors
+
+# ESPHome build output and device credentials
+deploy/esphome/.esphome/
+deploy/esphome/secrets.yaml
+
+# Arduino sketch credentials
+deploy/arduino/**/secrets.h
+
+# Arduino sketch archives — can contain secrets.h
+deploy/arduino/*.zip

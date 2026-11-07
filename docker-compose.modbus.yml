@@ -1,0 +1,17 @@
+# The RS-485 adapter for the mqtt-modbus translator.
+#
+# SEPARATE FROM docker-compose.yml BECAUSE COMPOSE WILL NOT START A CONTAINER
+# WHOSE MAPPED DEVICE IS MISSING. With MODBUS_DRY_RUN=1 there is no adapter and
+# the base file must still bring the service up. `./vms` layers this file by
+# itself when the modbus profile is on AND the path in MODBUS_PORT exists, so
+# plugging the adapter in and running `./vms up -d` is the whole procedure.
+# By hand:
+#   docker compose -f docker-compose.yml -f docker-compose.modbus.yml up -d mqtt-modbus
+services:
+  mqtt-modbus:
+    devices:
+      - "${MODBUS_PORT:-/dev/ttyUSB0}:${MODBUS_PORT:-/dev/ttyUSB0}"
+    # The device node is root:dialout 660 on the host. group_add gives the
+    # container's app user the host's dialout gid; 20 is Debian/Ubuntu's.
+    group_add:
+      - "${MODBUS_DIALOUT_GID:-20}"

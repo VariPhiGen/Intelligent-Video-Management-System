@@ -27,6 +27,7 @@ from ..models import sub_recording_name
 from ..security import get_principal
 from ..services import audit as audit_svc
 from ..services import policy as policy_svc
+from ..services import timeline as timeline_svc
 
 log = structlog.get_logger(__name__)
 router = APIRouter(tags=["nvr"])
@@ -144,6 +145,16 @@ async def _purge_all_tracks(camera: str, request: Request, principal) -> Respons
         # double-click on an empty camera must not write records an auditor
         # later reads as "evidence existed and was destroyed".
         return main_404
+    # The camera's person/vehicle presence goes with its footage: a marker over
+    # a purged timeline would describe footage nobody can see any more. Only
+    # when the main was actually purged — a failed main returned above. Not a
+    # failure of the purge if it errors (markers are not footage, and the
+    # retention sweep removes them anyway), but recorded either way.
+    if camera in results:
+        erased = await timeline_svc.erase_by_slug(camera)
+        merged["timeline_presence_deleted"] = erased
+        if erased is None:
+            log.error("nvr.purge.presence_failed", camera=camera)
     # Audited when something was deleted OR a real attempt partially failed —
     # with the failure named, so the record never reads as "both tracks clean"
     # when one was not even reachable.
@@ -152,6 +163,7 @@ async def _purge_all_tracks(camera: str, request: Request, principal) -> Respons
         detail={"segments_deleted": merged["segments_deleted"],
                 "bytes_freed": merged["bytes_freed"],
                 "tracks_purged": merged["tracks_purged"],
+                "timeline_presence_deleted": merged.get("timeline_presence_deleted"),
                 **({"sub_track_failed": sub_failure} if sub_failure else {})},
     )
     if sub_failure:
@@ -175,14 +187,13 @@ async def _purge_all_tracks(camera: str, request: Request, principal) -> Respons
 async def proxy(path: str, request: Request) -> Response:
     principal = await get_principal(request)
     if request.method != "GET":
-        # Annotation saves are an OPERATOR action (draw a box on a paused
-        # playback frame), not fleet administration — gate them on the same
-        # capability as the playback page they are drawn from, exactly the
-        # shape of motion.py's reset carve-out. Everything else mutating stays
-        # admin-only: those routes are the registry sync's, not a human's.
-        if request.method == "POST" and path.split("?", 1)[0].strip("/") == "annotations":
-            await policy_svc.require(principal, "playback_search")
-        elif not principal.has_any(frozenset({"admin"})):
+        # Annotations used to be carved out here, because a save is an operator
+        # action rather than fleet administration. They now have their own
+        # router (routers/annotations.py), which can see the label class and
+        # the index row and therefore gate and audit them properly. Everything
+        # still reaching this pass-through mutably is the registry sync's, not
+        # a human's, so admin-only is the whole rule again.
+        if not principal.has_any(frozenset({"admin"})):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Requires role: admin",
@@ -233,19 +244,6 @@ async def proxy(path: str, request: Request) -> Response:
     if action and request.method == "GET" and upstream.status_code < 400:
         await audit_svc.record(
             request, principal, action, target=path,
-            detail={k: v for k, v in request.query_params.items()} or None,
-        )
-    # Annotation saves are an evidence-adjacent act (an operator asserting
-    # "this person/object, at this instant") — record who drew what where. The
-    # payload itself is multipart, which this pass-through never parses, so the
-    # SPA duplicates camera/timestamp as query params purely for this row; the
-    # NVR reads its Form fields and ignores them.
-    if (request.method == "POST"
-            and path.split("?", 1)[0].strip("/") == "annotations"
-            and upstream.status_code < 400):
-        await audit_svc.record(
-            request, principal, "annotation.created",
-            target=request.query_params.get("camera") or "annotations",
             detail={k: v for k, v in request.query_params.items()} or None,
         )
     # Scoped erasure through the raw proxy must not be a silent path. A caller

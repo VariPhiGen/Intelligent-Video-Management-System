@@ -24,7 +24,7 @@ URL = "/api/analytics/events/entry-exit"
 NOW = datetime(2026, 9, 15, 10, 7, 13, tzinfo=timezone.utc)
 
 DOOR = SimpleNamespace(
-    id=uuid.uuid4(), slug="door-g7h8", name="Door", enabled=True, retention_days=None,
+    id=uuid.uuid4(), slug="door-g7h8", name="Door", enabled=True, retention_minutes=None,
     analytics_config={
         "regions": {
             "region_1": {"kind": "zone", "name": "Zone 1", "color": "#4fd1c5",

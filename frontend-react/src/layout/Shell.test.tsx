@@ -41,6 +41,9 @@ vi.mock('@/lib/auth', () => ({
 vi.mock('@/lib/api', () => ({
   apiFetch: async () => ({ disk: { used_pct: 10 } }),
   ApiError: class extends Error {},
+  // Base path the SPA is served under (the /vms sub-path deployment) — Shell
+  // builds its /health URL from it; '' = served at the root.
+  BASE_PREFIX: '',
 }));
 
 import { Shell } from './Shell';

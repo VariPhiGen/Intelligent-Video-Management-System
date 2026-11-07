@@ -77,7 +77,7 @@ Essential files:
 | `backend/security.py` | OIDC token validation against Keycloak |
 | `backend/urlutil.py` | RTSP credential inject/split + `redact_credentials` for logs |
 | `backend/migrate.py` | Core chain, then each extension's own chain (own version table) |
-| `migrations/versions/` | Alembic chain 001→037; numbers absent from it belong to an optional extension's own chain and version table |
+| `migrations/versions/` | Alembic chain 001→041; numbers absent from it belong to an optional extension's own chain and version table |
 
 Routers (`backend/routers/`) — the API surface:
 
@@ -88,6 +88,9 @@ Routers (`backend/routers/`) — the API surface:
 | `nvr.py` | Authenticated proxy to the NVR, including the whole-camera purge fan-out (`_purge_all_tracks` — deletes main and `<slug>_sub`, audits truthfully) |
 | `search.py` | Smart Search proxy: scopes results to this VMS's cameras, enforces the capability, audits every query |
 | `hls.py` | Unauthenticated streaming proxy to MediaMTX HLS (for single-port/tunnel fronts) |
+| `heatmaps.py` | Heatmap ingest (service principal only), overview, artifact images (ETag), per-camera sessions, the runtime switch |
+| `timelapse.py` | Per-camera time-lapse (migration 057): settings + estimate, stills by day, frame images (ETag), the render queue, video play/download. Gated by `timelapse_view` / `timelapse_manage` |
+| `timeline.py` | Playback presence: `POST /playback/timeline/presence` (service principal only), the merged person/vehicle/motion bars the playback timeline draws, and `/next` for ◀ ▶ (`ai_analytics`) |
 | `motion.py`, `users.py`, `audit.py`, `peripherals.py`, `sitemaps.py` | Motion proxy, Keycloak user admin, audit log, peripherals, site maps |
 
 Services (`backend/services/`) — the outbound half:
@@ -96,11 +99,17 @@ Services (`backend/services/`) — the outbound half:
 |---|---|
 | `relay.py` | MediaMTX path control (`add_path`/`patch_path`/`ensure_path` — ensure repoints, add does not) |
 | `nvr_client.py` | NVR sync: per-track add/remove, retention, groom (None/0/>0 = default/never/days), codec-cache invalidation, `erase_range_all_tracks` (both tracks, `missing_ok` both ways) |
-| `tracks.py` | THE definition of a camera's recording tracks (`tracks_for`), sub retention precedence, `carry_operator_settings` |
+| `tracks.py` | THE definition of a camera's recording tracks (`tracks_for`), sub retention precedence in MINUTES (`sub_retention_minutes`, clamped to the main), `carry_operator_settings` |
+| `retention_units.py` | ONE definition of what a retention period is: minutes canonical, days as an input spelling, the appliance default, and the human wording the compliance report and audit trail print |
 | `substream.py` | Sub-stream probing (`resolve_detailed` — UNREACHABLE vs NO_USABLE_SUB, so a transient outage never erases config), bitrate measurement, rtsps `-tls_verify 0` |
 | `health.py` | 30s poll: relay/NVR healing, orphan path sweep keyed on `tracks.relay_names` — relay ownership is wider than the recorder's, and keying it on the recorder's deleted live sub-track paths |
 | `smartsearch_sync.py` / `smartsearch_client.py` | Feed cameras to the index / query it; pushes each camera's retention RESOLVED to a concrete number (the two services' "defaults" are different values) and reconciles domain + retention drift; empty URL = "no index", a supported deployment |
 | `motion_client.py` | Same reconcile shape for the motion service |
+| `timeline.py` | Person/vehicle/motion PRESENCE for playback markers (`timeline_presence`, migrations 043–044): ingest only for kinds the camera produces (indexing domains; motion detection), bounded ≤10 min segments merged at the caller's pixel resolution (gaps and islands), `expires_at` from footage retention; erased by DSR and whole-camera purge; `adjacent` = next/previous marker (presence island starts and events) across all kept footage |
+| `heatmaps.py` | Heat sessions and their pictures: idempotent ingest (one `live` picture per session, replaced; one `final`; no picture archive), `expires_at` retention sweep, and the switch that freezes or closes a session without ever rewriting the schedule |
+| `heatmap_chunks.py` | 5-minute heat blocks (.npz in MinIO) and the heatmap of any range (summed, relative colour scale), drawn over ONE background frame per camera (`heatmap_backgrounds`, overwritten every 5 min) |
+| `timelapse.py` | Time-lapse: capture loop (stills from the relay on each camera's schedule; privacy masks ALWAYS blurred in before storing; skip dark / unchanged / while a PTZ is steered), object-store-or-row storage under `timelapse/{slug}/`, `expires_at` + per-camera size cap sweep, render queue (Pillow overlay → ffmpeg H.264, NVENC opt-in with x264 fallback, nightly "yesterday"), camera purge and DSR `erase_range` |
+| `snapshot.py` | ONE frame from the relay for everyone (`shared_snapshot`): keyframe-first FFmpeg passes, flat-frame retry, one decode per camera under a Valkey lock + 10 s shared cache. Used by `GET /cameras/{id}/snapshot` and the time-lapse capture loop |
 | `keycloak_admin.py`, `policy.py`, `audit.py` | User management, capability checks, audit writes |
 | `onvif_*.py`, `netscan.py`, `rtsp_verify.py`, `scan_manager.py` | Discovery internals |
 
@@ -124,7 +133,7 @@ playback. A camera with a sub track is simply two recording names
 | `recorder/stream_worker.py` | ffmpeg lifecycle, CSV-watermark indexing (filename watermark — survives ffmpeg CSV truncation), reconnect backoff, credential redaction of the command line AND relayed stderr |
 | `recorder/masking.py` | Privacy-mask burn-in (re-encode path) |
 | `storage/index.py` | Thread-safe SQLite (WAL) segment index |
-| `storage/retention.py` | Hourly eviction per recording name + emergency disk floor |
+| `storage/retention.py` | Age eviction per recording name (MINUTE-granular; the pass paces itself from the shortest retention on the box, [60 s, 1 h], while directory walks stay hourly) + emergency disk floor |
 | `storage/grooming.py` | Keyframe-only rewrite of old footage; honours per-camera 0 = never |
 | `storage/capacity.py` | Real storage cap ceiling; `detect_virtual_backing` flags WSL2/LinuxKit growable virtual disks whose free space the host cannot back |
 | `api/server.py` | Clip extraction, snapshots, coverage; playlist track selection (`covered_seconds` decides, cost breaks ties); TTL'd codec cache + explicit invalidation route |
@@ -145,9 +154,9 @@ person/vehicle/plate search through the api's `/api/search` proxy.
 | `index/embedder.py` | OpenCLIP ViT-B/32 embeddings (512-dim; changing width = re-index) |
 | `index/plates.py` | ANPR: open-baseline ONNX localiser (auto-downloads, MIT) or site-tuned weights (`SEARCH_PLATE_WEIGHTS` wins; failed custom load never falls back), fast-plate-ocr recogniser, two-line plate handling |
 | `index/motion.py` | Inline motion gate (skip inference on still frames) |
-| `index/store.py` | searchdb writes; `expires_at` stamped at insert from the camera's own retention (`set_camera_retention` restamps existing rows), falling back to `SEARCH_RETENTION_DAYS`; batched erase/expire/restamp |
+| `index/store.py` | searchdb writes; `expires_at` stamped at insert from the camera's own retention in MINUTES (`set_camera_retention` restamps existing rows), falling back to `SEARCH_RETENTION_MINUTES`; batched erase/expire/restamp |
 | `index/coverage.py` | Reconciles the index against the NVR's `GET /coverage`; erases rows whose footage is gone. Unknown coverage SKIPS, and a pass taking >50% of a camera refuses itself |
-| `index/retention.py` | Hourly expiry sweep + daily coverage sweep + daily orphan-crop sweep, composed into one pass |
+| `index/retention.py` | Expiry sweep (paced by the shortest camera retention, up to the configured hourly ceiling) + daily coverage sweep + daily orphan-crop sweep, composed into one pass |
 | `scripts/purge_unrecorded.py` | The coverage sweep on demand (`--dry-run`, `--camera`, `--force`); shares `index/coverage.py` with the thread |
 | `api/server.py` | `/person/search`, `/vehicles/search`, `/plates/search`, `/health` |
 | `migrations/` | Plain ordered SQL + `migrate.py` (one-screen runner, not alembic) |
@@ -186,12 +195,19 @@ nowhere; `./vms` layers it from the active profiles for exactly that reason.
 | `analytics/motion.py` | The gate in front of the detector (skip still frames) |
 | `analytics/sink.py` | Delivery to smartsearch; at-least-once, client-minted ids |
 | `analytics/indexing_policy.py` | What is worth indexing at all |
+| `analytics/engine.py`, `analytics/activities/` | The CPU Activity Engine: one worker per camera, activities registered in `activities/__init__.py` (tripwires, zones, stray parking, heatmap) |
+| `analytics/heatmap.py` | Heat accumulation and rendering, no frames or detector needed: a 1/4-scale float matrix, one precomputed disc per detection, blur + JET + blend at render time |
+| `analytics/heatmap_runtime.py` | Heat SESSIONS per camera (active / frozen / closed), the 60s snapshot interval, and the runtime ON/OFF switch — which is independent of the AI Config schedule |
+| `analytics/presence.py` | When each CONFIRMED track was in view: cut into ≤2 min segments, closed on tracker retirement or wall-clock idleness, posted to `/api/playback/timeline/presence` through the events sink (`ANALYTICS_PRESENCE_ENABLED`) |
+| `analytics/heatmap_sink.py` | Queued multipart delivery of each overlay to the api (`/api/analytics/heatmaps`); the events sink carries no images |
 
 ## services/motion — event detection
 
 Same shape as smartsearch's registry pattern, smaller: `api/server.py` +
 `detector/` (frame differencing per camera, events consumed by the api's
-`/api/motion` proxy and the events spine).
+`/api/motion` proxy and the events spine). `detector/activity.py` keeps RUNS of
+motion (not incidents, whose length is the cooldown) and `detector/sink.py`
+posts them to the playback timeline as `motion` presence (`MOTION_EVENTS_URL`).
 
 ## frontend-react — the SPA
 
@@ -203,10 +219,11 @@ HLS port for live view over plain HTTP).
 |---|---|
 | `src/lib/` | `api.ts` (fetch wrapper, `hlsSrc` — direct :8988 on HTTP, `/hls` proxy on HTTPS), `types.ts`, `auth.ts`, `smartsearch.ts` |
 | `src/pages/live/` | `useHls.ts` (hls.js lifecycle, sub-stream fallback), wall/expanded views |
-| `src/pages/playback/` | Timeline player over the NVR HLS VOD |
+| `src/pages/playback/` | Timeline player over the NVR HLS VOD; `timelineMarks.ts` + `Timeline.tsx` draw the marker strip (person/vehicle presence rows, AI events row) on cameras AI Config has doing something |
 | `src/pages/config/tabs/` | `RecordingTab.tsx` (mode/retention/schedule + the "AI still enabled" banner with one-click stop), `AiTab.tsx` (indexing/motion/activities), `SubTrackCard.tsx` |
 | `src/pages/admin/` | `StorageTab.tsx` + `storageRows.ts` (folds `<slug>_sub` bytes into the parent row; purge honesty), users, audit |
 | `src/pages/smartsearch/` | Search UI, ANPR panel, result cards |
+| `src/pages/analytics/` | AI tabs: events, Entry/Exit, and `HeatmapOverlayTab.tsx` + `heatmap/` (a read-only page — it polls, it never drives the analytics) |
 | `src/extensions/` | Registry for optional UI extensions (nav items, admin tabs, toolbar slots); resolves against whatever is on disk |
 
 ## Deploy & scripts

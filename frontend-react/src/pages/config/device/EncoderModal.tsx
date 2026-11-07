@@ -39,10 +39,16 @@ function ProfileCard({ camId, profile, onSaved, onError }: {
   const set = (k: string, v: string) => setD(s => ({ ...s, [k]: v }));
 
   const resList = o?.resolutions ?? [];
+  // Codecs offered: what the camera says it can do, always including the current one; H264/H265 only (JPEG/MPEG4
+  // streams aren't something to switch a camera to here).
+  const codecs = Array.from(new Set([p.encoding, ...(o?.encodings ?? [])]))
+    .filter((c): c is string => !!c && ['H264', 'H265'].includes(c));
   const curRes = p.width && p.height ? `${p.width}x${p.height}` : '';
 
   async function apply() {
-    const changes: Record<string, number> = {};
+    const changes: Record<string, number | string> = {};
+    const enc = cur('enc', p.encoding);
+    if (enc && enc !== p.encoding) changes.encoding = enc;
 
     // width+height only ever move as a pair — the API 422s on a lone one.
     const r = cur('res', curRes);
@@ -91,6 +97,20 @@ function ProfileCard({ camId, profile, onSaved, onError }: {
       </div>
 
       <div className="form-grid">
+        {codecs.length > 1 && (
+          <div className="form-group">
+            <Label hint="H264 plays in every browser">Codec</Label>
+            <select value={cur('enc', p.encoding)} onChange={e => set('enc', e.target.value)}>
+              {codecs.map(c => <option key={c} value={c}>{c === 'H265' ? 'H265 (HEVC)' : c}</option>)}
+            </select>
+            {cur('enc', p.encoding) === 'H265' && (
+              <div style={{ fontSize: 11, color: 'var(--warn, #b45309)', marginTop: 4 }}>
+                H.265 doesn't play in Firefox, in Safari for these streams, or on many Android tablets — use H264 for
+                the stream people watch live (usually the sub stream).
+              </div>
+            )}
+          </div>
+        )}
         <div className="form-group">
           <Label>Resolution</Label>
           {resList.length ? (

@@ -23,11 +23,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import settings
 from ..db import get_db
 from ..models import Camera, CameraStage
 from ..security import get_principal
-from ..services import ai_events, entry_exit
+from ..services import ai_events, entry_exit, retention_units, rules_engine
 from ..services.policy import require_capability
 
 log = structlog.get_logger(__name__)
@@ -62,17 +61,39 @@ async def ingest_events(
                              Camera.stage == CameraStage.REGISTERED.value)
     )).scalars().all()
 
+    from ..services import ptz_views
     rows, rejected = ai_events.prepare(
         body.events, {c.slug: c for c in cameras},
         now=datetime.now(timezone.utc),
-        default_retention_days=settings.nvr_default_retention_days,
+        default_retention_minutes=retention_units.default_retention_minutes(),
+        resolve=await ptz_views.event_resolver(db, list(cameras)),
     )
-    counts = await ai_events.record(db, rows) if rows else \
-        {"inserted": 0, "closed": 0, "duplicates": 0}
+    from ..services.event_delivery.envelope import CameraRef
+    refs = {c.id: CameraRef(c.id, c.slug, c.name or c.slug) for c in cameras}
+    catalog = await ai_events.load_catalog(db) if rows else {}
+    result = await ai_events.record(db, rows, cameras=refs,
+        labels={k:v['label'] for k,v in catalog.items()}) if rows else \
+        ai_events.RecordResult({"inserted": 0, "closed": 0, "duplicates": 0}, [])
     if rejected:
         log.info("ai_events.ingest.rejected", count=len(rejected),
                  reasons=sorted({r["reason"] for r in rejected}))
-    return {"received": len(body.events), **counts, "rejected": rejected}
+    # Evaluate only what was genuinely NEW. A producer replaying its buffer
+    # after a restart is routine, and firing a gate rule for each replay would
+    # not be. `evaluate` never raises — a bad rule must cost its own alert, not
+    # the rest of this batch's events.
+    if result.inserted:
+        slug_of = {c.id: c.slug for c in cameras}
+        await rules_engine.evaluate(
+            db,
+            [{**row, "camera_slug": slug_of.get(row["camera_id"]),
+              "camera_name": refs[row["camera_id"]].name}
+             for row in result.inserted],
+            now=datetime.now(timezone.utc),
+        )
+
+    # The response shape is unchanged: the pipeline is told what was stored,
+    # not what it triggered.
+    return {"received": len(body.events), **result.counts, "rejected": rejected}
 
 
 @router.get("/overview", dependencies=_can_view)

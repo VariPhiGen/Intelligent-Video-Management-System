@@ -140,6 +140,9 @@ function Test-FreshInstall {
 Set-EnvKV 'INTERNAL_API_KEY'        (New-Secret 64)
 $kcPass = New-Secret 32
 Set-EnvKV 'KEYCLOAK_ADMIN_PASSWORD' $kcPass
+# The VMS broker's credential (mqtt profile); see gen-secrets.sh for why.
+Set-EnvKV 'MQTT_PASSWORD' (New-Secret 32)
+if (-not (Select-String -Path $EnvFile -Pattern '^MQTT_USERNAME=.+' -Quiet)) { Set-EnvKV 'MQTT_USERNAME' 'vms' }
 
 $dskNote = "  DISCOVERY_SECRET_KEY     left untouched (see -Fresh, and rotate-secrets.sh)"
 if ($Fresh) {

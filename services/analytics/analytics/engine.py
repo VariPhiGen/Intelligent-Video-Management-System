@@ -44,17 +44,22 @@ the localiser and the OCR model and still reported them active.
 """
 from __future__ import annotations
 
+import collections
 import ctypes
 import ctypes.util
 import gc
 import logging
+import os
 import threading
 import time
 from typing import Optional
 
 import numpy as np
 
+from .capacity import (AUTO, CapacityCache, Choice, choose, demand_fps,
+                       ensure_weights, machine_key, measure_fps)
 from .config import AppConfig
+from .detector import SwappableDetector
 from .pipeline import DetectionPipeline
 
 log = logging.getLogger(__name__)
@@ -178,6 +183,21 @@ class AnalyticsEngine:
         #: hour ago is not more likely to build now, and retrying it on every
         #: wake would spend an export attempt each time a quiet site comes back.
         self._selector = None
+        #: Which detector model runs, and why (analytics/capacity.py). Survives
+        #: hibernation like the selector, so /health keeps answering "which
+        #: model, and why" for a sleeping service.
+        self._choice: Optional[Choice] = None
+        #: A background model swap in progress (None = none), the earliest
+        #: time a failed one may be retried, and since when a more accurate
+        #: model has been affordable — the upgrade waits on that being stable.
+        self._resizer: Optional[threading.Thread] = None
+        self._resize_retry_at = 0.0
+        self._upgrade_ready_since: Optional[float] = None
+        #: Offered detector load as observed: (t, calls/s) per sample, kept an
+        #: hour, and the previous counter reading the next rate is taken from.
+        self._load_rates: collections.deque = collections.deque()
+        self._load_mark: Optional[tuple] = None
+        self._cache_refreshed_at = 0.0
         self._state = DISABLED if not config.detect.enabled else IDLE
         self._error: Optional[str] = None
         self._sink = None
@@ -236,6 +256,75 @@ class AnalyticsEngine:
                      "and dropped")
         self._activities = ActivityEngine(emit=self._event_sink)
 
+        # PLAYBACK PRESENCE outlives every pipeline too: an open presence is a
+        # person still in view, and a hibernation must close it, not lose it.
+        # Same API and key as the events; its own queue, so a burst of
+        # presence never evicts an event.
+        self._presence = None
+        self._presence_sink = None
+        pr = config.presence
+        if pr.enabled and config.events.url:
+            from .activities.events import ActivityEventSink
+            from .presence import PresenceRecorder
+            ev = config.events
+            self._presence_sink = ActivityEventSink(
+                ev.url, ev.internal_api_key, timeout=ev.timeout_seconds,
+                queue_size=pr.queue_size, batch_size=pr.batch_size,
+                path="/api/playback/timeline/presence", envelope="segments",
+                name="presence")
+            self._presence_sink.start()
+            self._presence = PresenceRecorder(
+                self._presence_sink, segment_seconds=pr.segment_seconds,
+                idle_close_seconds=max(pr.idle_close_seconds,
+                                       config.tracking.max_age_seconds
+                                       + config.tracking.reassociate_within_seconds + 1.0))
+            self._presence.start()
+        else:
+            log.info("playback presence not recorded (disabled, or no events URL)")
+
+        # PEOPLE DISTRIBUTION samples go to the same API, with the same key.
+        from .activities import people_distribution as _pd
+        self._distribution_sink = None
+        if config.events.url and config.events.internal_api_key:
+            self._distribution_sink = _pd.install(_pd.DistributionSink(
+                config.events.url, config.events.internal_api_key))
+            self._distribution_sink.start()
+        else:
+            log.info("no events URL configured - people distribution is counted, not posted")
+
+        # THE HEATMAP RUNTIME OUTLIVES EVERY SESSION AND EVERY PIPELINE, for
+        # the same reason the activity engine does: an operator's ON/OFF and a
+        # camera reconfigure must not throw away accumulated heat. The activity
+        # finds it through analytics/heatmap_runtime.install(), because an
+        # Activity is constructed with (camera, spec) and nothing else.
+        from .heatmap_runtime import HeatmapRuntime, HeatmapSettings, install
+        hm = config.heatmap
+        self._heatmap_sink = None
+        self._heatmap_chunk_sink = None
+        if hm.url and hm.internal_api_key:
+            from .heatmap_sink import HeatmapSink
+            self._heatmap_sink = HeatmapSink(hm.url, hm.internal_api_key,
+                                             timeout=hm.timeout_seconds,
+                                             queue_size=hm.queue_size)
+            self._heatmap_sink.start()
+            # 5-minute heat blocks get their own queue, a day deep, so a VMS
+            # outage costs no stored heat until it lasts longer than that and a
+            # picture upload can never evict a block.
+            from .heatmap_sink import CHUNK_PATH
+            self._heatmap_chunk_sink = HeatmapSink(hm.url, hm.internal_api_key,
+                                                   timeout=hm.timeout_seconds,
+                                                   queue_size=288, path=CHUNK_PATH)
+            self._heatmap_chunk_sink.start()
+        else:
+            log.info("no heatmap URL configured - heat is accumulated, rendered "
+                     "and dropped")
+        self._heatmap = install(HeatmapRuntime(
+            HeatmapSettings(snapshot_interval_s=hm.snapshot_interval_seconds,
+                            scale=hm.scale, output_width=hm.output_width,
+                            jpeg_quality=hm.jpeg_quality),
+            publish=self._heatmap_sink,
+            chunks=self._heatmap_chunk_sink.chunk if self._heatmap_chunk_sink else None))
+
         self._broker = None
         if config.source.frame_source == "broker":
             from .frame_source import BrokerSubscriber
@@ -269,6 +358,11 @@ class AnalyticsEngine:
     @property
     def _idle_timeout(self) -> float:
         return self._cfg.lifecycle.idle_timeout_seconds
+
+    @property
+    def heatmap(self):
+        """The heat sessions, for the runtime switch on the HTTP surface."""
+        return self._heatmap
 
     # ── the sink ────────────────────────────────────────────────────────────
     def attach_sink(self, sink) -> None:
@@ -352,6 +446,8 @@ class AnalyticsEngine:
                 self._broker.unwant_every_frame(slug)
         else:
             self._attach_sampler(slug)
+        # A new camera, or a new activity on one, can outgrow the model.
+        self._review_capacity()
         return snap
 
     def remove_camera(self, slug: str) -> bool:
@@ -360,6 +456,7 @@ class AnalyticsEngine:
             if entry is None:
                 return False
             self._activities.forget(slug)
+            self._heatmap.forget(slug)
             if self._activity_pipeline is not None:
                 self._activity_pipeline.forget(slug)
             if self._pipeline is not None:
@@ -386,6 +483,7 @@ class AnalyticsEngine:
             self._broker.unwant_every_frame(slug)
         if sampler is not None:
             sampler.stop()
+        self._review_capacity()
         return True
 
     def list_cameras(self) -> list[dict]:
@@ -402,6 +500,9 @@ class AnalyticsEngine:
             ready = self._pipeline is not None
         return (e.to_dict(snap, ready, self._activities.camera_summary(slug))
                 if e else None)
+
+    def presence(self, slug: str) -> Optional[dict]:
+        return self._activities.presence(slug)
 
     # ── frame delivery ──────────────────────────────────────────────────────
     def _deliver(self, slug: str, frame: np.ndarray, ts: float,
@@ -586,6 +687,265 @@ class AnalyticsEngine:
                                         name="analytics-warmup", daemon=True)
         self._loader.start()
 
+    # ── which model, sized to this machine (analytics/capacity.py) ─────────
+    #: An upgrade waits for demand to have stayed this low for this long, and
+    #: needs this margin over the headroom a downgrade allows: the asymmetry is
+    #: what stops a camera flapping on and off swapping models all day.
+    UPGRADE_AFTER_S = 600.0
+    UPGRADE_MARGIN = 1.2
+    #: Live load needs this much history before it replaces the estimate, is
+    #: sampled at most this often, and its peak is taken over this window —
+    #: an hour, so a busy shift change is remembered through a quiet lull.
+    LIVE_MIN_S = 600.0
+    LOAD_SAMPLE_S = 30.0
+    LOAD_WINDOW_S = 3600.0
+
+    def _offered_counters(self) -> Optional[tuple]:
+        """Caller holds the lock. (queued, processed, calls) over both paths."""
+        pipes = [p for p in (self._pipeline, self._activity_pipeline) if p is not None]
+        if not pipes:
+            return None
+        get = lambda k: sum(int(getattr(p, k, 0) or 0) for p in pipes)
+        return get("frames_queued"), get("frames_processed"), get("detector_calls")
+
+    def _sample_load(self, now: float) -> None:
+        """Caller holds the lock. Record offered calls/s since the last sample.
+
+        OFFERED, NOT SERVED: queued frames include the ones later evicted, so an
+        overloaded detector cannot hide its own overload by processing less.
+        Calls per frame is measured too — a motion frame also costs a call per
+        moving region it crops, ~1.4 on site on 2026-10-27.
+        """
+        counters = self._offered_counters()
+        mark = self._load_mark
+        if counters is None:
+            self._load_mark = None
+            return
+        if mark is not None and now - mark[0] < self.LOAD_SAMPLE_S:
+            return
+        self._load_mark = (now, *counters)
+        if mark is None:
+            return
+        dt = now - mark[0]
+        dq, dp, dc = (counters[0] - mark[1], counters[1] - mark[2], counters[2] - mark[3])
+        if dq < 0 or dp < 0 or dc < 0:
+            return                      # a pipeline was rebuilt; counters restarted
+        per_frame = dc / dp if dp > 0 else 1.0
+        self._load_rates.append((now, dq * per_frame / dt))
+        while self._load_rates and now - self._load_rates[0][0] > self.LOAD_WINDOW_S:
+            self._load_rates.popleft()
+
+    def _live_demand(self, now: float) -> Optional[float]:
+        """Caller holds the lock. Peak observed load, once there is enough of it."""
+        if not self._load_rates or now - self._load_rates[0][0] < self.LIVE_MIN_S - self.LOAD_SAMPLE_S:
+            return None
+        return max(rate for _, rate in self._load_rates)
+
+    def _demand(self) -> float:
+        """Caller holds the lock. Detector calls/s this camera set can ask for."""
+        m = self._cfg.models
+        search = sum(1 for e in self._cameras.values() if e.domains)
+        activity = sum(1 for slug in self._cameras if self._activities.has_work(slug))
+        return demand_fps(search, activity, m.capacity_camera_fps, m.capacity_motion_share)
+
+    def _locked_demand(self) -> float:
+        with self._lock:
+            return self._demand()
+
+    def _build_detector(self, selector, weights: str):
+        from .detector import build_selected
+        m = self._cfg.models
+        ensure_weights(weights)
+        return build_selected(
+            selector, weights, self._cfg.detect.confidence,
+            m.device, m.square_letterbox,
+            shared_openvino=m.shared_detector,
+            inference_threads=m.inference_threads,
+            inference_requests=m.inference_num_requests,
+        )
+
+    def _capacity_key(self, weights: str, det) -> str:
+        m = self._cfg.models
+        spec = getattr(det, "backend", None)
+        threads = m.inference_threads or max(2, (os.cpu_count() or 4) // 2)
+        return machine_key(weights, getattr(spec, "runtime", type(det).__name__),
+                           getattr(spec, "runtime_version", None), threads)
+
+    def _capacity_cache(self) -> CapacityCache:
+        return CapacityCache(os.path.join(self._cfg.models.models_dir, "artifacts",
+                                          "detector-capacity.json"))
+
+    def _fps_of(self, weights: str, det) -> float:
+        """Throughput of `det` on this machine: cached, else measured once."""
+        key = self._capacity_key(weights, det)
+        cache = self._capacity_cache()
+        fps = cache.get(key)
+        if fps is None:
+            fps = measure_fps(det)
+            spec = getattr(det, "backend", None)
+            cache.put(key, fps, {"weights": os.path.basename(weights),
+                                 "runtime": getattr(spec, "runtime", None),
+                                 "runtime_version": getattr(spec, "runtime_version", None)})
+            log.info("measured %s on this machine: %.1f fps", os.path.basename(weights), fps)
+        return fps
+
+    def _choose_detector(self, selector):
+        """(raw detector, Choice). Off the lock: loads, and may time, models."""
+        m = self._cfg.models
+        pinned = (m.detector_weights or AUTO).strip()
+        if pinned.lower() != AUTO:
+            det = self._build_detector(selector, pinned)
+            fps = self._fps_of(pinned, det)
+            demand = self._locked_demand()
+            over = fps < demand * m.capacity_headroom
+            reason = "pinned by configuration (detector_weights)"
+            if over:
+                reason += (f"; it measures {fps:.1f} fps against the {demand:.1f} fps this "
+                           f"camera set can need — expect dropped frames at busy times")
+            return det, Choice(pinned, "pinned", reason, demand, fps, over,
+                               {pinned: round(fps, 1)})
+        choice, det = choose(list(m.detector_candidates), self._locked_demand,
+                             m.capacity_headroom,
+                             lambda w: self._build_detector(selector, w), self._fps_of)
+        return det, choice
+
+    def _review_capacity(self) -> None:
+        """Downgrade as soon as the camera set outgrows the model; upgrade only
+        after the more accurate one has been comfortably affordable a while.
+
+        Cheap when nothing changed (camera-mgmt re-asserts every camera each
+        reconcile pass, so this runs about once a minute even without the
+        reaper): one demand sum and, at most, one small cache read.
+        """
+        m = self._cfg.models
+        now = time.monotonic()
+        with self._lock:
+            c = self._choice
+            if (c is None or c.capacity_fps is None or self._detector is None
+                    or self._loader is not None):
+                return
+            # The figures and the warning are kept current in EVERY mode: a
+            # pinned model is never switched, but its "cannot keep up" must
+            # follow the camera set, not freeze at whatever the warm-up saw.
+            self._sample_load(now)
+            live_demand = self._live_demand(now)
+            live_cap = self._detector.live_fps() if hasattr(self._detector, "live_fps") else None
+            demand = live_demand if live_demand is not None else self._demand()
+            capacity = live_cap if live_cap is not None else c.capacity_fps
+            # What the start-up measurement said about THIS model; the ratio to
+            # what it does live is the contention every candidate would see.
+            baseline = c.measured.get(c.weights)
+            contention = (live_cap / baseline
+                          if live_cap and isinstance(baseline, (int, float)) and baseline > 0 else 1.0)
+            need = demand * m.capacity_headroom
+            c.demand_fps, c.capacity_fps = round(demand, 2), round(capacity, 2)
+            c.over_capacity = capacity < need
+            c.basis = "live" if live_demand is not None and live_cap is not None else "estimate"
+            if live_cap is not None and now - self._cache_refreshed_at >= self.LOAD_WINDOW_S / 6:
+                # Better evidence than the warm-up timing: let the next start use it.
+                self._capacity_cache().put(self._capacity_key(c.weights, self._detector.inner),
+                                           live_cap, {"weights": os.path.basename(c.weights),
+                                                      "source": "live"})
+                self._cache_refreshed_at = now
+            if c.mode == AUTO and c.basis == "live":
+                # The figures just changed, so the sentence beside them must too:
+                # an admin reading "12.5 fps" next to a live "9.7" is misled.
+                name = os.path.basename(c.weights)
+                tail = f"{capacity:.1f} fps measured live vs a peak of {demand:.1f} fps in the last hour"
+                if not c.over_capacity:
+                    c.reason = f"{name} keeps up: {tail} (x{m.capacity_headroom:g} headroom)"
+                elif c.weights == list(m.detector_candidates)[-1]:
+                    c.reason = (f"{name}, the fastest model, cannot keep up: {tail} — some frames "
+                                f"are skipped at busy times. Fewer cameras or activity rules, or a "
+                                f"faster machine, would fix it.")
+                else:
+                    c.reason = f"{name} cannot keep up ({tail}); switching to a faster model"
+            if c.mode == "pinned":
+                base = "pinned by configuration (detector_weights)"
+                c.reason = base if not c.over_capacity else (
+                    f"{base}; it manages {capacity:.1f} fps against the {demand:.1f} fps this "
+                    f"camera set can need — expect dropped frames at busy times")
+            cands = list(m.detector_candidates)
+            if (c.mode != AUTO or c.weights not in cands or self._resizer is not None
+                    or now < self._resize_retry_at):
+                return
+            i = cands.index(c.weights)
+            target = why = None
+            if capacity < need and i + 1 < len(cands):
+                target, why = cands[i + 1], "the camera load grew past it"
+                self._upgrade_ready_since = None
+            elif i > 0:
+                better = cands[i - 1]
+                cached = self._capacity_cache().get(
+                    self._capacity_key(better, self._detector.inner))
+                if cached is not None and cached * contention >= need * self.UPGRADE_MARGIN:
+                    if self._upgrade_ready_since is None:
+                        self._upgrade_ready_since = now
+                    elif now - self._upgrade_ready_since >= self.UPGRADE_AFTER_S:
+                        target, why = better, "the camera load fell and it now keeps up"
+                else:
+                    self._upgrade_ready_since = None
+            if target is None:
+                return
+            self._resizer = threading.Thread(target=self._resize, args=(c, target, why),
+                                             name="detector-resize", daemon=True)
+            resizer = self._resizer
+        resizer.start()
+
+    def _resize(self, was: Choice, target: str, why: str) -> None:
+        """Build `target` off the lock and swap it in under it — no gap, no
+        tracker reset (see SwappableDetector)."""
+        m = self._cfg.models
+        try:
+            with self._lock:
+                selector = self._selector
+                separate = (self._activity_detector is not None
+                            and self._activity_detector is not self._detector)
+            raw = self._build_detector(selector, target)
+            fps = self._fps_of(target, raw)
+            activity_raw = self._build_detector(selector, target) if separate else None
+            with self._lock:
+                if self._choice is not was or self._detector is None:
+                    return   # hibernated or re-chosen meanwhile; this result is stale
+                demand = self._demand()
+                self._detector.swap(raw)
+                if activity_raw is not None and self._activity_detector is not None:
+                    self._activity_detector.swap(activity_raw)
+                measured = dict(was.measured, **{target: round(fps, 1)})
+                old, new = os.path.basename(was.weights), os.path.basename(target)
+                self._choice = Choice(
+                    target, AUTO,
+                    f"switched from {old} to {new} because {why}: {fps:.1f} fps "
+                    f"measured vs {demand:.1f} fps needed (x{m.capacity_headroom:g})",
+                    demand, fps, fps < demand * m.capacity_headroom, measured)
+                self._upgrade_ready_since = None
+            log.warning("detector switched live from %s to %s (%s)", old, new, why)
+        except Exception:                                          # noqa: BLE001
+            log.exception("could not switch the detector to %s; keeping %s",
+                          target, was.weights)
+            with self._lock:
+                self._resize_retry_at = time.monotonic() + 300.0
+        finally:
+            with self._lock:
+                self._resizer = None
+
+    def _fallback_weights(self) -> str:
+        m = self._cfg.models
+        pinned = (m.detector_weights or AUTO).strip()
+        return pinned if pinned.lower() != AUTO else list(m.detector_candidates)[0]
+
+    @staticmethod
+    def _backend_of(det) -> Optional[dict]:
+        spec = getattr(getattr(det, "inner", det), "backend", None) if det is not None else None
+        return spec.to_dict() if hasattr(spec, "to_dict") else None
+
+    @staticmethod
+    def _detector_name(det) -> Optional[str]:
+        """The model class actually running, not the wrapper around it."""
+        if det is None:
+            return None
+        return type(getattr(det, "inner", det)).__name__
+
     def _warm(self) -> None:
         """Build whatever is missing, OFF THE LOCK, then install it under it."""
         cfg = self._cfg
@@ -605,31 +965,42 @@ class AnalyticsEngine:
         plates = None
         activity_detector = None
         faces = None
+        choice = None
         try:
             if need_detector:
-                from .detector import build_selected
-                m = cfg.models
-                # Prefers OpenVINO on CPU and falls back to torch WITHIN this
-                # call, so a failed optimisation never leaves this service
-                # without a detector.
-                detector = build_selected(
-                    selector, m.detector_weights, cfg.detect.confidence,
-                    m.device, m.square_letterbox,
-                )
+                # The most accurate model this machine keeps up with, unless one
+                # is pinned (capacity.py). Prefers OpenVINO on CPU and falls back
+                # to torch WITHIN the build, so a failed optimisation never
+                # leaves this service without a detector.
+                raw, choice = self._choose_detector(selector)
+                detector = SwappableDetector(raw)
+                log.info("detector model: %s — %s", choice.to_dict()["model"], choice.reason)
             if want_plates:
                 from .plates import build as build_plate_reader
                 # Never fatal: no plate reader costs plate reading, not
                 # detection.
                 plates = build_plate_reader(cfg.plates, cfg.models.device)
             if need_activity:
-                from .detector import build_selected
                 m = cfg.models
-                # OPTION 1: the activity path's OWN detector instance, from the
-                # same selector — OpenVINO on CPU, same weights and confidence.
-                activity_detector = build_selected(
-                    selector, m.detector_weights, cfg.detect.confidence,
-                    m.device, m.square_letterbox,
-                )
+                if m.shared_detector and detector is not None:
+                    # ONE COMPILED MODEL FOR BOTH PATHS. The measured reason is
+                    # in openvino_detector.py: two LATENCY instances cost 0.090
+                    # CPU-s per frame and 94 ms p50 against 0.059 and 54 ms for
+                    # one THROUGHPUT model with a request pool. The paths stay
+                    # otherwise independent — their own queues, gating, trackers
+                    # and counters are untouched — they now share the weights
+                    # and the streams that execute them.
+                    activity_detector = detector
+                else:
+                    # No detector to share (Smart Search wants nothing on this
+                    # box), or sharing switched off: the activity path gets its
+                    # own instance, exactly as before.
+                    # The SAME model the search path chose, so both paths see the
+                    # same objects; swapped together by _resize.
+                    current = choice or self._choice
+                    weights = current.weights if current else self._fallback_weights()
+                    activity_detector = SwappableDetector(
+                        self._build_detector(selector, weights))
             if want_faces:
                 from .faces import build as build_face_reader
                 # Same policy: a missing face model costs the face domain, and
@@ -675,12 +1046,16 @@ class AnalyticsEngine:
                 # because only add_camera and remove_camera re-arm it and a
                 # stable fleet sends neither.
                 self._note_plate_demand()
+            if choice is not None:
+                self._choice = choice
+                self._upgrade_ready_since = None
             if detector is not None:
                 self._detector = detector
             if self._pipeline is None and self._detector is not None:
                 self._pipeline = DetectionPipeline(
                     cfg, self._detector, plate_reader=self._plates,
                     face_reader=self._faces, sink=self._sink,
+                    presence=self._presence,
                 )
                 # Cameras that arrived during the warm-up have been waiting for
                 # exactly this. Their domains were never applied, so without
@@ -705,7 +1080,7 @@ class AnalyticsEngine:
                 self._activity_pipeline.start()
                 self._note_activity_demand()
                 log.info("activity pipeline up (detector=%s) — every frame, "
-                         "no motion gate", type(activity_detector).__name__)
+                         "no motion gate", self._detector_name(activity_detector))
             if self._pipeline is not None:
                 self._state = RUNNING
                 self._error = None
@@ -713,7 +1088,7 @@ class AnalyticsEngine:
             pending = list(self._cameras) if self._broker is None else []
             if need_detector and self._pipeline is not None:
                 log.info("detection pipeline up (detector=%s plates=%s)",
-                         type(self._detector).__name__,
+                         self._detector_name(self._detector),
                          "yes" if self._plates else "no")
             elif plates is not None:
                 # A plates-only pass: the detector was already running, so
@@ -863,6 +1238,7 @@ class AnalyticsEngine:
             log.info("detection models released (no cameras for %.0fs)", timeout)
         elif dropped_plates:
             self._reclaim()
+        self._review_capacity()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -872,6 +1248,14 @@ class AnalyticsEngine:
             self._sink.stop()
         if self._event_sink is not None:
             self._event_sink.stop()
+        if self._heatmap_sink is not None:
+            self._heatmap_sink.stop()
+        if self._heatmap_chunk_sink is not None:
+            self._heatmap_chunk_sink.stop()
+        if self._presence is not None:
+            self._presence.stop()           # closes what is open, into the sink
+        if self._presence_sink is not None:
+            self._presence_sink.stop()
         with self._lock:
             entries = list(self._cameras.values())
             pipeline = self._detach()
@@ -907,9 +1291,39 @@ class AnalyticsEngine:
             # feeding an index would be the misleading half of a safe rollout.
             "sink": (self._sink.snapshot() if self._sink is not None
                      else {"configured": False, "url": None}),
+            "presence": ({**self._presence.snapshot(),
+                          "sink": self._presence_sink.snapshot()}
+                         if self._presence is not None else {"configured": False}),
+            "heatmap": {**self._heatmap.snapshot(),
+                        "sink": (self._heatmap_sink.snapshot()
+                                 if self._heatmap_sink is not None
+                                 else {"configured": False, "url": None}),
+                        "chunk_sink": (self._heatmap_chunk_sink.snapshot()
+                                       if self._heatmap_chunk_sink is not None
+                                       else {"configured": False, "url": None})},
+            "people_distribution": (self._distribution_sink.snapshot()
+                                    if self._distribution_sink is not None
+                                    else {"configured": False, "url": None}),
             "models": {
-                "detector": type(self._detector).__name__ if self._detector else None,
+                "detector": self._detector_name(self._detector),
+                # WHICH MODEL AND WHY: chosen for this machine and camera load,
+                # or pinned. `over_capacity` is the warning to surface — this
+                # model cannot keep up and busy moments will drop frames.
+                "detector_choice": self._choice.to_dict() if self._choice else None,
+                # The runtime executing it (OpenVINO / torch, device), and why
+                # the preferred runtime is not in use when it is not — e.g. a
+                # probe that crashed with SIGILL on this CPU.
+                "detector_backend": self._backend_of(self._detector),
+                "backend_selection": (self._selector.snapshot()
+                                      if hasattr(self._selector, "snapshot") else None),
                 "detector_loaded": self._detector is not None,
+                # Whether both paths are executing the same compiled model, and
+                # what that model is costing per call. The latency percentiles
+                # are the number to watch after a threading change.
+                "detector_shared": (self._detector is not None
+                                    and self._detector is self._activity_detector),
+                "detector_inference": (self._detector.snapshot()
+                                       if hasattr(self._detector, "snapshot") else None),
                 # THREE DIFFERENT ANSWERS, AND CONFLATING THEM IS THE BUG THIS
                 # SPLIT EXISTS TO AVOID. `plates_wanted` is whether any camera
                 # asked; `plates_loaded` is whether a reader is resident right
@@ -922,8 +1336,7 @@ class AnalyticsEngine:
                 "plates_active": bool(getattr(self._plates, "active", False)),
                 "plates_load_failed": self._plates_load_failed,
                 # The activity path's own instance (Option 1).
-                "activity_detector": (type(self._activity_detector).__name__
-                                      if self._activity_detector else None),
+                "activity_detector": self._detector_name(self._activity_detector),
                 "activity_detector_loaded": self._activity_detector is not None,
             },
             "lifecycle": {

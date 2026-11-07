@@ -29,7 +29,7 @@ from ..config import settings
 log = structlog.get_logger(__name__)
 
 _TIMEOUT = httpx.Timeout(10.0)
-PRODUCT_ROLES = ("admin", "supervisor", "operator", "viewer", "dpo")
+PRODUCT_ROLES = ("admin", "supervisor", "operator", "viewer", "dpo", "integration")
 
 # Confidential client used ONLY to verify a user's CURRENT password (direct
 # grant) when they change it themselves. It is deliberately not vms-web: the SPA

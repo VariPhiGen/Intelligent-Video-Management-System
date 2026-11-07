@@ -15,9 +15,11 @@ from .base import (AVAILABLE, FULL_FRAME, HOLD, ZONE_OPTIONAL, ZONE_REQUIRED, ZO
                    Activity, ActivityDefinition, ActivityEvent, ActivitySpec, FrameContext,
                    Param, Schedule, TrackedObject, Zone, resolve_zones)
 from .car_detection import CarDetectionActivity
+from .Heatmap_overlay import HeatmapOverlayActivity
 from .entry_exit_WLE_logs import EntryExitWLELogsActivity
 from .idle_worker import IdleWorkerActivity
 from .no_person_area import NoPersonAreaActivity
+from .people_distribution import PeopleDistributionActivity
 from .people_gathering import PeopleGatheringActivity
 from .restricted_zone_entry import RestrictedZoneEntryActivity
 from .stray_parking import StrayParkingActivity
@@ -26,11 +28,13 @@ ACTIVITY_CLASSES: dict[str, type[Activity]] = {
     cls.definition.key: cls for cls in (
         RestrictedZoneEntryActivity,
         PeopleGatheringActivity,
+        PeopleDistributionActivity,
         StrayParkingActivity,
         EntryExitWLELogsActivity,
         NoPersonAreaActivity,
         CarDetectionActivity,
         IdleWorkerActivity,
+        HeatmapOverlayActivity,
     )
 }
 

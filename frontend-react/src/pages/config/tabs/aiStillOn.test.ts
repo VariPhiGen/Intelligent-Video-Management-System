@@ -8,7 +8,7 @@
  *  agreed in the plural branch.
  */
 import { describe, it, expect } from 'vitest';
-import { aiStillOn, searchIndexingActive, motionActive, aiRunningPhrase,
+import { aiStillOn, searchIndexingActive, motionActive, aiRunningPhrase, timelapseStillOn,
          type AiCamera } from './aiStillOn';
 
 const cam = (over: Partial<AiCamera> = {}): AiCamera => ({
@@ -45,9 +45,13 @@ describe('aiStillOn', () => {
     expect(aiStillOn(cam({ search_indexing: false, motion_detection: true }))).toBe(true);
   });
 
-  it('treats a missing opt-in as on, because indexing defaults to on', () => {
+  it('treats a missing opt-in as OFF, because indexing defaults to off', () => {
+    // Migration 038 made indexing opt-in. A payload that omits the field is
+    // the pre-038 shape or a partial update — either way it is not evidence
+    // that anybody switched indexing on, and claiming AI is running would send
+    // the operator looking for something to stop that was never started.
     const { search_indexing: _drop, ...rest } = cam();
-    expect(aiStillOn(rest as AiCamera)).toBe(true);
+    expect(aiStillOn(rest as AiCamera)).toBe(false);
   });
 });
 
@@ -83,5 +87,23 @@ describe('aiRunningPhrase', () => {
         expect(phrase.endsWith(plural ? 'run' : 'runs')).toBe(true);
       }
     }
+  });
+});
+
+describe('timelapseStillOn', () => {
+  it('fires when recording is off and time-lapse is on', () => {
+    expect(timelapseStillOn(cam({ timelapse_enabled: true }))).toBe(true);
+  });
+  it('stays silent when the flag is absent: time-lapse is opt-in (migration 057)', () => {
+    expect(timelapseStillOn(cam())).toBe(false);
+  });
+  it('stays silent while recording, or on a disabled camera', () => {
+    expect(timelapseStillOn(cam({ timelapse_enabled: true, recording: true }))).toBe(false);
+    expect(timelapseStillOn(cam({ timelapse_enabled: true, enabled: false }))).toBe(false);
+  });
+  it('is independent of the AI banner: Stop AI does not stop time-lapse', () => {
+    const c = cam({ timelapse_enabled: true, search_indexing: false, motion_detection: false });
+    expect(aiStillOn(c)).toBe(false);
+    expect(timelapseStillOn(c)).toBe(true);
   });
 });

@@ -24,6 +24,8 @@
   ],
   "eventsExpiration": 604800,
   "rememberMe": true,
+  "ssoSessionIdleTimeoutRememberMe": 2592000,
+  "ssoSessionMaxLifespanRememberMe": 2592000,
   "internationalizationEnabled": true,
   "supportedLocales": [
     "en",
@@ -32,6 +34,10 @@
   "defaultLocale": "en",
   "roles": {
     "realm": [
+      {
+        "name": "integration",
+        "description": "Read the optional VMS event feed with a service account"
+      },
       {
         "name": "admin",
         "description": "Configure cameras, users, retention, integrations"

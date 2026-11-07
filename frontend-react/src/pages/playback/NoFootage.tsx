@@ -15,6 +15,8 @@ import type { ReactNode } from 'react';
 export type TileState =
   | { kind: 'idle' }
   | { kind: 'loading' }
+  /** Was playing, buffer ran dry: keep the last frame, show a small spinner. */
+  | { kind: 'buffering' }
   /** In a gap, or before/after everything this camera recorded. */
   | { kind: 'gap'; earliest?: number; latest?: number }
   /** The camera has never recorded anything. */
@@ -52,7 +54,7 @@ function Frame({ icon, title, sub, action }: {
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>{sub}</div>
       )}
-      {action}
+      {action && <div onClick={e => e.stopPropagation()}>{action}</div>}
     </div>
   );
 }
@@ -63,8 +65,10 @@ const jumpBtn: React.CSSProperties = {
   color: '#cbd5e1', cursor: 'pointer',
 };
 
-export function NoFootage({ state, onJump, onRetry }: {
+export function NoFootage({ state, syncLock = true, onJump, onRetry }: {
   state: TileState;
+  /** Whether a jump moves every tile (lock on) or just this one. */
+  syncLock?: boolean;
   /**
    * Seek to the nearest instant this camera has footage. The parent decides
    * WHICH edge — it knows where the playhead currently sits — and, with sync
@@ -77,8 +81,19 @@ export function NoFootage({ state, onJump, onRetry }: {
     return <Frame icon={<span className="spinner" />} title="Loading…" />;
   }
 
+  if (state.kind === 'buffering') {
+    // Not a Frame: an opaque cover here turned every brief stall (a sync
+    // nudge, the next segment still building) into a black tile.
+    return (
+      <div style={{ position: 'absolute', top: 8, right: 8, padding: 5, borderRadius: 6,
+                    background: 'rgba(10,14,19,.6)', display: 'flex', pointerEvents: 'none' }}>
+        <span className="spinner" />
+      </div>
+    );
+  }
+
   if (state.kind === 'idle') {
-    return <Frame icon="⏱" title="Ready" sub="Pick a start time and press Load" />;
+    return <Frame icon="⏱" title="Ready" sub="Scrub the timeline to play" />;
   }
 
   if (state.kind === 'none') {
@@ -111,7 +126,7 @@ export function NoFootage({ state, onJump, onRetry }: {
       title="No recording at this time"
       sub={known ? `Footage available ${humanRange(earliest!, latest!)}` : 'Gap in this camera’s recording'}
       action={known && onJump && (
-        <button style={jumpBtn} title="Moves every tile — sync lock is on"
+        <button style={jumpBtn} title={syncLock ? 'Moves every tile — sync lock is on' : 'Moves only this tile'}
                 onClick={() => onJump({ earliest: earliest!, latest: latest! })}>
           Jump to nearest footage
         </button>

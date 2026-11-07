@@ -33,7 +33,8 @@ raises one.
 LIMITS. The rule is only as good as the tracker's identity: a person the
 tracker loses and recreates (occluded longer than its max age, or an id switch)
 is a new person and raises a new event. A detection without a tracker id cannot
-have a stay and raises nothing.
+have a stay and raises nothing, and nor can one whose track is not CONFIRMED
+yet - a single-frame false positive is not a violation.
 
 HISTORY. The supplied code alerted once per zone and never again (`alert_sent`
 was never cleared); the first CPU port raised one event per zone every cooldown.
@@ -87,7 +88,15 @@ class RestrictedZoneEntryActivity(Activity):
 
     def evaluate(self, ctx: FrameContext) -> list[ActivityEvent]:
         events: list[ActivityEvent] = []
-        people = [o for o in ctx.objects if o.label == PERSON_LABEL]
+        # CONFIRMED TRACKS ONLY. An unconfirmed track is one the tracker has
+        # seen for less than `confirm_after_seconds` and may never see again; at
+        # night this appliance produces person detections at 0.36-0.56
+        # confidence that live for a single frame, and each one used to cost a
+        # violation. Entry / Exit has always required confirmation; this brings
+        # the zone activities in line. The event is not lost, only delayed to
+        # the frame the track is confirmed on, because the person is still
+        # inside the zone then.
+        people = [o for o in ctx.objects if o.label == PERSON_LABEL and o.confirmed]
         if not people:
             return events
         for zone in self.zones:

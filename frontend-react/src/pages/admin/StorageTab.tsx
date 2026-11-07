@@ -10,12 +10,15 @@
  * eating the disk. Admin-only — the api's /api/nvr proxy rejects non-GET from
  * anyone else, so a non-admin never sees the controls.
  */
+import { LoadingSkeleton } from '@/components/LoadingSkeleton';
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useCameras } from '@/lib/cameras';
 import { Modal } from '@/components/Modal';
 import { useToast } from '@/components/Toast';
+import { formatRetention, retentionError, toMinutes, MINUTES_PER_DAY,
+         type RetentionUnit } from '@/lib/retention';
 import { foldPerCamera, storageRows } from './storageRows';
 
 import {
@@ -24,6 +27,34 @@ import {
   type NvrHealth, type NvrStorage, type PerCameraUsage, type PurgeResult,
 } from './storageBits';
 import { BulkRetentionModal, PurgeModal, StorageCapModal } from './storageModals';
+
+/** Time-lapse stills live in the object store, not on the NVR disk this tab
+ *  meters — so they are named here rather than silently absent from the
+ *  picture. Only for holders of timelapse_view (the endpoint 403s otherwise). */
+function TimelapseStorageLine() {
+  const { me, isAdmin } = useAuth();
+  const can = isAdmin || me?.permissions?.timelapse_view === true;
+  const [sum, setSum] = useState<{ on: number; frames: number; bytes: number; store: boolean } | null>(null);
+  useEffect(() => {
+    if (!can) return;
+    apiFetch<{ cameras: { enabled: boolean; frames: number; bytes: number }[]; object_store: boolean }>('/timelapse/cameras')
+      .then(r => setSum({ on: r.cameras.filter(c => c.enabled).length, frames: r.cameras.reduce((n, c) => n + c.frames, 0),
+                          bytes: r.cameras.reduce((n, c) => n + c.bytes, 0), store: r.object_store }))
+      .catch(() => setSum(null));
+  }, [can]);
+  if (!can || !sum || (!sum.on && !sum.frames)) return null;
+  const gb = sum.bytes / 1024 ** 3;
+  return (
+    <div className="card" style={{ marginTop: 'var(--s4)', fontSize: 13 }}>
+      <b>Time-lapse</b>: {sum.on} camera{sum.on === 1 ? '' : 's'} on · {sum.frames.toLocaleString()} stills ·{' '}
+      {gb >= 1 ? `${gb.toFixed(2)} GB` : `${(sum.bytes / 1024 ** 2).toFixed(0)} MB`}{' '}
+      <span style={{ color: 'var(--muted)' }}>
+        {sum.store ? 'in the object store, separate from recordings above' : 'in the database (no object store configured)'}
+        {' '}— each camera's own retention and size cap apply.
+      </span>
+    </div>
+  );
+}
 
 export function StorageTab() {
   const { cameras, refresh } = useCameras();
@@ -37,6 +68,7 @@ export function StorageTab() {
   // Bulk retention / grooming — a single modal editor for the whole fleet.
   const [bulkOpen, setBulkOpen] = useState(false);
   const [gRetention, setGRetention] = useState('');
+  const [gRetentionUnit, setGRetentionUnit] = useState<RetentionUnit>('days');
   const [gGroom, setGGroom] = useState('');
   const [bulkTyped, setBulkTyped] = useState('');
   const [applying, setApplying] = useState(false);
@@ -63,7 +95,7 @@ export function StorageTab() {
   if (!data) {
     return (
       <div className="wz-methods" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: 16 }}>
-        <div className="empty"><span className="spinner" /></div>
+        <LoadingSkeleton label="Loading storage usage…" variant="cards" count={2} />
       </div>
     );
   }
@@ -90,7 +122,13 @@ export function StorageTab() {
   const allOn = rows.length > 0 && selected.length === rows.length;
 
   // ── Global apply: parse inputs, validate, and preview the fleet-wide impact ──
-  const retentionDefault = cameras.find(c => c.retention_default_days != null)?.retention_default_days ?? 30;
+  // MINUTES throughout. Retention is minute-granular now (lib/retention.ts):
+  // a fleet can hold 30-day evidence cameras alongside a lobby camera kept for
+  // twenty minutes, and this screen has to state both without rounding either
+  // into nonsense.
+  const retentionDefault =
+    cameras.find(c => c.retention_default_minutes != null)?.retention_default_minutes
+    ?? 30 * MINUTES_PER_DAY;
   const groomDefault = sto?.groom_after_days_default ?? null;
   // Placeholder reflects the CURRENT groom window across the fleet (each camera's
   // override, or the appliance default when unset) so the admin sees what they're
@@ -109,19 +147,19 @@ export function StorageTab() {
   // "mixed" when cameras disagree — not the bare appliance default. Same
   // resolution as loweredRetentionCams below so preview and hint stay in step.
   const retCurrent = [...new Set(
-    cameras.map(c => c.retention_days ?? c.retention_default_days ?? retentionDefault))];
+    cameras.map(c => c.retention_minutes ?? c.retention_default_minutes ?? retentionDefault))];
   const retentionPlaceholder =
-    retCurrent.length === 1 ? `Current: ${retCurrent[0]} day${retCurrent[0] === 1 ? '' : 's'}`
+    retCurrent.length === 1 ? `Current: ${formatRetention(retCurrent[0])}`
     : retCurrent.length > 1 ? 'Current: mixed'
-    : `Default: ${retentionDefault} days`;
-  const gRetVal = gRetention.trim() === '' ? null : Number(gRetention);
+    : `Default: ${formatRetention(retentionDefault)}`;
+  const gRetVal = gRetention.trim() === '' ? null : toMinutes(gRetention, gRetentionUnit);
   const gGroomVal = gGroom.trim() === '' ? null : Number(gGroom);
-  const validRet = gRetVal == null || (Number.isInteger(gRetVal) && gRetVal >= 1 && gRetVal <= 3650);
+  const validRet = gRetVal == null || retentionError(gRetention, gRetentionUnit) == null;
   const validGroom = gGroomVal == null || (Number.isInteger(gGroomVal) && gGroomVal >= 1 && gGroomVal <= 3650);
   const canApply = (gRetVal != null || gGroomVal != null) && validRet && validGroom && cameras.length > 0;
   // Cameras whose footage would be deleted (retention lowered below what they keep now).
   const loweredRetentionCams = gRetVal == null ? []
-    : cameras.filter(c => gRetVal < (c.retention_days ?? c.retention_default_days ?? retentionDefault));
+    : cameras.filter(c => gRetVal < (c.retention_minutes ?? c.retention_default_minutes ?? retentionDefault));
   // Cameras that would start grooming (compressing) sooner than they do now (0 = never).
   const groomsSoonerCams = gGroomVal == null ? []
     : cameras.filter(c => {
@@ -213,7 +251,7 @@ export function StorageTab() {
   // NVR internally. Blank field = leave that setting untouched.
   async function applyGlobal() {
     const body: Record<string, number> = {};
-    if (gRetention.trim() !== '') body.retention_days = Number(gRetention);
+    if (gRetention.trim() !== '') body.retention_minutes = toMinutes(gRetention, gRetentionUnit);
     if (gGroom.trim() !== '') body.groom_after_days = Number(gGroom);
     setApplying(true);
     let ok = 0;
@@ -466,11 +504,12 @@ export function StorageTab() {
                         title={daysLabel(sto?.per_camera?.[slug]) ?? undefined}>
                       {fmtDays(spanDays(totalRange(sto?.per_camera?.[slug])))}
                     </td>
-                    <td style={{ fontFamily: 'var(--mono)', fontSize: 12, color: reg?.retention_days ? undefined : 'var(--muted)' }}>
+                    <td style={{ fontFamily: 'var(--mono)', fontSize: 12, color: reg?.retention_minutes ? undefined : 'var(--muted)' }}>
                       {reg
-                        ? (reg.retention_days
-                            ? `${reg.retention_days} d`
-                            : reg.retention_default_days ? `default (${reg.retention_default_days} d)` : 'default')
+                        ? (reg.retention_minutes
+                            ? (reg.retention_label || formatRetention(reg.retention_minutes))
+                            : reg.retention_default_minutes
+                                ? `default (${formatRetention(reg.retention_default_minutes)})` : 'default')
                         : '—'}
                     </td>
                     <td>
@@ -497,7 +536,8 @@ export function StorageTab() {
       <PurgeModal {...{ confirming, setConfirming, selected, nameOf, selBytes, typed, setTyped, purge, busy }} />
       <BulkRetentionModal {...{
         bulkOpen, setBulkOpen, applying, gGroom, setGGroom, groomPlaceholder,
-        gRetention, setGRetention, retentionPlaceholder, validRet, validGroom,
+        gRetention, setGRetention, gRetentionUnit, setGRetentionUnit,
+        retentionPlaceholder, validRet, validGroom,
         loweredRetentionCams, gRetVal, groomsSoonerCams, bulkTyped, setBulkTyped,
         applyGlobal, canApply, cameras,
       }} />
@@ -506,6 +546,7 @@ export function StorageTab() {
         capInRange, capOverMax, capMax,
         capWillDelete, capGb, capTyped, setCapTyped, doSaveCap,
       }} />
+      <TimelapseStorageLine />
     </div>
   );
 }

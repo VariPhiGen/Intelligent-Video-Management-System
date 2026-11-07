@@ -118,12 +118,26 @@ body += ('--%s\\r\\nContent-Disposition: form-data; name="crop"; filename="c.png
 body += crop + b'\\r\\n'
 body += ('--%s--\\r\\n' % boundary).encode()
 
-req = urllib.request.Request('${SS}/observations', data=body, method='POST')
-req.add_header('Content-Type', 'multipart/form-data; boundary=' + boundary)
-try:
-    print(urllib.request.urlopen(req).read().decode())
-except urllib.error.HTTPError as e:
-    print(json.dumps({"error": e.code, "detail": e.read().decode()[:300]}))
+# SmartSearch hibernates its models when idle and warms them when the first
+# camera registers, answering 503 "ingest not ready" until the warm-up
+# finishes. A journey that registers a camera and seeds straight away races
+# that warm-up, so wait it out — for exactly that answer and no other, and
+# for no longer than a cold CPU load could plausibly take.
+import time
+deadline = time.time() + 90
+while True:
+    req = urllib.request.Request('${SS}/observations', data=body, method='POST')
+    req.add_header('Content-Type', 'multipart/form-data; boundary=' + boundary)
+    try:
+        print(urllib.request.urlopen(req).read().decode())
+        break
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:300]
+        if e.code == 503 and 'ingest not ready' in detail and time.time() < deadline:
+            time.sleep(1)
+            continue
+        print(json.dumps({"error": e.code, "detail": detail}))
+        break
 `;
   return JSON.parse(await inNetwork(python));
 }

@@ -6,6 +6,7 @@
 import { useEffect, useState, type CSSProperties } from 'react';
 import type { Camera } from '@/lib/types';
 import { useHls } from './useHls';
+import { causeText, positionLabel, type PtzPosition } from '@/lib/ptz';
 
 type Variant = 'tile' | 'focus' | 'wall';
 
@@ -26,20 +27,35 @@ const VIDEO_STYLE: Record<Variant, CSSProperties> = {
   wall: { width: '100%', height: '100%', objectFit: 'contain', background: '#0a0e13' },
 };
 
-const OFFLINE_META: Record<Variant, { icon: number; text: number; label: string }> = {
-  tile: { icon: 22, text: 10.5, label: 'Signal lost' },
-  focus: { icon: 26, text: 11, label: 'Signal lost — retrying' },
-  wall: { icon: 18, text: 9.5, label: 'Signal lost' },
+const OFFLINE_META: Record<Variant, { icon: number; text: number; label: string; codec: string }> = {
+  tile: { icon: 22, text: 10.5, label: 'Signal lost', codec: 'H.265 — not playable in this browser' },
+  focus: { icon: 26, text: 11, label: 'Signal lost — retrying', codec: 'H.265 — not playable in this browser' },
+  wall: { icon: 18, text: 9.5, label: 'Signal lost', codec: 'H.265 not supported' },
 };
 
-export function LiveVideo({ slug, variant, staggerMs = 0, hasSub = false }: {
+// What to do about it. Not shown on the wall — a cell is too small to read it,
+// and the wall is watched, not configured.
+const CODEC_HINT = "Set the camera's sub stream to H.264, or use a browser with H.265 support";
+
+export function LiveVideo({ slug, variant, staggerMs = 0, hasSub = false,
+                           preferSub = false }: {
   slug: string;
   variant: Variant;
   staggerMs?: number;
   /** Camera has a recording sub track, so the relay publishes `<slug>_sub`. */
   hasSub?: boolean;
+  /** Ask for the low-res track up front — a tile too small to show the main
+   *  stream's detail should not pay to decode it. Falls up to the main when
+   *  the camera has no sub track. */
+  preferSub?: boolean;
 }) {
-  const { videoRef, offline, variant: stream } = useHls(slug, staggerMs, hasSub);
+  // Focus = the expanded / PTZ view: the operator steers by the picture, so it
+  // runs the low-latency HLS profile AND attempts WebRTC first (sub-second when
+  // the browser and LAN allow it, HLS fallback otherwise). Tiles and the wall
+  // stay buffered — on a monitoring wall a frozen tile costs more than latency.
+  const isFocus = variant === 'focus';
+  const { videoRef, offline, variant: stream, unsupportedCodec } =
+    useHls(slug, staggerMs, hasSub, preferSub, isFocus, isFocus);
   const off = OFFLINE_META[variant];
   return (
     <>
@@ -57,18 +73,37 @@ export function LiveVideo({ slug, variant, staggerMs = 0, hasSub = false }: {
                     alignItems: 'center', justifyContent: 'center', background: '#0a0e13' }}>
         <div style={{ textAlign: 'center', color: '#5b7186' }}>
           <div style={{ fontSize: off.icon }}>⚠</div>
-          <div style={{ fontSize: off.text, marginTop: variant === 'wall' ? 0 : 4 }}>{off.label}</div>
+          <div style={{ fontSize: off.text, marginTop: variant === 'wall' ? 0 : 4 }}>
+            {unsupportedCodec ? off.codec : off.label}
+          </div>
+          {unsupportedCodec && variant !== 'wall' && (
+            <div style={{ fontSize: off.text - 1, marginTop: 4, padding: '0 12px', opacity: 0.8 }}>
+              {CODEC_HINT}
+            </div>
+          )}
         </div>
       </div>
     </>
   );
 }
 
-/** LIVE / REC / OFFLINE badge cluster, top-right of a tile (legacy _lvBadges). */
-export function LvBadges({ c }: { c: Camera }) {
+/** LIVE / REC / OFFLINE badge cluster, top-right of a tile (legacy _lvBadges). `pos` = where a PTZ camera is
+ *  pointing ("📍 Gate" / "Moving…" / "Off preset" — services/ptz_track), shown first. */
+export function LvBadges({ c, pos }: { c: Camera; pos?: PtzPosition | null }) {
   const online = c.health_status === 'connected';
+  // 'unknown' is "not probed yet" — the state every camera is in for the
+  // first ~40 s after the api restarts. Drawn as OFFLINE, an upgrade turned
+  // the whole wall red for that long with every camera actually streaming.
+  if (c.health_status === 'unknown') {
+    return (
+      <div style={{ position: 'absolute', right: 8, top: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span className="lv-badge" style={{ color: '#8aa0b4' }} title="Status not checked yet">CHECKING</span>
+      </div>
+    );
+  }
   return (
     <div style={{ position: 'absolute', right: 8, top: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+      {pos && <PtzPosBadge pos={pos} />}
       {online && (
         <span className="lv-badge">
           <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22C55E' }} />LIVE
@@ -94,4 +129,16 @@ export function Clock() {
     return () => clearInterval(t);
   }, []);
   return <span className="lv-time">{now}</span>;
+}
+
+/** Where a PTZ camera points, with who/what put it there in the tooltip. */
+export function PtzPosBadge({ pos }: { pos: PtzPosition }) {
+  const who = causeText(pos.cause, pos.actor);
+  const since = pos.since ? new Date(pos.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  return (
+    <span className={`ptz-pos-badge${pos.state === 'off_preset' ? ' off' : ''}`}
+          title={`${positionLabel(pos)}${since ? ` since ${since}` : ''}${who ? ` · moved by ${who}` : ''}`}>
+      {positionLabel(pos)}
+    </span>
+  );
 }

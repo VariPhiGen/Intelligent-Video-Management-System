@@ -12,10 +12,13 @@ import { apiFetch } from '@/lib/api';
 import type { Camera } from '@/lib/types';
 import { Modal } from '@/components/Modal';
 import { useToast } from '@/components/Toast';
+import { RetentionInput } from '@/components/RetentionInput';
+import { formatApproxRetention, formatRetention, retentionError, splitRetention,
+         toMinutes, MINUTES_PER_DAY, type RetentionUnit } from '@/lib/retention';
 import { ScheduleDays } from '../ScheduleDays';
 import { SubTrackCard } from './SubTrackCard';
 import { daysToSchedule, scheduleToDays, type DaySet, type WeeklySchedule } from '../schedule';
-import { aiStillOn, searchIndexingActive, aiRunningPhrase } from './aiStillOn';
+import { aiStillOn, searchIndexingActive, aiRunningPhrase, timelapseStillOn } from './aiStillOn';
 
 type Mode = 'continuous' | 'scheduled' | 'off';
 
@@ -34,8 +37,12 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
   const toast = useToast();
   const [mode, setMode] = useState<Mode>(() => initialMode(camera));
   const [days, setDays] = useState<DaySet>(() => scheduleToDays(camera.recording_schedule as WeeklySchedule | null));
-  // Retention / groom inputs as raw text: '' = appliance default (stored NULL).
-  const [retention, setRetention] = useState(() => camera.retention_days?.toString() ?? '');
+  // Retention as a number + unit: '' = appliance default (stored NULL). The
+  // unit is seeded from the stored MINUTES so a 30-day camera opens reading
+  // "30 days" rather than "43200 minutes" — see lib/retention.splitRetention.
+  const [retention, setRetention] = useState(() => splitRetention(camera.retention_minutes).value);
+  const [retentionUnit, setRetentionUnit] =
+    useState<RetentionUnit>(() => splitRetention(camera.retention_minutes).unit);
   const [groom, setGroom] = useState(() => camera.groom_after_days?.toString() ?? '');
   // DPDP purpose-binding: why footage is kept this long (recorded + audited).
   const [justification, setJustification] = useState(() => camera.retention_justification ?? '');
@@ -46,16 +53,17 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
   // Shorten-retention confirmation (footage deletion is irreversible).
   const [confirming, setConfirming] = useState(false);
   const [typed, setTyped] = useState('');
-  // Days of existing footage the shorter window will delete; null = unknown
+  // MINUTES of existing footage the shorter window will delete; null = unknown
   // (NVR unreachable or the camera has no footage yet).
-  const [affectedDays, setAffectedDays] = useState<number | null>(null);
+  const [affectedMinutes, setAffectedMinutes] = useState<number | null>(null);
 
   // Re-init on camera switch only (not the 15s refresh, so edits survive).
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     setMode(initialMode(camera));
     setDays(scheduleToDays(camera.recording_schedule as WeeklySchedule | null));
-    setRetention(camera.retention_days?.toString() ?? '');
+    setRetention(splitRetention(camera.retention_minutes).value);
+    setRetentionUnit(splitRetention(camera.retention_minutes).unit);
     setGroom(camera.groom_after_days?.toString() ?? '');
     setJustification(camera.retention_justification ?? '');
   }, [camera.id]);
@@ -70,19 +78,24 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
     return () => { alive = false; };
   }, []);
 
-  // 0 = reset to default; NaN when the input isn't a number at all.
-  const retDays = retention.trim() === '' ? 0 : Number(retention);
-  const dflt = camera.retention_default_days ?? 30;
-  const currentEffective = camera.retention_days ?? dflt;
-  const newEffective = retDays === 0 ? dflt : retDays;
+  // Everything below is MINUTES. 0 = reset to default; NaN when the input
+  // isn't a number at all.
+  const retMinutes = toMinutes(retention, retentionUnit);
+  const dflt = camera.retention_default_minutes ?? 30 * MINUTES_PER_DAY;
+  const currentEffective = camera.retention_minutes ?? dflt;
+  const newEffective = retMinutes === 0 ? dflt : retMinutes;
 
+  // Grooming stays in DAYS: it is a re-encode of cold footage, and a threshold
+  // finer than a day is meaningless for a pass that runs in a nightly window.
+  // It is converted to minutes only where the two are compared.
   const groomDays = groom.trim() === '' ? 0 : Number(groom);
   const newGroomEffective = groomDays === 0 ? (groomDefault ?? 0) : groomDays;
   const curGroomEffective = camera.groom_after_days ?? groomDefault ?? 0;
   // Normalize "never grooms" (off, or footage deleted before the threshold)
-  // to Infinity so threshold comparisons read naturally.
-  const groomsAt = (eff: number, retentionEff: number) =>
-    eff > 0 && eff < retentionEff ? eff : Infinity;
+  // to Infinity so threshold comparisons read naturally. `retentionEff` is in
+  // minutes, so the groom threshold is converted up to compare.
+  const groomsAt = (effDays: number, retentionEffMinutes: number) =>
+    effDays > 0 && effDays * MINUTES_PER_DAY < retentionEffMinutes ? effDays : Infinity;
   const newGroomsAt = groomsAt(newGroomEffective, newEffective);
   const lowersRetention = newEffective < currentEffective;
   const lowersGroom = newGroomsAt < groomsAt(curGroomEffective, currentEffective);
@@ -92,8 +105,9 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
       toast('Select at least one day to record, or choose another mode', 'err');
       return;
     }
-    if (!Number.isInteger(retDays) || retDays < 0 || retDays > 3650) {
-      toast('Retention must be a whole number of days between 1 and 3650, or blank for the default', 'err');
+    const retErr = retentionError(retention, retentionUnit);
+    if (retErr) {
+      toast(`${retErr} Leave it blank for the appliance default.`, 'err');
       return;
     }
     if (!Number.isInteger(groomDays) || groomDays < 0 || groomDays > 3650) {
@@ -108,11 +122,11 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
       if (lowersRetention) {
         try {
           const r = await apiFetch<{ earliest: string }>(`/nvr/cameras/${encodeURIComponent(camera.slug)}/range`);
-          const ageDays = (Date.now() - new Date(r.earliest).getTime()) / 86400000;
-          affected = Math.max(0, Math.min(ageDays, currentEffective) - newEffective);
+          const ageMinutes = (Date.now() - new Date(r.earliest).getTime()) / 60000;
+          affected = Math.max(0, Math.min(ageMinutes, currentEffective) - newEffective);
         } catch { /* fall through with affected = null */ }
       }
-      setAffectedDays(affected);
+      setAffectedMinutes(affected);
       setTyped('');
       setConfirming(true);
       return;
@@ -164,7 +178,7 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
       // recording on/off + retention + groom-after
       await apiFetch(`/cameras/${camera.id}`, {
         method: 'PUT',
-        body: JSON.stringify({ recording: mode !== 'off', retention_days: retDays, groom_after_days: groomDays, retention_justification: justification.trim() }),
+        body: JSON.stringify({ recording: mode !== 'off', retention_minutes: retMinutes, groom_after_days: groomDays, retention_justification: justification.trim() }),
       });
       // schedule — only meaningful when recording; Continuous clears it.
       if (mode === 'continuous') {
@@ -226,6 +240,19 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
             </div>
           )}
 
+          {timelapseStillOn(camera) && (
+            <div style={{
+              marginTop: 12, padding: '10px 12px', borderRadius: 8,
+              border: '1px solid var(--yellow)', background: 'transparent',
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>Time-lapse still captures this camera</div>
+              <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 4 }}>
+                Recording is off, but time-lapse keeps taking stills from the live stream under its own
+                retention. Switch it off on the Time-lapse tab if no pictures of this view should be kept.
+              </div>
+            </div>
+          )}
+
           <div className="card-title" style={{ margin: '20px 0 8px' }}>Retention</div>
           <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '8px 10px', alignItems: 'center', justifyContent: 'start' }}>
             <span style={{ fontSize: 12.5 }}>Keep full quality for</span>
@@ -240,24 +267,26 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
               <span style={{ fontSize: 12.5, color: 'var(--muted)' }}>days</span>
             </span>
             <span style={{ fontSize: 12.5 }}>Keep footage for</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <input
-                type="number" min={1} max={3650} step={1} value={retention}
-                onChange={e => setRetention(e.target.value)}
-                placeholder={`Default: ${dflt} days`}
-                style={{ width: 170 }}
-              />
-              <span style={{ fontSize: 12.5, color: 'var(--muted)' }}>days</span>
-            </span>
+            <RetentionInput
+              value={retention} unit={retentionUnit}
+              onValue={setRetention} onUnit={setRetentionUnit}
+              placeholder={`Default: ${formatRetention(dflt)}`}
+              ariaLabel="Keep footage for"
+            />
           </div>
           <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 8, lineHeight: 1.6 }}>
             {newGroomsAt !== Infinity
               ? <>Footage lifecycle: full quality for <b>{newGroomsAt} days</b> → compressed to
-                 keyframe-only (plays as a slideshow) until <b>{newEffective} days</b> → deleted.</>
-              : <>Footage stays full quality until it is deleted at <b>{newEffective} days</b>
+                 keyframe-only (plays as a slideshow) until <b>{formatRetention(newEffective)}</b> → deleted.</>
+              : <>Footage stays full quality until it is deleted at <b>{formatRetention(newEffective)}</b>
                  {retention.trim() === '' && <> (the appliance default)</>}.</>}{' '}
             Blank fields use the appliance defaults. The global size cap still applies — the oldest
             footage across all cameras is evicted first when over the cap, even inside these windows.
+            {newEffective < 60 && (
+              <> <b>Below an hour, deletion is accurate to about a minute</b> — recordings are
+              written in 60-second segments and whole segments are deleted, so the last minute of
+              a window can survive slightly past it.</>
+            )}
           </div>
           <div style={{ marginTop: 14 }}>
             <label style={{ fontSize: 12.5, display: 'block', marginBottom: 6 }}>
@@ -304,13 +333,16 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
              onClose={() => setConfirming(false)} width={480}>
         {lowersRetention && (
           <div style={{ fontSize: 13, marginBottom: 12, lineHeight: 1.6 }}>
-            Shortening retention from <b>{currentEffective}</b> to <b>{newEffective}</b> days means footage
-            older than {newEffective} days is permanently deleted within the hour.{' '}
-            {affectedDays == null
+            Shortening retention from <b>{formatRetention(currentEffective)}</b> to{' '}
+            <b>{formatRetention(newEffective)}</b> means footage older than{' '}
+            {formatRetention(newEffective)} is permanently deleted — the sweep runs at least
+            four times per retention period, so within about{' '}
+            {formatRetention(Math.max(1, Math.min(60, Math.round(newEffective / 4))))}.{' '}
+            {affectedMinutes == null
               ? 'The amount of affected footage could not be determined right now.'
-              : affectedDays < 0.1
+              : affectedMinutes < 1
                 ? 'No stored footage is currently older than the new window, but future footage will be deleted sooner.'
-                : <>Roughly <b>{affectedDays >= 10 ? Math.round(affectedDays) : affectedDays.toFixed(1)} days</b> of
+                : <>Roughly <b>{formatApproxRetention(affectedMinutes)}</b> of
                    this camera's oldest footage will be deleted.</>}{' '}
             <b>This cannot be undone</b> — there is no trash and no backup.
           </div>
@@ -332,7 +364,12 @@ export function RecordingTab({ camera, onSaved }: { camera: Camera; onSaved: () 
         <div className="form-actions">
           <button className="btn-danger" onClick={doSave}
                   disabled={saving || (lowersRetention && typed !== 'DELETE')}>
-            {saving ? 'Saving…' : lowersRetention ? `Reduce to ${newEffective} days` : 'Apply'}
+            {/* The period, not a bare number with a hard-coded unit: this is
+                the last thing an operator reads before footage is deleted, and
+                "Reduce to 45 days" on a 45-MINUTE change is the one mislabel
+                that cannot be walked back. */}
+            {saving ? 'Saving…' : lowersRetention
+              ? `Reduce to ${formatRetention(newEffective)}` : 'Apply'}
           </button>
           <button className="btn-ghost" onClick={() => setConfirming(false)} disabled={saving}>Cancel</button>
         </div>

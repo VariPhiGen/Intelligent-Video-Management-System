@@ -11,6 +11,8 @@
  * bound up with the table's selection and the fleet's current settings.
  */
 import { Modal } from '@/components/Modal';
+import { RetentionInput } from '@/components/RetentionInput';
+import { formatRetention, type RetentionUnit } from '@/lib/retention';
 import type { Camera } from '@/lib/types';
 
 import { gb, humanSize, type NvrStorage } from './storageBits';
@@ -66,7 +68,8 @@ export function PurgeModal({
 
 export function BulkRetentionModal({
   bulkOpen, setBulkOpen, applying, gGroom, setGGroom, groomPlaceholder,
-  gRetention, setGRetention, retentionPlaceholder, validRet, validGroom,
+  gRetention, setGRetention, gRetentionUnit, setGRetentionUnit,
+  retentionPlaceholder, validRet, validGroom,
   loweredRetentionCams, gRetVal, groomsSoonerCams, bulkTyped, setBulkTyped,
   applyGlobal, canApply, cameras,
 }: {
@@ -78,11 +81,14 @@ export function BulkRetentionModal({
   groomPlaceholder: string;
   gRetention: string;
   setGRetention: (v: string) => void;
+  gRetentionUnit: RetentionUnit;
+  setGRetentionUnit: (u: RetentionUnit) => void;
   retentionPlaceholder: string;
   validRet: boolean;
   validGroom: boolean;
   /** Cameras whose footage this change would delete — gates the DELETE field. */
   loweredRetentionCams: Camera[];
+  /** The requested retention in MINUTES, or null when the field is blank. */
   gRetVal: number | null;
   groomsSoonerCams: Camera[];
   bulkTyped: string;
@@ -109,22 +115,27 @@ export function BulkRetentionModal({
         </div>
         <div className="form-group full">
           <label>Keep footage for (retention)</label>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <input type="number" min={1} max={3650} step={1} value={gRetention}
-              onChange={e => setGRetention(e.target.value)} placeholder={retentionPlaceholder} style={{ maxWidth: 200 }} />
-            <span style={{ fontSize: 12.5, color: 'var(--muted)' }}>days</span>
-          </span>
+          <RetentionInput
+            value={gRetention} unit={gRetentionUnit}
+            onValue={setGRetention} onUnit={setGRetentionUnit}
+            placeholder={retentionPlaceholder} width={140}
+            ariaLabel="Keep footage for"
+          />
         </div>
         {(!validRet || !validGroom) && (
           <div style={{ color: 'var(--red)', fontSize: 11.5, marginBottom: 8 }}>
-            Enter a whole number of days between 1 and 3650, or leave the field blank.
+            Enter a whole number (up to 3650 days, and at least one whole minute
+            of retention), or leave the field blank.
           </div>
         )}
         {loweredRetentionCams.length > 0 && (
           <div style={{ fontSize: 13, margin: '4px 0 12px', lineHeight: 1.6 }}>
             <b style={{ color: 'var(--red)' }}>{loweredRetentionCams.length} camera{loweredRetentionCams.length !== 1 ? 's' : ''}</b>{' '}
-            currently keep footage longer than {gRetVal} days — their older footage is <b>permanently deleted</b>{' '}
-            within the hour. This cannot be undone; there is no trash and no backup.
+            currently keep{loweredRetentionCams.length === 1 ? 's' : ''} footage longer
+            than {formatRetention(gRetVal)} — their older footage is{' '}
+            <b>permanently deleted</b> within about{' '}
+            {formatRetention(Math.max(1, Math.min(60, Math.round((gRetVal ?? 0) / 4))))}.{' '}
+            This cannot be undone; there is no trash and no backup.
           </div>
         )}
         {groomsSoonerCams.length > 0 && (

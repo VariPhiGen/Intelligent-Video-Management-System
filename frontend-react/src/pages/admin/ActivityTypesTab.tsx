@@ -23,6 +23,8 @@ interface Draft {
   key: string;
   label: string;
   color: string;
+  search_aliases: string[];
+  suggested_aliases: string[];
 }
 
 const ZONE_RULE_TEXT: Record<string, string> = {
@@ -50,7 +52,7 @@ export function ActivityTypesTab() {
   const [err, setErr] = useState('');
 
   const seed = (types: ActivityMeta[]) =>
-    setDrafts(types.map(t => ({ key: t.key, label: t.label, color: t.color })));
+    setDrafts(types.map(t => ({ key: t.key, label: t.label, color: t.color, search_aliases: t.search_aliases || [], suggested_aliases: t.suggested_aliases || [] })));
 
   async function load() {
     try {
@@ -70,7 +72,7 @@ export function ActivityTypesTab() {
     setDrafts(ds => ds.map(d => (d.key === key ? { ...d, ...patch } : d)));
 
   const dirty = !!stored && drafts.some((d, i) =>
-    d.label.trim() !== stored[i]?.label || d.color !== stored[i]?.color);
+    d.label.trim() !== stored[i]?.label || d.color !== stored[i]?.color || JSON.stringify(d.search_aliases) !== JSON.stringify(stored[i]?.search_aliases || []) || JSON.stringify(d.suggested_aliases) !== JSON.stringify(stored[i]?.suggested_aliases || []));
   const blank = drafts.some(d => !d.label.trim());
 
   async function save() {
@@ -78,7 +80,7 @@ export function ActivityTypesTab() {
     try {
       const saved = await apiFetch<ActivityMeta[]>('/cameras/analytics/types', {
         method: 'PUT',
-        body: JSON.stringify({ types: drafts.map(d => ({ key: d.key, label: d.label.trim(), color: d.color })) }),
+        body: JSON.stringify({ types: drafts.map(d => ({ key: d.key, label: d.label.trim(), color: d.color, search_aliases: d.search_aliases, suggested_aliases: d.suggested_aliases })) }),
       });
       setStored(saved);
       seed(saved);
@@ -137,6 +139,21 @@ export function ActivityTypesTab() {
                 </button>
               </div>
 
+              <label className="hint">Search aliases (comma separated)
+                <input aria-label={`${d.key} search aliases`} value={d.search_aliases.join(', ')} disabled={busy}
+                  onChange={e => set(d.key, { search_aliases: e.target.value.split(',').map(v => v.trim()) })}
+                  onBlur={() => set(d.key, { search_aliases: [...new Set(d.search_aliases.filter(Boolean))] })} />
+              </label>
+              {d.suggested_aliases.map(alias => <div key={alias} className="hint">
+                Suggested alias: {alias}
+                <button className="btn-ghost btn-sm" disabled={busy} onClick={() => set(d.key, {
+                  search_aliases: [...new Set([...d.search_aliases, alias])],
+                  suggested_aliases: d.suggested_aliases.filter(a => a !== alias),
+                })}>Accept alias</button>
+                <button className="btn-ghost btn-sm" disabled={busy} onClick={() => set(d.key, {
+                  suggested_aliases: d.suggested_aliases.filter(a => a !== alias),
+                })}>Dismiss alias</button>
+              </div>)}
               {open === d.key && (
                 <div style={{ marginLeft: 42, display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 12px',
                               borderRadius: 8, background: 'var(--surface2)', border: '1px solid var(--border)' }}>

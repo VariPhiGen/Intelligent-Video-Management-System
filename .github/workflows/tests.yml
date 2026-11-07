@@ -64,6 +64,8 @@ jobs:
             python: "3.11"
           - service: nvr
             python: "3.12"
+          - service: mqtt-modbus
+            python: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

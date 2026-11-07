@@ -157,7 +157,22 @@ class StubSession:
             first=lambda: None,
             fetchall=lambda: [],
             mappings=lambda: SimpleNamespace(all=lambda: []),
+            # An UPDATE or DELETE against an empty database touches nothing.
+            rowcount=0,
         )
+
+    async def scalar(self, statement=None, *a, **kw):
+        """`db.scalar(stmt)` is `(await db.execute(stmt)).scalar()` on a real
+        session, so it delegates — otherwise the advisory-lock special case
+        above would apply on one path and not the other."""
+        return (await self.execute(statement, *a, **kw)).scalar()
+
+    async def get(self, model, key, *a, **kw):
+        """`db.get(Model, pk)` — nothing exists in an empty database."""
+        return None
+
+    async def delete(self, obj):
+        return None
 
     async def commit(self):
         self.commits += 1
@@ -194,10 +209,37 @@ class StubSession:
         return None
 
     async def delete(self, obj):
+        # Forget it, so a handler that deletes and then re-reads sees it gone.
+        self.added = [o for o in self.added if o is not obj]
         return None
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def get(self, model, pk, *a, **kw):
+        """A real session answers `get()` from its identity map before it goes
+        near the database. This is that much and no more: rows THIS session was
+        handed, by primary key.
+
+        It is what lets a contract test create a rule and then arm it — the
+        authority the rules router exists to separate — without pretending to
+        run a query. Anything that needs a SELECT still belongs in a *_db suite.
+        """
+        # The primary key is read off the mapper, not assumed to be "id".
+        # Most tables here key on `id`, but not all — `label_classes` keys on
+        # `key` — and a hardcoded "id" silently answers None for those, which
+        # looks like "no such row" and makes a validation test pass vacuously.
+        try:
+            pk_names = [c.name for c in model.__table__.primary_key]
+        except AttributeError:
+            pk_names = ["id"]
+        for obj in self.added:
+            if not isinstance(obj, model):
+                continue
+            if all(str(getattr(obj, name, None)) == str(pk)
+                   for name in pk_names):
+                return obj
+        return None
 
     def begin(self):
         """`async with db.begin():` — the delete path opens a transaction."""
@@ -429,7 +471,11 @@ def app(db, monkeypatch):
 
     monkeypatch.setattr(redis_client, "get_redis", _get_redis)
     monkeypatch.setattr(redis_client, "_redis", fake, raising=False)
-    for name in ("audit", "health", "scan_manager"):
+    # Each of these does `from ..redis_client import get_redis` at import time,
+    # so the name is bound in THEIR module namespace and patching redis_client
+    # alone leaves them dialling a real Valkey — which the network guard below
+    # turns into an AssertionError rather than a mystery.
+    for name in ("audit", "health", "scan_manager", "rules_engine"):
         module = __import__(f"backend.services.{name}", fromlist=[name])
         if hasattr(module, "get_redis"):
             monkeypatch.setattr(module, "get_redis", _get_redis)
@@ -480,3 +526,17 @@ def camera_id():
     """A syntactically valid camera id, so a 404/403 is about the CAMERA and
     not about the path failing to parse."""
     return str(uuid.uuid4())
+
+
+@pytest.fixture(autouse=True)
+def _timelapse_site_and_disk(monkeypatch):
+    """Time-lapse's disk guard measures a real disk and caches site settings per
+    process: give every test a roomy disk and built-in defaults, so the guard only
+    trips in the tests that ask it to (test_timelapse_defaults.py)."""
+    from collections import namedtuple
+    from backend.services import timelapse as tl
+    du = namedtuple("du", "total used free")
+    monkeypatch.setattr(tl.shutil, "disk_usage", lambda p: du(1000 * 1024 ** 3, 100 * 1024 ** 3, 900 * 1024 ** 3))
+    tl._site.update(defaults={}, guard={}, paused=None, at=-1e9)
+    yield
+    tl._site.update(defaults={}, guard={}, paused=None, at=-1e9)

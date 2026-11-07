@@ -40,6 +40,21 @@ HOST_NETWORK_EXEMPT = {
     # The TLS front door is host-network and not remapped; TLS deployments are
     # Linux-first, and the overlay header says so.
     "caddy",
+    # The siren chain is Linux-only: mqtt-modbus drives a USB RS-485 adapter,
+    # which Docker Desktop cannot pass through, and mosquitto exists (profile
+    # "mqtt") to serve it and the api's bridge on 127.0.0.1. Both are
+    # opt-in profiles, so a Docker Desktop install never starts them.
+    "mosquitto",
+    "mqtt-modbus",
+    # The device gateway reaches LAN devices directly: Modbus TCP relay boards
+    # and MULTICAST paging speakers. Multicast cannot leave Docker Desktop's
+    # VM, so the gateway is Linux-only like the siren chain, behind the opt-in
+    # "gateway" profile, and talks to the api on 127.0.0.1 (both host network).
+    "device-gateway",
+    # Home Assistant needs host networking for mDNS/SSDP/DHCP discovery and to
+    # reach LAN relay boards directly; none of that crosses Docker Desktop's
+    # VM. Opt-in "homeassistant" profile, reached by the api on 127.0.0.1.
+    "ha",
 }
 
 

@@ -103,7 +103,7 @@ def sub_is_recordable(camera: Any) -> bool:
 # Resolution describes what the camera offers; these describe what a person
 # decided, and a probe has no opinion about either — so a re-probe must carry
 # them across rather than replace them.
-OPERATOR_SET_FIELDS = ("recording_enabled", "retention_days")
+OPERATOR_SET_FIELDS = ("recording_enabled", "retention_minutes")
 
 
 def carry_operator_settings(prior: dict | None, resolved: dict | None) -> dict | None:
@@ -112,7 +112,7 @@ def carry_operator_settings(prior: dict | None, resolved: dict | None) -> dict |
     `resolve()` always reports `recording_enabled: False` and no retention,
     because it describes the camera rather than the deployment. Re-checking a
     camera therefore overwrote both. `recording_enabled` was being restored by
-    hand at the one call site and `retention_days` was not, so a deliberate
+    hand at the one call site and `retention_minutes` was not, so a deliberate
     14-day sub retention silently reverted to the 3-day default and footage
     someone had chosen to keep started ageing out.
 
@@ -128,19 +128,27 @@ def carry_operator_settings(prior: dict | None, resolved: dict | None) -> dict |
     return resolved
 
 
-def sub_retention_days(camera: Any, main_retention: int | None) -> int:
-    """How long to keep this camera's sub track.
+def sub_retention_minutes(camera: Any, main_retention_minutes: int | None) -> int:
+    """How long to keep this camera's sub track, in MINUTES.
 
-    Precedence: the camera's own `sub_track.retention_days`, else the appliance
-    default, and never longer than the main — a scrub track outliving the
-    footage it is meant to help scrub is pure waste.
+    Precedence: the camera's own `sub_track.retention_minutes`, else the
+    appliance default, and never longer than the main — a scrub track
+    outliving the footage it is meant to help scrub is pure waste.
+
+    The clamp is why this had to move to minutes along with the main. In days,
+    its floor was `max(1, ...)` — one whole day — so a camera whose main was
+    cut to thirty minutes would have kept a sub track for a day, and the scrub
+    track would have outlived by 48x the footage it exists to help scrub. The
+    floor is one MINUTE now, which is the recorder's real segment granularity.
     """
-    from ..config import settings
+    from . import retention_units  # noqa: PLC0415 — reads settings lazily
 
     st = getattr(camera, "sub_track", None) or {}
-    want = st.get("retention_days") or settings.nvr_sub_retention_days
-    effective_main = main_retention or settings.nvr_default_retention_days
-    return max(1, min(int(want), int(effective_main)))
+    want = st.get("retention_minutes") or retention_units.default_sub_retention_minutes()
+    effective_main = (main_retention_minutes
+                      or retention_units.default_retention_minutes())
+    return max(retention_units.MIN_RETENTION_MINUTES,
+               min(int(want), int(effective_main)))
 
 
 def tracks_for(camera: Any) -> list[Track]:

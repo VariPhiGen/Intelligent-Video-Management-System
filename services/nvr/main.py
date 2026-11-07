@@ -38,15 +38,51 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _default_retention_minutes(rec_cfg: dict) -> int:
+    """The appliance retention default in MINUTES, from either spelling.
+
+    `default_retention_minutes` wins; `default_retention_days` is read as a
+    day-spelling of the same setting, so a cameras.yaml written before minutes
+    existed keeps its policy across the upgrade untouched.
+    """
+    minutes = rec_cfg.get("default_retention_minutes")
+    if minutes:
+        return int(minutes)
+    return int(rec_cfg.get("default_retention_days", 30)) * 1440
+
+
 def run_retention_loop(retention: RetentionManager, stop_event: threading.Event,
-                       interval: int = 3600):
-    """Run retention cleanup every `interval` seconds."""
+                       interval: float | None = None):
+    """Run retention cleanup, re-pacing itself after every pass.
+
+    The cadence used to be a fixed hour, which was right while retention was a
+    whole number of days: an hour of slack on a thirty-day promise is noise.
+    It is wrong for minute-granular retention — a camera set to ten minutes on
+    an hourly sweep keeps footage for up to seventy, so the setting appears not
+    to work at all.
+
+    `RetentionManager.sweep_interval()` derives the wait from the SHORTEST
+    retention configured across the appliance, clamped to [60 s, 1 h], and it
+    is asked AFTER each pass rather than once at startup because retention is
+    edited at runtime. A fleet of thirty-day cameras is swept hourly exactly as
+    before; one camera dropped to ten minutes pulls the whole loop to 150 s,
+    which is what it costs to honour it. `interval` pins the wait instead, for
+    tests and for an operator who wants the old fixed behaviour.
+    """
     while not stop_event.is_set():
         try:
             retention.run_once()
         except Exception:
             logger.exception("Retention pass failed")
-        stop_event.wait(interval)
+        if interval is not None:
+            wait = float(interval)
+        else:
+            try:
+                wait = retention.sweep_interval()
+            except Exception:
+                logger.exception("Retention: could not compute sweep interval")
+                wait = float(RetentionManager.MAX_SWEEP_INTERVAL_S)
+        stop_event.wait(wait)
 
 
 def main():
@@ -144,7 +180,7 @@ def main():
             )
     else:
         logger.warning("No storage cap set (NVR_MAX_STORAGE_GB / UI) — footage "
-                       "is bounded only by per-camera retention_days")
+                       "is bounded only by per-camera retention")
 
     # Uncapped or not, say so when the volume's own numbers cannot be trusted.
     # On Docker Desktop for Windows /data/nvr is a dynamically expanding vhdx
@@ -176,8 +212,8 @@ def main():
         clip_ttl_minutes=rec_cfg.get("clip_ttl_minutes", 30),
         hls_cache_ttl_minutes=rec_cfg.get("hls_cache_ttl_minutes", 360),
         storage_path=str(storage_path),
-        default_retention_days=rec_cfg.get("default_retention_days", 30),
-        # Runtime-added cameras (registry sync) carry their own retention_days;
+        default_retention_minutes=_default_retention_minutes(rec_cfg),
+        # Runtime-added cameras (registry sync) carry their own retention;
         # without this hook they would never be age-cleaned.
         retention_map_provider=(engine.get_retention_map if engine else None),
         # Read the size cap live so a UI edit applies on the next pass.
@@ -204,7 +240,7 @@ def main():
             "limit_bytes": storage_settings.max_storage_bytes,
             "pressure": retention.pressure_snapshot(),
             "oldest_epoch": (min(starts) if starts else None),
-            "configured_days": retention.configured_retention_days(),
+            "configured_minutes": retention.configured_retention_minutes(),
         }
 
     alerter.start(gather_pressure)
@@ -212,7 +248,7 @@ def main():
     # Fast trigger for emergency disk-floor eviction: the engine's 30s disk
     # check fires this the moment the volume crosses critical, so space is
     # reclaimed before ffmpeg starts failing writes (rather than waiting for the
-    # hourly retention pass, which also enforces the floor as a backstop).
+    # next retention pass, which also enforces the floor as a backstop).
     if engine is not None:
         engine.set_disk_pressure_callback(retention.enforce_disk_floor)
     retention_thread = threading.Thread(
@@ -282,6 +318,10 @@ def main():
         max_clip_seconds=rec_cfg.get("max_clip_seconds", 6 * 3600),
         # None (key absent) = size it to the encoder the startup probe finds.
         max_concurrent_extractions=rec_cfg.get("max_concurrent_extractions"),
+        # Snapshot extraction is capped separately from clips — a Data
+        # Collection run is hundreds of decodes competing with the recorders.
+        # None = the built-in default (2).
+        max_concurrent_snapshots=rec_cfg.get("max_concurrent_snapshots"),
     )
 
     logger.info("Starting API server on %s:%d", args.host, args.port)

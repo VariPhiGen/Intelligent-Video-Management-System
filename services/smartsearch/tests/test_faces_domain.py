@@ -395,7 +395,7 @@ def test_a_camera_can_be_registered_with_every_domain_the_registry_declares():
     seen = {}
 
     class Engine:
-        def upsert_camera(self, name, url, domains, retention_days=None):
+        def upsert_camera(self, name, url, domains, retention_minutes=None):
             seen["domains"] = domains
             entry = SimpleNamespace(
                 name=name, domains=domains,

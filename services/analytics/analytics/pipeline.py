@@ -69,9 +69,13 @@ MAX_FRAME_BOXES = 40
 class DetectionPipeline:
     def __init__(self, config: AppConfig, detector: Detector,
                  plate_reader=None, face_reader=None,
-                 sink: Optional[ObservationSink] = None) -> None:
+                 sink: Optional[ObservationSink] = None, presence=None) -> None:
         self._cfg = config
         self._detector = detector
+        #: analytics/presence.py — when each confirmed track was in view, for
+        #: the playback timeline. None = not recorded. Owned by the engine, so
+        #: it outlives this pipeline across a hibernation.
+        self._presence = presence
         self._plates = plate_reader
         self._faces = face_reader
         self._sink = sink
@@ -94,6 +98,9 @@ class DetectionPipeline:
             stationary_after_seconds=t.stationary_after_seconds,
             stationary_distance=t.stationary_distance,
             max_tracks_per_key=t.max_tracks_per_key,
+            reassociate_within_seconds=t.reassociate_within_seconds,
+            reassociate_iou=t.reassociate_iou,
+            reassociate_distance=t.reassociate_distance,
         ) if t.enabled else None
         self._index_tentative = t.index_tentative
 
@@ -208,6 +215,8 @@ class DetectionPipeline:
         if gone:
             self._policy.forget(gone)
             self._best_frames.forget(gone)
+            if self._presence is not None:
+                self._presence.close(gone)
 
     def note_gated_before_read(self, slug: str) -> None:
         """A frame the broker found no motion in, dropped before it was copied.
@@ -419,6 +428,8 @@ class DetectionPipeline:
         if gone:
             self._policy.forget(gone)
             self._best_frames.forget(gone)
+            if self._presence is not None:
+                self._presence.close(gone)
 
         # One whole-frame JPEG per frame, shared by every object in it that is
         # recorded — see _emit. Filled lazily, so a frame whose detections are
@@ -439,6 +450,13 @@ class DetectionPipeline:
                 # Too young to trust. A RECALL decision, not a saving.
                 self.detections_tentative += 1
                 continue
+
+            # Presence is every CONFIRMED sighting, whatever the indexing
+            # policy decides below: the policy picks which looks are worth a
+            # crop, the timeline needs to know the object was there at all.
+            if self._presence is not None and track is not None and track.confirmed:
+                self._presence.observe(slug, det.domain, track.track_id, ts,
+                                       track.first_seen, det.confidence, det.label)
 
             # A vehicle's best looks are collected whether or not this
             # observation is recorded: the point is to have a good frame ready

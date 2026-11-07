@@ -23,29 +23,39 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.services import smartsearch_sync  # noqa: E402
+from backend.services import retention_units  # noqa: E402
 from backend.config import settings  # noqa: E402
+
+DAY = 1440  # minutes — retention is minute-granular (services/retention_units.py)
 
 
 # ── resolving "default" ──────────────────────────────────────────────────────
 
 def test_an_explicit_camera_retention_is_used_as_is():
-    assert smartsearch_sync.effective_retention_days(2) == 2
+    assert smartsearch_sync.effective_retention_minutes(2 * DAY) == 2 * DAY
+
+
+def test_a_minute_scale_retention_survives_the_resolve():
+    """The whole point of the unit change reaching this path. A camera kept
+    for twenty minutes must not leave a day of person crops behind it — the
+    crop IS the footage as far as a data subject is concerned."""
+    assert smartsearch_sync.effective_retention_minutes(20) == 20
 
 
 def test_no_camera_retention_resolves_to_the_appliance_recording_default():
-    """NOT to the index's own SEARCH_RETENTION_DAYS. Those are two different
-    numbers, and sending None would let the index keep crops for thirty days on
-    an appliance recording for two."""
-    assert (smartsearch_sync.effective_retention_days(None)
-            == settings.nvr_default_retention_days)
+    """NOT to the index's own SEARCH_RETENTION_* setting. Those are two
+    different numbers, and sending None would let the index keep crops for
+    thirty days on an appliance recording for two."""
+    assert (smartsearch_sync.effective_retention_minutes(None)
+            == retention_units.default_retention_minutes())
 
 
 def test_zero_means_reset_to_default_not_expire_immediately():
     """0 is the registry's sentinel for "clear the override" (routers/cameras.py
     stores it as NULL). Forwarding a literal 0 would expire every crop from that
     camera on the next sweep."""
-    assert (smartsearch_sync.effective_retention_days(0)
-            == settings.nvr_default_retention_days)
+    assert (smartsearch_sync.effective_retention_minutes(0)
+            == retention_units.default_retention_minutes())
 
 
 # ── drift ────────────────────────────────────────────────────────────────────
@@ -61,8 +71,8 @@ class Recorder:
     async def list_cameras(self):
         return self.current
 
-    async def add_camera(self, slug, domains=None, retention_days=None):
-        self.added.append((slug, tuple(domains or ()), retention_days))
+    async def add_camera(self, slug, domains=None, retention_minutes=None):
+        self.added.append((slug, tuple(domains or ()), retention_minutes))
         return True
 
     async def remove_camera(self, slug):
@@ -84,8 +94,8 @@ def index(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_new_camera_is_added_with_its_retention(index):
     rec = index({})
-    await smartsearch_sync.reconcile({"a": (["person"], 2)}, set())
-    assert rec.added == [("a", ("person",), 2)]
+    await smartsearch_sync.reconcile({"a": (["person"], 2 * DAY)}, set())
+    assert rec.added == [("a", ("person",), 2 * DAY)]
 
 
 @pytest.mark.asyncio
@@ -93,9 +103,9 @@ async def test_retention_drift_is_corrected(index):
     """The failure this exists for: the immediate push from the update handler
     failed, so the index is still holding this camera's crops on the old clock
     and nothing else in the system would notice."""
-    rec = index({"a": (["person"], 30)})
-    await smartsearch_sync.reconcile({"a": (["person"], 2)}, set())
-    assert rec.added == [("a", ("person",), 2)]
+    rec = index({"a": (["person"], 30 * DAY)})
+    await smartsearch_sync.reconcile({"a": (["person"], 2 * DAY)}, set())
+    assert rec.added == [("a", ("person",), 2 * DAY)]
 
 
 @pytest.mark.asyncio
@@ -107,7 +117,7 @@ async def test_an_index_running_on_its_own_default_counts_as_drift(index):
     rec = index({"a": (["person"], None)})
     await smartsearch_sync.reconcile({"a": (["person"], None)}, set())
     assert rec.added == [("a", ("person",),
-                          settings.nvr_default_retention_days)]
+                          retention_units.default_retention_minutes())]
 
 
 @pytest.mark.asyncio
@@ -115,16 +125,16 @@ async def test_a_converged_camera_is_left_alone(index):
     """Reconcile runs in four workers on every sync interval, and each add
     restamps rows. Re-asserting a camera that already agrees would be an UPDATE
     over the whole index, four times a minute."""
-    rec = index({"a": (["person"], settings.nvr_default_retention_days)})
+    rec = index({"a": (["person"], retention_units.default_retention_minutes())})
     await smartsearch_sync.reconcile({"a": (["person"], None)}, set())
     assert rec.added == []
 
 
 @pytest.mark.asyncio
 async def test_domain_drift_still_heals_and_carries_retention(index):
-    rec = index({"a": (["person"], 2)})
-    await smartsearch_sync.reconcile({"a": (["person", "vehicles"], 2)}, set())
-    assert rec.added == [("a", ("person", "vehicles"), 2)]
+    rec = index({"a": (["person"], 2 * DAY)})
+    await smartsearch_sync.reconcile({"a": (["person", "vehicles"], 2 * DAY)}, set())
+    assert rec.added == [("a", ("person", "vehicles"), 2 * DAY)]
 
 
 @pytest.mark.asyncio
@@ -132,7 +142,7 @@ async def test_an_unreachable_index_changes_nothing(index):
     """Not "the index has no cameras". Acting on an unknown would remove every
     camera the registry knows about."""
     rec = index(None)
-    await smartsearch_sync.reconcile({"a": (["person"], 2)}, {"b"})
+    await smartsearch_sync.reconcile({"a": (["person"], 2 * DAY)}, {"b"})
     assert rec.added == [] and rec.removed == []
 
 
@@ -175,6 +185,19 @@ class _Defaulting(SimpleNamespace):
             raise AttributeError(name)
         return None
 
+    def resolved_retention_minutes(self):
+        """Delegates to the REAL CameraUpdate rather than re-implementing it.
+
+        The endpoint reads retention through this method now, so a stub with
+        its own copy of the conversion would let every test below pass while
+        the shipped one was broken.
+        """
+        from backend.models import CameraUpdate  # noqa: PLC0415 — test-local
+        return CameraUpdate(
+            retention_minutes=self.retention_minutes,
+            retention_days=self.retention_days,
+        ).resolved_retention_minutes()
+
 
 @pytest.fixture
 def endpoint(monkeypatch):
@@ -182,7 +205,7 @@ def endpoint(monkeypatch):
     cam = _Defaulting(id=uuid.uuid4(), slug="gate-a1b2",
                       rtsp_url="rtsp://u:pw@10.0.0.5:554/main",
                       enabled=True, recording=False, privacy_masks=[],
-                      retention_days=30, search_indexing=True,
+                      retention_minutes=30 * DAY, search_indexing=True,
                       search_domains=["person", "vehicles"], sub_track=None)
 
     async def get_cam(camera_id, db): return cam
@@ -192,7 +215,8 @@ def endpoint(monkeypatch):
     monkeypatch.setattr(cam_router, "_get_camera_or_404", get_cam)
     monkeypatch.setattr(cam_router, "get_principal", principal)
     monkeypatch.setattr(cam_router.audit_svc, "record", noop)
-    monkeypatch.setattr(cam_router, "sync_now", noop)
+    monkeypatch.setattr(cam_router, "sync_camera", noop)
+    monkeypatch.setattr(cam_router, "sync_removal", noop)
     monkeypatch.setattr(cam_router, "_build_response", lambda c: c)
     monkeypatch.setattr(cam_router, "_sync_recording_tracks", noop)
     monkeypatch.setattr(cam_router, "_teardown_recording_tracks", noop)
@@ -201,14 +225,14 @@ def endpoint(monkeypatch):
     monkeypatch.setattr(settings, "smartsearch_sync_enabled", True)
 
     class _NVR:
-        async def set_retention(self, slug, days):
-            calls.nvr_retention.append((slug, days)); return True
+        async def set_retention(self, slug, minutes):
+            calls.nvr_retention.append((slug, minutes)); return True
         async def set_groom(self, *a, **kw): return True
         async def invalidate_codec_cache(self, *a, **kw): return True
     monkeypatch.setattr(cam_router, "nvr_client", _NVR())
 
-    async def restart(slug, domains=None, retention_days=None):
-        calls.search.append((slug, tuple(domains or ()), retention_days))
+    async def restart(slug, domains=None, retention_minutes=None):
+        calls.search.append((slug, tuple(domains or ()), retention_minutes))
         return True
 
     async def remove(slug):
@@ -227,10 +251,32 @@ async def test_a_retention_change_alone_reaches_the_index(endpoint):
     """THE REGRESSION THIS FILE EXISTS FOR. Before this, the Smart Search push
     fired only on a domain or enabled change, so shortening retention updated
     the NVR and left the crops cut from that footage on the old clock."""
+    body = _Defaulting(retention_minutes=2 * DAY)
+    await cam_router.update_camera(endpoint.cam.id, body, endpoint.req, endpoint.db)
+    assert endpoint.calls.nvr_retention == [("gate-a1b2", 2 * DAY)]
+    assert endpoint.calls.search == [("gate-a1b2", ("person", "vehicles"), 2 * DAY)]
+
+
+@pytest.mark.asyncio
+async def test_a_minute_scale_retention_reaches_both_services(endpoint):
+    """Twenty minutes has to arrive as twenty minutes at BOTH ends. The index
+    stamps its deadline from this number, so a conversion that survived to the
+    recorder but not to the index would delete the footage on the new clock and
+    leave the crops cut from it searchable on the old one."""
+    body = _Defaulting(retention_minutes=20)
+    await cam_router.update_camera(endpoint.cam.id, body, endpoint.req, endpoint.db)
+    assert endpoint.calls.nvr_retention == [("gate-a1b2", 20)]
+    assert endpoint.calls.search == [("gate-a1b2", ("person", "vehicles"), 20)]
+
+
+@pytest.mark.asyncio
+async def test_the_deprecated_day_spelling_still_reaches_both(endpoint):
+    """A scripted caller written against the day-based API keeps working; the
+    router converts at the edge and nothing downstream sees two units."""
     body = _Defaulting(retention_days=2)
     await cam_router.update_camera(endpoint.cam.id, body, endpoint.req, endpoint.db)
-    assert endpoint.calls.nvr_retention == [("gate-a1b2", 2)]
-    assert endpoint.calls.search == [("gate-a1b2", ("person", "vehicles"), 2)]
+    assert endpoint.calls.nvr_retention == [("gate-a1b2", 2 * DAY)]
+    assert endpoint.calls.search == [("gate-a1b2", ("person", "vehicles"), 2 * DAY)]
 
 
 @pytest.mark.asyncio
@@ -247,7 +293,7 @@ async def test_turning_indexing_off_removes_rather_than_restamps(endpoint):
     """Opting a camera out of Smart Search is not a retention change, and must
     not be turned into one by the shared trigger."""
     endpoint.cam.search_indexing = False
-    body = _Defaulting(search_indexing=False, retention_days=2)
+    body = _Defaulting(search_indexing=False, retention_minutes=2 * DAY)
     await cam_router.update_camera(endpoint.cam.id, body, endpoint.req, endpoint.db)
     assert endpoint.calls.search == []
     assert endpoint.calls.removed == ["gate-a1b2"]

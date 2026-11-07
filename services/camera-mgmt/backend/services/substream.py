@@ -195,6 +195,11 @@ def judge(main: dict[str, Any] | None, sub: dict[str, Any] | None) -> tuple[bool
     """
     if not sub or not sub.get("width"):
         return False, "not reachable"
+    if (sub.get("codec") or "").lower() in ("mjpeg", "jpeg", "mjpg", "jpg"):
+        # A JPEG profile is always "smaller" than the main, so the size rule below
+        # took it — and live view can't carry JPEG at all (HLS is H.264/H.265):
+        # the camera's _sub tile 404'd forever (KEC A5000's i-PRO cameras).
+        return False, "JPEG stream — can't play live, never used as a sub"
 
     main_codec = (main or {}).get("codec")
     if not main_codec:

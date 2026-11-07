@@ -19,6 +19,7 @@
  * counts off `/motion/events`), and Geofences, a disabled chip until that
  * surface exists.
  */
+import { LoadingSkeleton } from '@/components/LoadingSkeleton';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
@@ -36,12 +37,17 @@ import {
 import { DRAG_SLOP_PX, type View } from './mapConstants';
 import { usePanZoom } from './usePanZoom';
 import { useCameraSnapshot, useMotionEvents, useSitemapImage, useSitemaps } from './useMapData';
-import { CalibrationPins, CameraDots, ZoneBoxes, type DotDragHandlers } from './MapMarkers';
+import {
+  CalibrationPins, CameraDots, CoverageFootprints, ZoneBoxes, type DotDragHandlers,
+} from './MapMarkers';
 import { EditHint, HeatCaption, HeatEmpty, ZoomControls } from './MapOverlays';
 import {
   CalibrateCard, CameraDetailPanel, CameraTray, HaDetailPanel, HaTray,
 } from './MapPanels';
 import { RenameModal, UploadModal } from './MapModals';
+import { RegisterCoverage } from './RegisterCoverage';
+import { deleteRegistration, saveRegistration, usePlanRegistrations } from './useRegistrations';
+import type { Pair } from './homographyFit';
 import { MapToolbar } from './MapToolbar';
 
 export function MapPage() {
@@ -67,6 +73,9 @@ export function MapPage() {
   const [heatWindow, setHeatWindow] = useState('24h');
 
   const snapUrl = useCameraSnapshot(selectedId);
+  // Coverage for the whole plan in one query — the alternative is a request
+  // per camera dot on every render.
+  const { registrations, reload: reloadRegistrations } = usePlanRegistrations(currentId);
   const { devices: peripheralDevices } = usePeripherals();
 
   const {
@@ -96,6 +105,7 @@ export function MapPage() {
   // the state itself is harmless either way.
   const [editMode, setEditMode] = useState(false);
   const [calibrating, setCalibrating] = useState(false);
+  const [registerOpen, setRegisterOpen] = useState(false);
   const [calPoints, setCalPoints] = useState<{ x: number; y: number; lat: string; lng: string }[]>([]);
   // Camera armed via the tray's "Place" button — the next click on the plan
   // (not on an existing dot) persists that camera's coordinates.
@@ -129,6 +139,53 @@ export function MapPage() {
     return peripheralDevices.filter(d => !placed.has(d.id));
   }, [peripheralDevices, haPins]);
 
+  const selectedRegistration = useMemo(
+    () => registrations.find(r => r.camera_id === selectedId) ?? null,
+    [registrations, selectedId],
+  );
+
+  const footprints = useMemo(
+    () => registrations.map(r => ({ cameraId: r.camera_id, points: r.footprint })),
+    [registrations],
+  );
+
+  // ── Registration ───────────────────────────────────────────────────────────
+  // The client fits the homography (see homographyFit.ts) and the server judges
+  // it, so a 422 here is a real rejection to surface verbatim rather than a
+  // generic failure — its messages are written for the person placing pins.
+  async function handleSaveRegistration(pairs: Pair[], homography: number[][]) {
+    if (!selected || currentId == null) return;
+    setBusy(true);
+    try {
+      await saveRegistration(selected.id, {
+        sitemap_id: currentId,
+        // Stage A registers a camera's fixed view. Per-preset registration for
+        // PTZ adds a token here and needs no other change on this path.
+        preset_token: '',
+        landmark_pairs: pairs,
+        homography,
+      });
+      await reloadRegistrations();
+      setRegisterOpen(false);
+      toast('Coverage registered', 'ok');
+    } catch (e: any) {
+      toast(e.message, 'err');
+    } finally { setBusy(false); }
+  }
+
+  async function handleDeleteRegistration(registrationId: number) {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await deleteRegistration(selected.id, registrationId);
+      await reloadRegistrations();
+      setRegisterOpen(false);
+      toast('Coverage removed', 'ok');
+    } catch (e: any) {
+      toast(e.message, 'err');
+    } finally { setBusy(false); }
+  }
+
   // Everything transient resets when the plan changes.
   useEffect(() => {
     resetForNewMap();
@@ -142,6 +199,8 @@ export function MapPage() {
     haDragRef.current = null;
     setOptimistic({});
     setCalibrating(false);
+    // A half-finished registration belongs to the plan it was started on.
+    setRegisterOpen(false);
     setCalPoints([]);
   }, [currentId, resetForNewMap]);
 
@@ -485,7 +544,7 @@ export function MapPage() {
   );
 
   if (sitemaps === null) {
-    return <div className="empty"><span className="spinner lg" /></div>;
+    return <LoadingSkeleton label="Loading site plans…" variant="preview" />;
   }
 
   if (sitemaps.length === 0) {
@@ -528,7 +587,7 @@ export function MapPage() {
         onUpload={() => setUploadOpen(true)}
       />
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 300px', gap: 'var(--s5)', alignItems: 'start' }}>
+      <div className="map-split">
         {/* One grid cell: the plan and the key that explains it. */}
         <div style={{ minWidth: 0 }}>
           <div
@@ -559,7 +618,7 @@ export function MapPage() {
             }}>
             {imgLoading && (
               <div className="empty" style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <span className="spinner lg" />
+                <LoadingSkeleton label="Loading map image…" variant="preview" />
               </div>
             )}
             {imgError && !imgLoading && (
@@ -578,6 +637,20 @@ export function MapPage() {
                   drag={dotDrag}
                 />
                 {calibrating && <CalibrationPins points={calPoints} scale={tf.scale} />}
+              </div>
+            )}
+
+            {imgUrl && view === 'coverage' && (
+              <div style={layerStyle}>
+                {planImg}
+                {/* Footprints under the dots: the polygons are decoration for
+                    the dots, and a dot buried under a translucent polygon is
+                    still the thing an operator wants to click. */}
+                <CoverageFootprints footprints={footprints} selectedId={selectedId} />
+                <CameraDots
+                  dots={dots} motion={motion} scale={tf.scale} labels={labels}
+                  selectedId={selectedId} onSelect={setSelectedId}
+                />
               </div>
             )}
 
@@ -722,6 +795,9 @@ export function MapPage() {
               motionState={selected ? motion[selected.slug] : undefined}
               autoPlaced={!!selected && autoIds.has(selected.id)}
               editMode={editMode}
+              registration={selectedRegistration}
+              canRegister={canManage && !!currentMap}
+              onRegister={() => setRegisterOpen(true)}
               onSaveGps={persistGps}
               onCopyGps={text => navigator.clipboard?.writeText(text).then(() => toast('Copied', 'ok'))}
               onOpenLive={() => nav('/live')}
@@ -738,6 +814,20 @@ export function MapPage() {
       {canManage && currentMap && (
         <RenameModal open={renameOpen} busy={busy} initialName={currentMap.name}
           onClose={() => setRenameOpen(false)} onSubmit={handleRename} />
+      )}
+      {canManage && (
+        <RegisterCoverage
+          open={registerOpen && !!selected && !!currentMap}
+          camera={selected}
+          plan={currentMap}
+          planImgUrl={imgUrl}
+          frameUrl={snapUrl}
+          existing={selectedRegistration}
+          busy={busy}
+          onSave={handleSaveRegistration}
+          onDelete={handleDeleteRegistration}
+          onClose={() => setRegisterOpen(false)}
+        />
       )}
     </div>
   );

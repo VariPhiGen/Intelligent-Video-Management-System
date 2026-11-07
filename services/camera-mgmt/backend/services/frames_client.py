@@ -171,6 +171,27 @@ def desired_sets(rows) -> tuple[set[str], set[str]]:
     return desired, absent
 
 
+async def push_camera(slug: str, enabled: bool, motion: bool, search_indexing: bool,
+                      search_domains, analytics_config) -> None:
+    """Apply one camera's state to the broker now. Best-effort, never raises.
+
+    THE BROKER IS THE FIRST LINK, so it is the one that decides how long a
+    switch takes to mean anything. Analytics reads frames from here; without
+    them it has nothing to detect, and a camera that only reaches the broker on
+    the next reconcile pass produces no crops for up to `nvr_sync_interval`
+    however promptly the index was told to expect them. Same immediacy
+    `analytics_client.push_camera` gives the detector.
+    """
+    if not (settings.frames_sync_enabled and is_configured()):
+        return
+    desired, _ = desired_sets([(slug, enabled, motion, search_indexing,
+                                search_domains, analytics_config)])
+    if slug in desired:
+        await add_camera(slug)
+    else:
+        await remove_camera(slug)
+
+
 async def reconcile_loop() -> None:
     """Background task: periodic registry→broker reconciliation."""
     # Local import to avoid a circular import at module load time.

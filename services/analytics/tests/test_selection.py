@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analytics import selection                                       # noqa: E402
+from analytics import detector, selection                             # noqa: E402
 from analytics.artifacts import Artifact                              # noqa: E402
 from analytics.config import ModelConfig                              # noqa: E402
 from analytics.hardware import RuntimeInfo                            # noqa: E402
@@ -33,6 +33,9 @@ from analytics.selection import OPENVINO, TORCH, DetectorSelector     # noqa: E4
 def _env(monkeypatch, *, device="cpu", openvino_available=True, export_ok=True,
          export_error="export blew up"):
     monkeypatch.setattr(selection, "resolve_device", lambda _p: device)
+    # The crash-isolated probe has its own tests (test_detector_probe.py);
+    # here it passes, so these exercise the in-process path.
+    monkeypatch.setattr(detector, "probe_isolated", lambda *a, **kw: None)
     monkeypatch.setattr(selection, "runtimes", lambda: {
         OPENVINO: RuntimeInfo(OPENVINO, openvino_available, "2026.3.1"),
         TORCH: RuntimeInfo(TORCH, True, "2.14.0+cpu"),

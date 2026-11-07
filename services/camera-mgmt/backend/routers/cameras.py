@@ -59,6 +59,7 @@ from ..models import (
     SystemHealthResponse,
     UptimeInterval,
     generate_slug,
+    onvif_host,
     sub_recording_name,
     validate_lawful_basis,
     validate_stqc_status,
@@ -69,13 +70,16 @@ from ..urlutil import host_of
 from ..services import audit as audit_svc
 from ..services.audit import actor_of
 from ..services import health as health_svc
-from ..services import motion_client, nvr_client, onvif_device, onvif_media, relay
-from ..services import substream, tracks
+from ..services import motion_client, nvr_client, onvif_device, onvif_media, onvif_ptz, relay
+from ..services import retention_units, substream, tracks
 from ..services import smartsearch_sync
 from ..services import schedule as schedule_svc
+from ..services import snapshot as snapshot_svc
+from ..services import timelapse as timelapse_svc
 from ..services.deepstream import deepstream_config
-from ..services.deepstream_client import sync_now
+from ..services.deepstream_client import sync_camera, sync_removal
 from ..services import analytics_client
+from ..services import frames_client
 from ..services import activity_catalog
 from ..services.policy import require_capability
 
@@ -156,8 +160,9 @@ async def _sync_recording_tracks(camera: Camera, *, restart: bool = False) -> No
             is_sub = name == sub_name
             await nvr_client.add_camera(
                 name,
-                retention_days=(tracks.sub_retention_days(camera, camera.retention_days)
-                                if is_sub else camera.retention_days),
+                retention_minutes=(
+                    tracks.sub_retention_minutes(camera, camera.retention_minutes)
+                    if is_sub else camera.retention_minutes),
                 masks=camera.privacy_masks,
                 # 0 = never groom the sub. Grooming rewrites footage
                 # keyframe-only, which is exactly what a scrub track must not
@@ -268,7 +273,7 @@ async def create_camera(
                 enabled=body.enabled,
                 recording=body.recording,
                 stage=CameraStage.REGISTERED.value,
-                ip=host_of(body.rtsp_url),
+                ip=body.ip or host_of(body.rtsp_url),
                 camera_metadata=body.metadata,
                 lawful_basis=lawful_basis,
                 purpose=purpose,
@@ -306,6 +311,11 @@ async def create_camera(
         # Fast-path status: don't leave the UI on "unknown" until the next
         # 30s monitor poll — verify within seconds.
         asyncio.create_task(health_svc.check_camera_soon(camera.id))
+
+    # DeepStream: a freshly created camera has no zones yet, so this is a no-op
+    # unless the create body carried an analytics config — but the hook is
+    # here so the create path and the update path can never drift apart.
+    await sync_camera(camera, f"camera.created:{slug}")
 
     log.info("create_camera.ok", slug=slug)
     await audit_svc.record(
@@ -473,6 +483,75 @@ async def uptime_summary(
     return {"hours": hours, "buckets": buckets, "cameras": out}
 
 
+# ─── GET /cameras/export.xlsx ────────────────────────────────────────────────
+# Admin-only full inventory (name + camera ID first) as a real Excel workbook. Registered BEFORE
+# /{camera_id} for the same reason as /uptime/summary. `ids` narrows it to the rows ticked in the
+# inventory; without it, every registered camera. Credentials never leave — see camera_export.py.
+#
+# require_role("admin"), not the grantable 'export_reports' capability that gates the uptime
+# workbook: this file is the whole fleet's reachability (IPs, MACs, ports, stream URLs), which is a
+# different thing to hand out than one camera's uptime timeline. Widen it deliberately, if ever.
+
+@router.get("/export.xlsx")
+async def export_cameras_xlsx(
+    request: Request,
+    ids: Optional[str] = Query(default=None, description="Comma-separated camera IDs (default: all)"),
+    principal=Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    from ..services import camera_export
+
+    stmt = select(Camera).where(Camera.stage == CameraStage.REGISTERED.value)
+    wanted: list[uuid.UUID] = []
+    if ids:
+        try:
+            wanted = [uuid.UUID(x.strip()) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(422, detail="ids must be comma-separated camera IDs")
+        stmt = stmt.where(Camera.id.in_(wanted))
+    cams = (await db.execute(stmt.order_by(Camera.name.asc().nulls_last()))).scalars().all()
+
+    # Both riders are best-effort: an inventory must export with MediaMTX down (status → Unknown)
+    # or the status-event history empty (uptime blank) — that is often exactly when it's wanted.
+    ready: Optional[set[str]] = None
+    try:
+        ready = {p.get("name", "") for p in await relay.list_active_paths() if p.get("ready")}
+    except Exception as exc:
+        log.debug("export_cameras.relay_unavailable", error=str(exc))
+    uptime: dict[str, Any] = {}
+    try:
+        uptime = (await uptime_summary(hours=168, db=db)).get("cameras", {})
+    except Exception as exc:
+        log.debug("export_cameras.uptime_unavailable", error=str(exc))
+
+    rows = [
+        camera_export.camera_row(
+            c,
+            zone=(c.camera_metadata or {}).get("zone") or "Unzoned",
+            streaming=None if ready is None else (c.slug in ready),
+            uptime_pct=(uptime.get(str(c.id)) or {}).get("pct"),
+            relay_url=settings.local_rtsp_url(c.slug) if c.slug else "",
+        )
+        for c in cams
+    ]
+    who = actor_of(principal)[1] or "admin"
+    try:
+        data = camera_export.build_workbook(rows, generated_by=who, selection=bool(wanted))
+    except ImportError:
+        raise HTTPException(500, detail="openpyxl is not installed on the server")
+
+    # Audited: a full inventory (IPs, MACs, URLs) leaving the building is worth a trail entry.
+    await audit_svc.record(request, principal, "cameras.exported", target="cameras",
+                           detail={"count": len(rows), "selection": bool(wanted), "format": "xlsx"})
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    return Response(
+        content=data,
+        media_type=camera_export.XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="cameras_{stamp}.xlsx"',
+                 "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
 # ─── GET /cameras/{id} ────────────────────────────────────────────────────────
 
 @router.get("/{camera_id}", response_model=CameraResponse)
@@ -550,9 +629,13 @@ async def update_camera(
             # something under "search" moved.
             search_before = _search_state(camera)
             # 0 in the payload means "reset to appliance default" → stored NULL.
-            new_retention = (body.retention_days or None) if body.retention_days is not None else None
+            # `resolved_retention_minutes()` folds the deprecated day-spelling
+            # onto the canonical one, so everything below this line deals in
+            # minutes and only the wire knows there were ever two units.
+            requested_retention = body.resolved_retention_minutes()
+            new_retention = (requested_retention or None) if requested_retention is not None else None
             retention_changed = (
-                body.retention_days is not None and new_retention != camera.retention_days
+                requested_retention is not None and new_retention != camera.retention_minutes
             )
             new_groom = (body.groom_after_days or None) if body.groom_after_days is not None else None
             groom_changed = (
@@ -563,7 +646,14 @@ async def update_camera(
                 camera.name = body.name
             if body.rtsp_url is not None:
                 camera.rtsp_url = body.rtsp_url
-                camera.ip = host_of(body.rtsp_url)  # keep the scan-dedupe key current
+                new_ip = _device_address_after_url_change(camera, body.rtsp_url)
+                if new_ip != camera.ip:
+                    log.info("camera.update.device_address", slug=camera.slug,
+                             was=camera.ip, now=new_ip)
+                    camera.ip = new_ip  # also keeps the scan-dedupe key current
+                elif host_of(body.rtsp_url) != camera.ip:
+                    log.info("camera.update.device_address_kept", slug=camera.slug,
+                             device=camera.ip, stream_host=host_of(body.rtsp_url))
             if body.sensor_id is not None:
                 camera.sensor_id = body.sensor_id
             if body.enabled is not None:
@@ -581,7 +671,7 @@ async def update_camera(
                 # the immediate push below does not fire on a reordering.
                 camera.search_domains = sorted(set(body.search_domains))
             if retention_changed:
-                camera.retention_days = new_retention
+                camera.retention_minutes = new_retention
             if body.retention_justification is not None:
                 camera.retention_justification = body.retention_justification or None
             if body.lawful_basis is not None:
@@ -671,7 +761,7 @@ async def update_camera(
         # retention, so push changes through the dedicated setter. Applies to
         # non-recording cameras too — their already-recorded footage keeps
         # aging out and must follow the new policy.
-        await nvr_client.set_retention(slug, camera.retention_days)
+        await nvr_client.set_retention(slug, camera.retention_minutes)
     if settings.nvr_sync_enabled and groom_changed:
         # Same in-place push for the groom-after override (None clears it).
         # `or None` for the same reason as in _sync_recording_tracks: 0 on a
@@ -702,11 +792,43 @@ async def update_camera(
             # Re-add rather than add: the index holds the domain set per camera,
             # so a domain change needs the entry replaced, not merely present.
             await smartsearch_sync.restart_camera(
-                slug, list(camera.search_domains), camera.retention_days)
+                slug, list(camera.search_domains), camera.retention_minutes)
         else:
             # No domains selected is the same as off, and is stored as such
             # rather than as a camera that is indexed but contributes nothing.
             await smartsearch_sync.remove_camera(slug)
+
+    # THE TWO SERVICES THAT ACTUALLY PRODUCE THE ROWS, pushed for the same
+    # reason and in the same breath as the index above — and they were the ones
+    # missing. Telling the index to expect a camera does nothing on its own:
+    # the broker decodes the frames and analytics detects in them, and until
+    # 2026-09-18 neither learned about a domain change from here at all. They
+    # picked it up on the next reconcile sweep, so switching People on for one
+    # camera produced nothing for up to `nvr_sync_interval` (60 s) plus a model
+    # warm-up — long enough that an operator working through a fleet sees
+    # results appear only once the LAST camera is switched on, and reads that
+    # as "it needs every camera enabled".
+    #
+    # Broker first, then analytics: analytics reads frames from the broker, so
+    # the other order registers a detector against a camera nothing is
+    # decoding. Both are best-effort and both are no-ops when the service is
+    # not deployed, which is the default for each.
+    #
+    # `motion_changed` is in the trigger because the broker's desired set is
+    # the UNION of motion's cameras and analytics' — motion_client's own push
+    # above does not reach it.
+    if search_changed or enabled_changed or motion_changed:
+        await frames_client.push_camera(
+            slug, camera.enabled, camera.motion_detection, camera.search_indexing,
+            camera.search_domains, camera.analytics_config)
+        # Faces ride on exactly this call. The analytics engine loads the face
+        # reader when the FIRST camera asks for the `face` domain and releases
+        # it when the last stops asking (engine._note_face_demand), so the
+        # domain checkbox is the switch — but only once the engine has been
+        # told, which before this happened a sweep later.
+        await analytics_client.push_camera(
+            slug, camera.enabled, camera.search_indexing,
+            camera.search_domains, camera.analytics_config)
 
     # Keep the uptime history truthful across enable/disable: a disabled
     # camera must not linger as "connected" (the poller skips it), and time
@@ -721,10 +843,11 @@ async def update_camera(
     if camera.enabled and (enabled_changed or rtsp_changed):
         asyncio.create_task(health_svc.check_camera_soon(camera.id))
 
-    # Unconditional: the projected envelope carries the camera's name, slug and
-    # enabled flag, and a full sweep is a no-op when none of them moved — cheaper
-    # than tracking which fields feed the pipeline and getting it wrong later.
-    await sync_now(f"camera.updated:{slug}")
+    # Unconditional: the pushed envelope carries the camera's name, slug and
+    # enabled flag, and the pipeline answers `unchanged` when none of them
+    # moved — cheaper than tracking which fields feed it and getting it wrong.
+    # A disabled camera inverts to a removal (see deepstream_client.sync_camera).
+    await sync_camera(camera, f"camera.updated:{slug}")
 
     log.info("update_camera.ok", slug=slug)
     # Retention is a distinct, compliance-relevant event; everything else is a
@@ -768,7 +891,11 @@ async def update_camera(
         await audit_svc.record(
             request, principal, "retention.changed",
             target=slug,
-            detail={"retention_days": new_retention,
+            detail={"retention_minutes": new_retention,
+                    # The human spelling alongside the number, because the audit
+                    # trail is read by people answering "how long did you keep
+                    # it?" and "43200" is not that answer.
+                    "retention": retention_units.format_retention(new_retention),
                     "justification": camera.retention_justification},
         )
     return _build_response(camera)
@@ -813,15 +940,51 @@ async def delete_camera(
         log.warning("delete_camera.relay_cleanup_failed", slug=slug, error=str(exc))
 
     purged_ok = await _teardown_recording_tracks(slug, purge=purge_recordings)
+    # Time-lapse stills and videos: their ROWS went with the camera (ON DELETE
+    # CASCADE), their objects in the store did not, and with no camera row left
+    # nothing could ever reach or expire them. Unconditional, unlike the footage
+    # purge flag: a still taken from the live view is not "recordings" an
+    # operator might want to keep — it is a derived copy of a camera that no
+    # longer exists.
+    await timelapse_svc.purge_camera(slug)
     if settings.motion_sync_enabled:
         await motion_client.remove_camera(slug)
 
-    # Drops the camera's config file and detaches it from the running
-    # pipeline. NOTE: the pipeline restarts its container on any removal, so
+    # THE AI SERVICES, AND A DELETION IS THE ONE EVENT THEIR RECONCILE LOOPS
+    # CANNOT SEE. Each loop builds its desired set AND its `absent` set from
+    # registry rows, and deliberately leaves alone any name it does not
+    # recognise — another VMS may be feeding the same index. A deleted camera
+    # has no row, so it is in neither set: it was decoded, detected and ingested
+    # for ever after the operator deleted it, with no camera left in the UI to
+    # switch it off through. Observed as capture threads and index rows for
+    # cameras that no longer existed.
+    #
+    # So removal has to be pushed from here, and this is the one place that can.
+    # Consumers first, then the producer they read from — the mirror of the
+    # add order in update_camera. Every call treats 404 as success, so a camera
+    # no service ever held costs three 404s and changes nothing.
+    if settings.analytics_sync_enabled and analytics_client.is_configured():
+        await analytics_client.remove_camera(slug)
+    if settings.smartsearch_sync_enabled and smartsearch_sync.is_configured():
+        # Unregisters from INGEST and leaves the indexed rows alone — that is
+        # the index's documented contract for this call, and it is the right
+        # one. Those rows are already unreachable from here (search_scope can no
+        # longer resolve them to a camera), and destroying footage-derived data
+        # is DELETE /erase: an explicit, audited act, not a side effect of
+        # tidying up a registry.
+        await smartsearch_sync.remove_camera(slug)
+    if settings.frames_sync_enabled and frames_client.is_configured():
+        # Last, and this is what actually stops the work: the broker holds the
+        # decode thread and the shared-memory ring. Freeing it before its
+        # consumers have let go would leave them reading a camera that vanished.
+        await frames_client.remove_camera(slug)
+
+    # Detaches the camera from the running pipeline, which deletes its own
+    # config file for it. NOTE: the pipeline restarts its container on any removal, so
     # analysis on every camera pauses for a few seconds here — its behaviour,
     # not something this call adds, but the reason removals are never inferred
     # by the background loop (see services/deepstream_client.reconcile).
-    await sync_now(f"camera.deleted:{slug}")
+    await sync_removal(slug, f"camera.deleted:{slug}")
 
     log.info("delete_camera.ok", slug=slug, purged=purge_recordings,
              purge_complete=purged_ok)
@@ -1126,73 +1289,11 @@ async def camera_uptime(
 
 # ─── GET /cameras/{id}/snapshot ──────────────────────────────────────────────
 
-# A grey/green "frame" is a real decode of a P-frame whose reference picture was
-# never received — it happens whenever FFmpeg joins the relay mid-GOP. Such a
-# frame is near-uniform, so it compresses to almost nothing: a genuine 720p+
-# camera frame at q:v 4 is tens of KB, a flat one is 1–3 KB. Anything under this
-# is treated as a miss and retried with a different frame-selection strategy.
-_MIN_PLAUSIBLE_JPEG_BYTES = 8_000
-
-_SNAPSHOT_TIMEOUT_SEC = 12.0
-_SNAPSHOT_WAIT_SEC = 10.0        # how long a caller waits on someone else's decode
-
-
-# Two frame-selection strategies, tried in order. Each is (input options, output
-# options) — FFmpeg needs decoder flags before -i, filters after it.
-_SNAPSHOT_PASSES: list[tuple[list[str], list[str]]] = [
-    # Keyframes only. An IDR is self-contained, so this is the one strategy that
-    # cannot return a grey frame. Costs up to one GOP of wait — measured at
-    # 1.9–3.0 s on the cameras here, well inside the timeout.
-    (["-skip_frame", "nokey"], []),
-    # Fallback for a stream we never see a keyframe on within the timeout: decode
-    # normally and discard the first 15 pictures. Partial-grey is possible (P
-    # deltas painted over a grey reference) but a partial frame is still enough
-    # to place a mask or zone against.
-    ([], ["-vf", "select=gte(n\\,15)"]),
-]
-
-
-async def _grab_frame(local_url: str, pre_input: list[str], post_input: list[str]) -> bytes | None:
-    """Run one FFmpeg frame-grab. Returns JPEG bytes, or None if it produced nothing."""
-    # asyncio.create_subprocess_exec avoids blocking the event loop. We read from
-    # the local RTSP relay rather than the raw camera URL so this works even if
-    # the camera requires VPN access.
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-nostdin",
-        "-rtsp_transport", "tcp",
-        *pre_input,
-        "-i", local_url,
-        *post_input,
-        "-an",
-        "-frames:v", "1",
-        "-f", "image2",
-        "-vcodec", "mjpeg",
-        "-q:v", "4",             # JPEG quality 1-31, lower = better
-        "pipe:1",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_SNAPSHOT_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return None
-    if proc.returncode != 0 or not stdout:
-        return None
-    return stdout
-
-
-async def _decode_snapshot(local_url: str) -> bytes | None:
-    """Decode one JPEG, escalating to the next pass if the frame looks flat."""
-    best: bytes | None = None
-    for pre_input, post_input in _SNAPSHOT_PASSES:
-        jpeg = await _grab_frame(local_url, pre_input, post_input)
-        if jpeg and len(jpeg) >= _MIN_PLAUSIBLE_JPEG_BYTES:
-            return jpeg
-        best = jpeg or best
-    return best  # a flat frame still beats no frame at all
+# The frame-grab itself (keyframe-first FFmpeg passes, the flat-frame retry, the
+# one-decode-per-camera lock and the short shared cache) lives in
+# services/snapshot.py, because the time-lapse capture loop needs exactly the
+# same frame from exactly the same relay — two copies of this logic would drift
+# the way the sub-track paths did.
 
 
 def _jpeg_response(jpeg: bytes) -> Response:
@@ -1224,34 +1325,13 @@ async def camera_snapshot(
     if not camera.enabled:
         raise HTTPException(status_code=409, detail="Camera is disabled")
 
-    cached = await redis_client.get_cached_snapshot(slug)
-    if cached:
-        return _jpeg_response(cached)
-
-    if not await redis_client.acquire_snapshot_lock(slug):
-        # Someone else is decoding — poll for their result instead of failing.
-        deadline = asyncio.get_running_loop().time() + _SNAPSHOT_WAIT_SEC
-        while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.25)
-            cached = await redis_client.get_cached_snapshot(slug)
-            if cached:
-                return _jpeg_response(cached)
-        raise HTTPException(status_code=503, detail="Snapshot is taking too long — try again")
-
-    # Pull via the API's own route to the relay — differs from the user-facing
-    # URL under the bridge overlay (mediamtx is another container there).
-    local_url = settings.internal_rtsp_url(slug)
-
     try:
-        jpeg = await _decode_snapshot(local_url)
-        if not jpeg:
-            raise HTTPException(status_code=503, detail="Could not extract frame — stream may be offline")
-        await redis_client.set_cached_snapshot(slug, jpeg)
-        return _jpeg_response(jpeg)
-    finally:
-        # Release explicitly: the TTL is only a crash backstop. Holding it for
-        # its full window was what starved every follow-up request.
-        await redis_client.release_snapshot_lock(slug)
+        jpeg = await snapshot_svc.shared_snapshot(slug)
+    except snapshot_svc.SnapshotBusy:
+        raise HTTPException(status_code=503, detail="Snapshot is taking too long — try again")
+    if not jpeg:
+        raise HTTPException(status_code=503, detail="Could not extract frame — stream may be offline")
+    return _jpeg_response(jpeg)
 
 
 # ── Privacy masks (burned into recordings by the NVR) ────────────────────────
@@ -1370,8 +1450,8 @@ async def set_sub_track_recording(
     Enabling adds a `<slug>_sub` relay path and NVR recording worker; disabling
     tears both down.
 
-    The sub keeps its **own, much shorter retention** (`retention_days` here, or
-    the appliance default, never longer than the main). It exists to make
+    The sub keeps its **own, much shorter retention** (`retention_minutes`
+    here, or the appliance default, never longer than the main). It exists to make
     scrubbing recent footage fast, while the main is what evidence is drawn
     from — so keeping both for the same period doubles the cost of the feature
     long past the point it buys anything. Once the sub expires, playback of
@@ -1396,8 +1476,9 @@ async def set_sub_track_recording(
     # Replace the dict rather than mutating: SQLAlchemy does not track in-place
     # JSONB edits, so a mutated key silently never reaches the database.
     patch: dict = {"recording_enabled": body.recording_enabled}
-    if body.retention_days is not None:
-        patch["retention_days"] = body.retention_days
+    sub_retention = body.resolved_retention_minutes()
+    if sub_retention is not None:
+        patch["retention_minutes"] = sub_retention
     camera.sub_track = {**camera.sub_track, **patch}
     await db.commit()
     await db.refresh(camera)
@@ -1415,9 +1496,10 @@ async def set_sub_track_recording(
                 if settings.nvr_sync_enabled and camera.recording and camera.enabled:
                     # The sub keeps its own short retention and is never groomed
                     # — see the reconcile loop in services/nvr_client.py for why.
-                    keep = tracks.sub_retention_days(camera, camera.retention_days)
+                    keep = tracks.sub_retention_minutes(
+                        camera, camera.retention_minutes)
                     await nvr_client.add_camera(
-                        sub_name, retention_days=keep,
+                        sub_name, retention_minutes=keep,
                         masks=camera.privacy_masks, groom_after_days=0)
                     # add_camera is a no-op on a track that is ALREADY recording
                     # (the NVR answers 409), and reconcile only ever adds tracks
@@ -1510,9 +1592,8 @@ async def update_analytics_config(
     Validated and stored here; EXECUTED by the CPU Activity Engine in the
     analytics service, which receives this stored config verbatim (pushed
     below and re-asserted by analytics_client's reconcile loop). DeepStream is
-    no longer the execution path: its projection only runs when
-    DEEPSTREAM_PROJECTION_ENABLED is set, and the GET endpoints below remain for
-    it. No NVR/motion-service involvement.
+    no longer the execution path: it is pushed to only when
+    DEEPSTREAM_SYNC_ENABLED is set, and the GET endpoints below remain for it. No NVR/motion-service involvement.
     """
     camera = await _get_camera_or_404(camera_id, db)
     # Every activity's type must be a key in the admin-managed catalog (validated
@@ -1539,9 +1620,9 @@ async def update_analytics_config(
     await analytics_client.push_camera(
         camera.slug, camera.enabled, camera.search_indexing,
         camera.search_domains, camera.analytics_config)
-    # DeepStream projection — a no-op unless DEEPSTREAM_PROJECTION_ENABLED is
-    # set. Kept so that integration can be switched back on without code.
-    await sync_now(f"analytics.updated:{camera.slug}")
+    # DeepStream push — a no-op unless DEEPSTREAM_SYNC_ENABLED is set. Kept so
+    # that integration can be switched back on without code.
+    await sync_camera(camera, f"analytics.updated:{camera.slug}")
     await audit_svc.record(
         request, await get_principal(request), "camera.config_changed",
         target=camera.slug,
@@ -1562,6 +1643,8 @@ async def list_activity_types(db: AsyncSession = Depends(get_db)) -> list[dict]:
 
 def _type_out(t: AnalyticsActivityType) -> dict:
     return {"key": t.key, "label": t.label, "color": t.color,
+            "search_aliases": getattr(t, "search_aliases", None) or [],
+            "suggested_aliases": getattr(t, "suggested_aliases", None) or [],
             "params_schema": t.params_schema or [], "status": t.status,
             "zone_rule": t.zone_rule, "description": t.description,
             "definition_version": t.definition_version}
@@ -1591,6 +1674,10 @@ async def replace_activity_types(
         rows[t.key].label = t.label
         rows[t.key].color = t.color
         rows[t.key].sort_order = i
+        if t.search_aliases is not None:
+            rows[t.key].search_aliases = t.search_aliases
+        if t.suggested_aliases is not None:
+            rows[t.key].suggested_aliases = t.suggested_aliases
     rest = sorted((r for k, r in rows.items() if k not in listed), key=lambda r: r.sort_order)
     for j, r in enumerate(rest, start=len(body.types)):
         r.sort_order = j
@@ -1676,8 +1763,8 @@ async def list_deepstream_analytics_configs(
     height: Optional[int] = Query(default=None, gt=0, le=10000),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    """Bulk pull: the DeepStream envelope for every enabled camera that has
-    a non-empty analytics_config."""
+    """Bulk pull: the DeepStream envelope for every camera the pipeline should
+    hold — the same predicate the push uses (deepstream_client.should_project)."""
     _require_pixel_dims(coords, width, height)
     result = await db.execute(
         select(Camera).where(
@@ -1686,9 +1773,10 @@ async def list_deepstream_analytics_configs(
         )
     )
     out: list[dict] = []
+    from ..services.deepstream_client import should_project
+
     for camera in result.scalars():
-        cfg = camera.analytics_config or {}
-        if cfg.get("regions") or cfg.get("activities"):
+        if should_project(camera):
             out.append(deepstream_config(
                 camera,
                 width=width if coords == "pixels" else None,
@@ -1742,12 +1830,42 @@ async def update_recording_schedule(
 # Works for cameras onboarded through discovery (or manual add with creds):
 # their IP, ONVIF port, and Fernet-encrypted credentials live on the camera row.
 
+def _onvif_verified(camera: Camera) -> bool:
+    """True once this camera's address, port and credentials have been proven
+    against the device — the same triple `CameraResponse.onvif_capable` reports.
+    Only the credential endpoint sets all three, and it only does so after a
+    successful GetDeviceInformation, so this means "an ONVIF device answered at
+    `camera.ip`", not merely "somebody filled these in"."""
+    return bool(camera.ip and camera.onvif_port and camera.enc_password)
+
+
+def _device_address_after_url_change(camera: Camera, rtsp_url: str) -> Optional[str]:
+    """The device address to store when a camera's RTSP URL is edited.
+
+    An RTSP URL's host is only a GUESS at where the camera lives. It is right for
+    a camera pulled directly, and wrong every time the stream is re-published by
+    something else — a MediaMTX relay, an NVR channel, a bridge — because then
+    the host is that box, which speaks no ONVIF. Overwriting a device-verified
+    address with it silently kills maintenance, imaging, OSD, encoder and PTZ for
+    that camera, and the only symptom is a connection refused against a host the
+    operator never typed.
+
+    So a verified address stands; an unverified one still follows the URL, which
+    keeps the scanner's dedupe key current for the cameras it discovers. A
+    verified address is moved in the Maintenance tab, which re-verifies it.
+    """
+    if _onvif_verified(camera):
+        return camera.ip
+    return host_of(rtsp_url)
+
+
 def _onvif_target_or_409(camera: Camera) -> tuple[str, int, str, str]:
-    if not (camera.ip and camera.onvif_port and camera.enc_password):
+    if not _onvif_verified(camera):
         raise HTTPException(
             status_code=409,
             detail="No ONVIF connection details for this camera — enter its "
-                   "credentials in the Maintenance tab (ONVIF credentials)",
+                   "credentials, and the camera's own IP, in the Maintenance tab "
+                   "(ONVIF credentials)",
         )
     user = decrypt(camera.enc_username)
     password = decrypt(camera.enc_password)
@@ -1758,7 +1876,7 @@ def _onvif_target_or_409(camera: Camera) -> tuple[str, int, str, str]:
                    "(DISCOVERY_SECRET_KEY changed?) — re-enter them in the "
                    "Maintenance tab (ONVIF credentials)",
         )
-    return camera.ip, camera.onvif_port, user, password
+    return onvif_host(camera.ip, camera.onvif_use_https), camera.onvif_port, user, password
 
 
 @router.put("/{camera_id}/onvif-credentials", dependencies=_can_manage)
@@ -1771,16 +1889,24 @@ async def set_onvif_credentials(
 
     This is the recovery path when stored credentials are missing or no longer
     decrypt (e.g. DISCOVERY_SECRET_KEY rotated), and the bootstrap for cameras
-    added manually/by bulk import that never had ONVIF details. Credentials are
-    verified against the device (GetDeviceInformation) BEFORE being stored, so
-    a typo can't clobber working state.
+    added manually/by bulk import that never had ONVIF details. It also repairs
+    the device ADDRESS (`ip`), which is the other half of the same failure: a
+    camera registered by a re-published URL carries the re-publisher's host, so
+    there is nothing to authenticate against until the address is corrected.
+    Both are verified against the device (GetDeviceInformation) BEFORE being
+    stored, so a typo can't clobber working state.
     """
     camera = await _get_camera_or_404(camera_id, db)
-    if not camera.ip:
+    # `body.ip` is how a wrong or missing address is repaired: a camera
+    # registered by a relay's re-published URL carries the RELAY's host here, and
+    # no credential will ever verify against it. Whatever address we end up
+    # dialling is the one stored — but only after the device answers on it.
+    ip = body.ip or camera.ip
+    if not ip:
         raise HTTPException(
             status_code=409,
-            detail="Camera has no IP on record — edit its RTSP URL first so the "
-                   "device address is known",
+            detail="Camera has no device address on record — enter the camera's "
+                   "own IP here (its ONVIF address), or fix its RTSP URL",
         )
     port = body.onvif_port or camera.onvif_port
     if not port:
@@ -1788,23 +1914,47 @@ async def set_onvif_credentials(
             status_code=422,
             detail="No ONVIF port known for this camera — specify one (80 is the most common)",
         )
+    use_https = body.onvif_use_https if body.onvif_use_https is not None else bool(camera.onvif_use_https)
+    # The address being VERIFIED is the repaired one (`ip`), wrapped for ONVIF-over-HTTPS when asked —
+    # not camera.ip, or an IP repair would be verified against the old, wrong address.
+    host = onvif_host(ip, use_https)
 
     try:
-        info = await onvif_device.verify_device(camera.ip, port, body.username, body.password)
+        info = await onvif_device.verify_device(host, port, body.username, body.password)
     except onvif_media.OnvifError as exc:
         raise HTTPException(status_code=409 if exc.auth else 502, detail=str(exc))
 
     camera.enc_username = encrypt(body.username)
     camera.enc_password = encrypt(body.password)
+    camera.ip = ip
     camera.onvif_port = port
+    camera.onvif_use_https = use_https
     camera.vendor = info.get("vendor") or camera.vendor
     camera.model = info.get("model") or camera.model
     camera.firmware = info.get("firmware") or camera.firmware
+
+    # We are already authenticated against the device on a round trip the
+    # operator is waiting out — the cheapest honest moment to learn whether this
+    # camera pans. Best-effort: a camera that answers GetDeviceInformation but
+    # not GetCapabilities is still a working camera, and failing the credential
+    # save over a PTZ probe would be absurd. NULL just means "ask again later",
+    # which routers/ptz.py does on first use.
+    try:
+        caps = await onvif_ptz.probe(host, port, body.username, body.password)
+        caps["probed_at"] = datetime.now(timezone.utc).isoformat()
+        camera.ptz_capabilities = caps
+    except onvif_media.OnvifError as exc:
+        log.info("onvif_credentials.ptz_probe_skipped", slug=camera.slug, error=str(exc))
+
     await db.commit()
 
-    log.info("onvif_credentials.updated", slug=camera.slug, port=port,
-             vendor=info.get("vendor"), model=info.get("model"))
-    return {"status": "verified", **info, "onvif_port": port}
+    log.info("onvif_credentials.updated", slug=camera.slug, ip=ip, port=port, use_https=use_https,
+             vendor=info.get("vendor"), model=info.get("model"),
+             ptz=(camera.ptz_capabilities or {}).get("supported"))
+    return {
+        "status": "verified", **info, "ip": ip, "onvif_port": port, "onvif_use_https": use_https,
+        "ptz_capable": (camera.ptz_capabilities or {}).get("supported") is True,
+    }
 
 
 @router.get("/{camera_id}/encoder")
@@ -2111,7 +2261,7 @@ async def _process_bulk(
                     enabled=item.enabled,
                     recording=item.recording,
                     stage=CameraStage.REGISTERED.value,
-                    ip=host_of(item.rtsp_url),
+                    ip=item.ip or host_of(item.rtsp_url),
                     camera_metadata=item.metadata,
                     # Persist the (now-validated) compliance fields — previously
                     # dropped entirely, which is how bulk-imported cameras ended

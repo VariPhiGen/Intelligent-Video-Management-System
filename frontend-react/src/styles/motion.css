@@ -1,0 +1,143 @@
+/* Shared motion layer. Transform/opacity entrances are finite; no animation
+   runs over surveillance video. Reduced motion covers this entire layer. */
+:root {
+  --motion-fast: 140ms;
+  --motion-base: 240ms;
+  --motion-reveal: 480ms;
+  --motion-ease: cubic-bezier(.22, 1, .36, 1);
+}
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+/* Keep press feedback on controls, rather than moving whole functional panels. */
+:where(.btn, .btn-primary, .btn-secondary, .btn-danger, .iconbtn, .close-btn, .chip, .topseg-item) {
+  transition: transform var(--motion-fast) var(--motion-ease),
+    background var(--motion-fast) ease, border-color var(--motion-fast) ease,
+    color var(--motion-fast) ease, box-shadow var(--motion-base) ease,
+    opacity var(--motion-fast) ease;
+}
+:where(.btn, .btn-primary, .btn-secondary, .btn-danger, .iconbtn, .close-btn, .chip, .topseg-item):not(:disabled):active {
+  transform: scale(.97);
+}
+.stat { transition: border-color var(--motion-base) ease, background var(--motion-base) ease, box-shadow var(--motion-base) ease; }
+.stat.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+#app > aside nav a .nav-glyph {
+  transition: transform var(--motion-base) var(--motion-ease), color var(--motion-fast) ease;
+}
+/* One quiet entrance, also suitable for the horizontal mobile navigation. */
+#app > aside nav { animation: nav-arrive 400ms var(--motion-ease) both; }
+.topbar { position: relative; }
+.topbar::after {
+  content: ''; position: absolute; inset: auto 0 -1px; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: .2; pointer-events: none; transform-origin: left;
+  animation: ambient-arrive 900ms var(--motion-ease) both;
+}
+button.tab { font-family: inherit; border: 0; background: transparent; }
+.aid-view > .stat-grid > .stat {
+  animation: stat-arrive var(--motion-reveal) var(--motion-ease) both;
+}
+.aid-view > .stat-grid > .stat:nth-child(2) { animation-delay: 35ms; }
+.aid-view > .stat-grid > .stat:nth-child(3) { animation-delay: 70ms; }
+.aid-view > .stat-grid > .stat:nth-child(4) { animation-delay: 105ms; }
+.aid-view > .stat-grid > .stat:nth-child(5) { animation-delay: 140ms; }
+.aid-hour-bar {
+  transform-origin: bottom;
+  animation: chart-grow-y 560ms var(--motion-ease) both;
+  transition: height var(--motion-reveal) var(--motion-ease), filter var(--motion-fast) ease;
+}
+.aid-cam-fill, .aid-cover-fill, .aid-split-bar > i {
+  transform-origin: left;
+  animation: chart-grow-x 560ms var(--motion-ease) both;
+  transition: width var(--motion-reveal) var(--motion-ease);
+}
+.meter-fill { transition: width 480ms var(--motion-ease), background var(--motion-base) ease; }
+.skel::after { animation-duration: 1.8s; animation-timing-function: linear; }
+.overlay { animation-duration: 180ms; animation-timing-function: ease-out; }
+.modal { animation-duration: 280ms; animation-timing-function: var(--motion-ease); }
+/* Animate custom popovers when present; native select menus stay browser-owned. */
+[role="menu"], [role="listbox"] { animation: surface-arrive 180ms var(--motion-ease); }
+@media (hover: hover) and (pointer: fine) {
+  :where(.btn-primary, .btn-secondary):not(:disabled):hover { transform: translateY(-1px); }
+  #app > aside nav a:hover .nav-glyph { transform: translateY(-1px); }
+  .stat.clickable:hover { box-shadow: var(--e2); }
+  .aid-hour-bar:hover { filter: brightness(1.15); }
+}
+@keyframes nav-arrive { from { opacity: .6; } to { opacity: 1; } }
+@keyframes ambient-arrive { from { transform: scaleX(.3); opacity: 0; } to { transform: scaleX(1); opacity: .2; } }
+@keyframes stat-arrive { from { opacity: .4; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes chart-grow-y { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes chart-grow-x { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes surface-arrive { from { opacity: 0; translate: 0 -4px; } to { opacity: 1; translate: 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important; transition: none !important; scroll-behavior: auto !important;
+  }
+  :where(.btn, .btn-primary, .btn-secondary, .btn-danger, .iconbtn, .close-btn, .chip, .topseg-item):active,
+  :where(.btn-primary, .btn-secondary):hover,
+  #app > aside nav a:hover .nav-glyph { transform: none; }
+}
+
+/* Page-specific polish uses existing DOM, with no transforms on video, map
+   layers, or timeline canvases (their pointer coordinates must remain exact). */
+.loading-skeleton { width: 100%; min-width: 0; }
+.loading-skeleton-shapes { display: grid; gap: var(--s3); }
+.loading-skeleton-item {
+  min-width: 0; padding: var(--s4); border: 1px solid var(--border);
+  border-radius: var(--r-md); background: var(--surface);
+}
+.loading-skeleton-cards .loading-skeleton-shapes {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+}
+.loading-skeleton-image { height: 120px; margin-bottom: var(--s4); }
+.loading-skeleton-preview .loading-skeleton-image { height: clamp(180px, 30vh, 320px); }
+.loading-skeleton-rows .loading-skeleton-item { padding-block: var(--s4); }
+/* Give page tabs an anchored underline rather than an abrupt color swap. */
+.page-tabs .tab::after {
+  background: var(--accent); transform: scaleX(0); transform-origin: center;
+  transition: transform var(--motion-base) var(--motion-ease), opacity var(--motion-fast) ease;
+  opacity: 0;
+}
+.page-tabs .tab.active::after { transform: scaleX(1); opacity: 1; }
+button.tab { line-height: inherit; }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+:where(.motion-page, .fade) :where(.stat-grid > .stat, .pk-grid > .pk-tile, .ch-tile) {
+  animation: reading-arrive 360ms var(--motion-ease) both;
+}
+:where(.motion-page, .fade) :where(.stat-grid > .stat, .pk-grid > .pk-tile):nth-child(2) { animation-delay: 30ms; }
+:where(.motion-page, .fade) :where(.stat-grid > .stat, .pk-grid > .pk-tile):nth-child(3) { animation-delay: 60ms; }
+:where(.motion-page, .fade) :where(.stat-grid > .stat, .pk-grid > .pk-tile):nth-child(4) { animation-delay: 90ms; }
+/* Limit list entrances to the first screen; a long inventory must stay cheap. */
+.motion-page tbody > tr:nth-child(-n+12),
+.fade tbody > tr:nth-child(-n+12),
+.ss-grid > .ss-card:nth-child(-n+12), .ss-face-grid > .ss-face-card:nth-child(-n+12) {
+  animation: reading-arrive 240ms var(--motion-ease) both;
+}
+.ss-card, .ss-face-card, .pk-tile, .lv-tile {
+  transition: border-color var(--motion-base) ease, box-shadow var(--motion-base) ease;
+}
+.lv-node, .map-cam-row, .chip, .tab {
+  transition: color var(--motion-fast) ease, background var(--motion-fast) ease,
+    border-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease;
+}
+.storage-split-meter > span {
+  transition: width 480ms var(--motion-ease);
+  animation: reading-arrive 360ms ease-out;
+}
+.meter-row .meter-fill { transform-origin: left; animation: chart-grow-x 480ms var(--motion-ease) both; }
+.ch-tip { animation: reading-arrive 120ms ease-out; pointer-events: none; }
+@media (hover: hover) and (pointer: fine) {
+  .ss-card:hover, .ss-face-card:hover, .pk-tile:hover { border-color: var(--border3); box-shadow: var(--e2); }
+  .lv-tile:hover { border-color: var(--accent); }
+  .page-tabs .tab:not(.active):not(.disabled):hover::after { opacity: .25; transform: scaleX(.45); }
+}
+@keyframes reading-arrive { from { opacity: .55; } to { opacity: 1; } }
+@media (max-width: 720px) {
+  .loading-skeleton-image { height: 100px; }
+  .loading-skeleton-cards .loading-skeleton-shapes { grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); }
+}
+/* Last on purpose: reduced motion also overrides the page-specific layer. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

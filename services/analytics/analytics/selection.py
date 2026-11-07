@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import artifacts
 from .hardware import resolve_device, runtimes
@@ -45,6 +45,8 @@ log = logging.getLogger("analytics.selection")
 TORCH = "torch"
 OPENVINO = "openvino"
 AUTO = "auto"
+
+_UNPROBED = object()
 
 #: Backends a deployment may ask for by name. ONNX is deliberately absent —
 #: see the module docstring; it is slower than the incumbent here, so offering
@@ -109,6 +111,11 @@ class DetectorSelector:
         self._lock = threading.Lock()
         #: (backend, reason), memoised by _ensure_resolved.
         self._resolved: Optional[tuple[str, str]] = None
+        #: (backend, artifact) -> None if a crash-isolated probe passed, else
+        #: why it did not. Once per process: the probe costs seconds, and what
+        #: it measures (this CPU against this runtime build) cannot change
+        #: without a restart.
+        self._probed: dict[tuple[str, str], Optional[str]] = {}
         configured = (models_cfg.detector_backend or AUTO).strip().lower()
         if configured not in CHOOSABLE:
             # A typo must not silently downgrade a site to the slow path, and
@@ -221,6 +228,42 @@ class DetectorSelector:
                         "retry on the next warm-up (%d of %d attempts used)",
                         backend, error, self._state.attempts,
                         self._state.max_attempts)
+
+    def isolation_verdict(self, backend: str, artifact: str,
+                          probe: Callable[[], Optional[str]]) -> Optional[str]:
+        """The memoised result of `probe` for this backend and artifact.
+
+        The probe runs outside the lock: it takes seconds, and /health must
+        stay answerable meanwhile.
+        """
+        key = (backend, artifact)
+        with self._lock:
+            cached = self._probed.get(key, _UNPROBED)
+        if cached is not _UNPROBED:
+            return cached
+        verdict = probe()
+        with self._lock:
+            self._probed[key] = verdict
+        return verdict
+
+    def record_crash(self, backend: str, error: str) -> None:
+        """The backend took down a probe process. NO RETRY BUDGET.
+
+        A native crash is a property of this CPU and this runtime build, not a
+        transient — 2026-10-26, Apple M5 under Docker: OpenVINO's ARM plugin
+        executes an SVE instruction the chip does not implement, on every
+        attempt, in every release tried (2024.6 to 2026.4). Retrying it in
+        process would kill the service; retrying it in a probe would only
+        spend seconds learning the same thing.
+        """
+        with self._lock:
+            self._state.attempts += 1
+            self._state.failures.append(f"{backend}: {error}")
+            self._state.exhausted = True
+        log.error("%s cannot run on this machine (%s) — using torch for the "
+                  "life of this process. Detection keeps working, at lower "
+                  "throughput. Set ANALYTICS_DETECTOR_BACKEND=torch to skip "
+                  "the probe on start-up.", backend, error)
 
     def record_success(self, backend: str) -> None:
         """A load that worked. Deliberately does NOT reset the attempt count.

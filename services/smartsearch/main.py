@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
         log.error("index database migration failed (exit %d) — refusing to serve", rc)
         raise SystemExit(rc)
 
-    store = Store(config.store.dsn, config.store.retention_days)
+    store = Store(config.store.dsn, config.store.retention_minutes)
     db = store.health()
     if db.get("reachable"):
         log.info("index database ok (schema %s, %s persons, %s vehicles)",

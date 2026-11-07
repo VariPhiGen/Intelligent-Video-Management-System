@@ -19,11 +19,21 @@ interface VerifyResp {
   vendor: string | null;
   model: string | null;
   firmware: string | null;
+  ip: string;
   onvif_port: number;
+  onvif_use_https: boolean;
 }
 interface SyncResp {
   skew_before_seconds: number | null;
   synced_to: string;
+}
+
+/** Host portion of an RTSP URL — the box the stream is pulled from, which is
+ *  the camera itself only when nothing re-publishes it. */
+function streamHost(url: string | null | undefined): string {
+  if (!url) return '';
+  const m = /^rtsps?:\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^:/?#]+)/i.exec(url);
+  return m ? m[1] : '';
 }
 
 export function MaintenanceModal({ camera, onClose, onChanged }: {
@@ -36,6 +46,12 @@ export function MaintenanceModal({ camera, onClose, onChanged }: {
   const [user, setUser] = useState('admin');
   const [pass, setPass] = useState('');
   const [port, setPort] = useState(String(camera.onvif_port || 80));
+  // The camera's OWN address, which is not always the RTSP URL's host: a stream
+  // re-published by a relay or an NVR channel arrives from that box, and ONVIF
+  // has to go to the camera. Editable here because a camera registered by such a
+  // URL has the wrong address stored, and nothing else can correct it.
+  const [ip, setIp] = useState(camera.ip || streamHost(camera.rtsp_url) || '');
+  const [useHttps, setUseHttps] = useState(camera.onvif_use_https);
   const [credBusy, setCredBusy] = useState(false);
   const [credOut, setCredOut] = useState('');
 
@@ -47,8 +63,17 @@ export function MaintenanceModal({ camera, onClose, onChanged }: {
 
   const [err, setErr] = useState('');
 
+  // A camera that has never answered ONVIF has an address nobody checked: it
+  // was taken from the RTSP URL, which is the camera only when nothing
+  // re-publishes the stream. Say so, because a relay's host in this field is
+  // exactly how these settings come to fail with a connection refused against a
+  // host the operator never typed.
+  const sHost = streamHost(camera.rtsp_url);
+  const guessed = !camera.onvif_capable && !!sHost && sHost === ip.trim();
+
   async function saveCreds() {
     if (!user.trim()) { setErr('Username is required'); return; }
+    if (!ip.trim()) { setErr("The camera's address is required"); return; }
     setErr('');
     setCredBusy(true);
     try {
@@ -56,10 +81,13 @@ export function MaintenanceModal({ camera, onClose, onChanged }: {
         method: 'PUT',
         body: JSON.stringify({
           username: user.trim(), password: pass, onvif_port: Number(port) || null,
+          ip: ip.trim(),
+          onvif_use_https: useHttps,
         }),
       });
       const who = [r.vendor, r.model].filter(Boolean).join(' ') || 'device answered';
-      setCredOut(`Verified: ${who} (port ${r.onvif_port}) — credentials saved.`);
+      const scheme = r.onvif_use_https ? 'https' : 'http';
+      setCredOut(`Verified: ${who} at ${r.ip}:${r.onvif_port} (${scheme}) — credentials saved.`);
       toast('ONVIF credentials verified & saved');
       onChanged();  // unlocks the other three editors
     } catch (e: any) {
@@ -113,7 +141,24 @@ export function MaintenanceModal({ camera, onClose, onChanged }: {
             : 'None stored for this camera — enter them to enable the other device settings.'}
           {' '}Verified against the camera before saving.
         </div>
+        {guessed && (
+          <div className="d-hint" style={{ marginBottom: 10, color: 'var(--amber, var(--muted))' }}>
+            The address below was taken from this camera’s RTSP URL and has never been
+            verified. If that stream arrives from a relay or an NVR channel rather than
+            the camera itself, replace it with the camera’s own IP — device settings
+            cannot reach a relay.
+          </div>
+        )}
         <div className="form-grid">
+          <div className="form-group">
+            <Label>Camera address</Label>
+            <input value={ip} autoComplete="off" spellCheck={false}
+                   placeholder="192.168.1.64"
+                   onChange={e => setIp(e.target.value)} />
+            {sHost && sHost !== ip.trim() && (
+              <div className="d-hint" style={{ marginTop: 4 }}>Stream arrives from {sHost}</div>
+            )}
+          </div>
           <div className="form-group">
             <Label>Username</Label>
             <input value={user} autoComplete="off" onChange={e => setUser(e.target.value)} />
@@ -127,6 +172,28 @@ export function MaintenanceModal({ camera, onClose, onChanged }: {
             <Label>ONVIF port</Label>
             <input type="number" value={port} onChange={e => setPort(e.target.value)} />
           </div>
+        </div>
+        <label className="d-hint" style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+          <input type="checkbox" checked={useHttps} onChange={e => {
+            const checked = e.target.checked;
+            setUseHttps(checked);
+            // HTTPS is virtually always a different port than plain HTTP on the
+            // same device (443 vs 80) — checking the box without also moving off
+            // the HTTP port just points HTTPS at a port nothing is listening for
+            // TLS on, which hangs until the request times out. Only nudge away
+            // from the well-known default: a port the operator already changed
+            // to something else (a non-standard HTTP port, or already 443) is
+            // deliberate and must not be silently overwritten either direction.
+            if (checked && port === '80') setPort('443');
+            if (!checked && port === '443') setPort('80');
+          }} />
+          Camera requires HTTPS for ONVIF
+        </label>
+        <div className="d-hint" style={{ marginTop: 2, marginBottom: 4 }}>
+          Leave unchecked unless PTZ/encoder/imaging keep failing while the video itself plays fine —
+          that combination means this camera's firmware rejects ONVIF over plain HTTP. HTTPS is almost
+          always a different port than plain HTTP on the same camera (443 is the usual default) —
+          double-check the ONVIF port above still matches whichever scheme is checked.
         </div>
         <div className="form-actions">
           <button className="btn-primary btn-sm" onClick={saveCreds} disabled={credBusy}>

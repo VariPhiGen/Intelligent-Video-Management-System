@@ -149,3 +149,53 @@ export function ZoneBoxes({ boxes }: { boxes: ZoneBox[] }) {
     </>
   );
 }
+
+/**
+ * Coverage footprints — the ground each registered camera actually sees.
+ *
+ * Drawn as one SVG beneath the camera dots, in the same normalized plan
+ * coordinates everything else on this map uses (viewBox 0 0 1 1 with
+ * preserveAspectRatio="none"), so it needs no knowledge of the plan's pixel
+ * size or the current zoom.
+ *
+ * The polygons come from the server, which clipped them to the plan and dropped
+ * everything past each camera's horizon. That matters for what an operator can
+ * conclude: an area with no polygon over it is genuinely unwatched by any
+ * registered camera, rather than merely beyond where the drawing stopped.
+ *
+ * A camera registered but not covering anything on this plan arrives with an
+ * empty footprint and is skipped — there is no shape to draw, and a dot with no
+ * polygon is the honest picture.
+ */
+export function CoverageFootprints({ footprints, selectedId }: {
+  footprints: { cameraId: string; points: number[][] }[];
+  selectedId: string | null;
+}) {
+  const usable = footprints.filter(f => f.points.length >= 3);
+  if (!usable.length) return null;
+  return (
+    <svg
+      viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true"
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
+    >
+      {usable.map(({ cameraId, points }) => {
+        // The selected camera is lifted rather than colour-coded: every
+        // footprint means the same thing, so the only distinction worth drawing
+        // is which one the operator is currently looking at.
+        const selected = cameraId === selectedId;
+        return (
+          <polygon
+            key={cameraId}
+            points={points.map(([x, y]) => `${x},${y}`).join(' ')}
+            fill="var(--accent)"
+            fillOpacity={selected ? 0.3 : 0.12}
+            stroke="var(--accent)"
+            strokeOpacity={selected ? 0.95 : 0.45}
+            strokeWidth={selected ? 2 : 1}
+            vectorEffect="non-scaling-stroke"
+          />
+        );
+      })}
+    </svg>
+  );
+}

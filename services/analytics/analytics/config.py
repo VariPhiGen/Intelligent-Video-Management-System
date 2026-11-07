@@ -78,14 +78,28 @@ class MotionConfig:
 @dataclass
 class TrackingConfig:
     enabled: bool = True
-    max_association_cost: float = 1.75
+    #: 2.5 since 2026-09-17, from four minutes of gate footage replayed through
+    #: this tracker: 1.75 produced 94 tracks for 81 linked objects with a median
+    #: life of 1.2 s, and 2.5 produced 85 for 74 with a median life of 3.4 s,
+    #: counting the same crossings. The old value was fitted when this pipeline
+    #: sampled at 1-2 FPS, where a walking person moved less between frames.
+    max_association_cost: float = 2.5
     velocity_alpha: float = 0.5
     confirm_after_seconds: float = 1.0
-    max_age_seconds: float = 3.0
+    #: 5.0 since 2026-09-17, same replay: at the frame rate this appliance
+    #: actually delivers it took 89 tracks down to 66 for the same footage.
+    max_age_seconds: float = 5.0
     stationary_after_seconds: float = 4.0
     stationary_distance: float = 0.15
     max_tracks_per_key: int = 64
     index_tentative: bool = True
+    #: RE-ASSOCIATION. How long a dead identity is remembered, and how close a
+    #: new detection must be to inherit it. Strict on purpose: an extra identity
+    #: costs a duplicate event, but a wrong merge loses a person entirely.
+    #: 0 seconds switches it off and restores the previous behaviour.
+    reassociate_within_seconds: float = 2.0
+    reassociate_iou: float = 0.3
+    reassociate_distance: float = 1.0
 
 
 @dataclass
@@ -185,12 +199,34 @@ class FaceConfig:
 @dataclass
 class ModelConfig:
     detector: str = "ultralytics"
-    detector_weights: str = "/models/weights/yolov8n.pt"
+    #: "auto" = the most accurate of `detector_candidates` this machine can keep
+    #: up with (analytics/capacity.py). A path pins that model and switches
+    #: nothing automatically.
+    detector_weights: str = "auto"
+    #: Most accurate first. Why s leads: config.yaml.
+    detector_candidates: list = field(default_factory=lambda: [
+        "/models/weights/yolov8s.pt", "/models/weights/yolov8n.pt"])
+    #: Measured throughput must cover demand times this.
+    capacity_headroom: float = 1.25
+    #: Share of a Smart Search camera's frames expected to carry motion at a
+    #: busy moment. Activity cameras always count in full.
+    capacity_motion_share: float = 0.5
+    #: Frames per second the broker samples per camera (frames: sample_fps).
+    capacity_camera_fps: float = 5.0
     device: Optional[str] = None
     detector_backend: str = "auto"
     backend_attempts: int = 3
     models_dir: str = "/models"
     square_letterbox: bool = True
+    #: ONE compiled OpenVINO model shared by both detection paths, with
+    #: THROUGHPUT and a bounded thread count, instead of a LATENCY instance per
+    #: path. Measured on this box: 0.059 CPU-s per frame against 0.090, and p50
+    #: 54 ms against 94 ms, at the same offered load. See openvino_detector.py.
+    shared_detector: bool = True
+    #: 0 = half the machine, floor two. The other half decodes video.
+    inference_threads: int = 0
+    #: Calls that can be in flight: one worker thread per pipeline.
+    inference_num_requests: int = 2
 
 
 @dataclass
@@ -251,6 +287,48 @@ class EventsConfig:
 
 
 @dataclass
+class PresenceConfig:
+    """Playback presence: when each tracked person/vehicle was in view.
+
+    Delivered to the VMS (`POST /api/playback/timeline/presence`) through the
+    events URL and key — the same API, the same trust. EMPTY events URL = not
+    recorded at all. `segment_seconds` is how late the timeline may learn of a
+    long stay, and must stay under the VMS's 10-minute bound; the idle close
+    must outlast the tracker's own give-up (max_age + re-association window),
+    or a person who paused for a moment is split in two.
+    """
+    enabled: bool = True
+    segment_seconds: float = 120.0
+    idle_close_seconds: float = 10.0
+    queue_size: int = 4096
+    batch_size: int = 200
+
+
+@dataclass
+class HeatmapConfig:
+    """The Heatmap Overlay activity's rendering and delivery.
+
+    NOT operator settings: AI Config exposes only what the supplied DeepStream
+    implementation exposed (classes, intensity, radius). These are the costs —
+    how often a picture is made, how big it is, where it goes — and they are
+    here so they can be changed without touching the activity.
+
+    `url` is the API ROOT; the sink appends /api/analytics/heatmaps. EMPTY =
+    heat still accumulates and is reported on /health, and nothing is stored.
+    It defaults to the events URL and key, which point at the same API.
+    """
+    snapshot_interval_seconds: float = 60.0
+    #: Heat matrix size, per axis, relative to the frame.
+    scale: int = 4
+    output_width: int = 1280
+    jpeg_quality: int = 85
+    url: str = ""
+    internal_api_key: str = ""
+    timeout_seconds: float = 20.0
+    queue_size: int = 8
+
+
+@dataclass
 class AppConfig:
     api: ApiConfig = field(default_factory=ApiConfig)
     source: SourceConfig = field(default_factory=SourceConfig)
@@ -266,6 +344,8 @@ class AppConfig:
     snapshot: SnapshotConfig = field(default_factory=SnapshotConfig)
     events: EventsConfig = field(default_factory=EventsConfig)
     activities: ActivitiesConfig = field(default_factory=ActivitiesConfig)
+    heatmap: HeatmapConfig = field(default_factory=HeatmapConfig)
+    presence: PresenceConfig = field(default_factory=PresenceConfig)
     log_level: str = "INFO"
 
     @classmethod
@@ -294,6 +374,13 @@ class AppConfig:
         snapshot = sect("snapshot", SnapshotConfig)
         events = sect("events", EventsConfig)
         activities = sect("activities", ActivitiesConfig)
+        heatmap = sect("heatmap", HeatmapConfig)
+        presence = sect("presence", PresenceConfig)
+        if "ANALYTICS_PRESENCE_ENABLED" in os.environ:
+            presence.enabled = os.environ["ANALYTICS_PRESENCE_ENABLED"].lower() not in (
+                "0", "false", "no")
+        # Never beyond the VMS's per-row bound, never so short it floods it.
+        presence.segment_seconds = min(540.0, max(10.0, float(presence.segment_seconds)))
         if "ANALYTICS_ACTIVITIES_ENABLED" in os.environ:
             activities.enabled = os.environ["ANALYTICS_ACTIVITIES_ENABLED"].lower() not in (
                 "0", "false", "no")
@@ -318,11 +405,36 @@ class AppConfig:
             detect.enabled = os.environ["ANALYTICS_INGEST_ENABLED"].lower() not in (
                 "0", "false", "no")
 
+        tracking.max_association_cost = float(os.environ.get(
+            "ANALYTICS_TRACK_MAX_COST", tracking.max_association_cost))
+        tracking.max_age_seconds = float(os.environ.get(
+            "ANALYTICS_TRACK_MAX_AGE", tracking.max_age_seconds))
+        tracking.reassociate_within_seconds = float(os.environ.get(
+            "ANALYTICS_TRACK_REASSOCIATE_SECONDS", tracking.reassociate_within_seconds))
+        tracking.reassociate_iou = float(os.environ.get(
+            "ANALYTICS_TRACK_REASSOCIATE_IOU", tracking.reassociate_iou))
+        tracking.reassociate_distance = float(os.environ.get(
+            "ANALYTICS_TRACK_REASSOCIATE_DISTANCE", tracking.reassociate_distance))
+
         models.detector_backend = os.environ.get(
             "ANALYTICS_DETECTOR_BACKEND", models.detector_backend).strip().lower()
         models.detector_weights = os.environ.get(
             "ANALYTICS_DETECTOR_WEIGHTS", models.detector_weights)
+        if os.environ.get("ANALYTICS_DETECTOR_CANDIDATES"):
+            models.detector_candidates = [w.strip() for w in os.environ[
+                "ANALYTICS_DETECTOR_CANDIDATES"].split(",") if w.strip()]
+        models.capacity_motion_share = float(os.environ.get(
+            "ANALYTICS_CAPACITY_MOTION_SHARE", models.capacity_motion_share))
+        models.capacity_camera_fps = float(os.environ.get(
+            "ANALYTICS_CAPACITY_CAMERA_FPS", os.environ.get(
+                "FRAMES_SAMPLE_FPS", models.capacity_camera_fps)))
         models.models_dir = os.environ.get("ANALYTICS_MODELS_DIR", models.models_dir)
+        if "ANALYTICS_SHARED_DETECTOR" in os.environ:
+            models.shared_detector = os.environ["ANALYTICS_SHARED_DETECTOR"].lower()                 not in ("0", "false", "no")
+        models.inference_threads = int(os.environ.get(
+            "ANALYTICS_INFERENCE_THREADS", models.inference_threads))
+        models.inference_num_requests = int(os.environ.get(
+            "ANALYTICS_INFERENCE_REQUESTS", models.inference_num_requests))
 
         plates.localiser_weights = os.environ.get(
             "ANALYTICS_PLATE_WEIGHTS", plates.localiser_weights)
@@ -367,6 +479,15 @@ class AppConfig:
             "ANALYTICS_INTERNAL_API_KEY",
             os.environ.get("INTERNAL_API_KEY", events.internal_api_key))
 
+        # The heatmap talks to the same API as the events sink, so it inherits
+        # its address and key unless it is pointed somewhere else on purpose.
+        heatmap.url = os.environ.get("ANALYTICS_HEATMAP_URL", heatmap.url).strip().rstrip("/")
+        heatmap.url = heatmap.url or events.url
+        heatmap.internal_api_key = heatmap.internal_api_key or events.internal_api_key
+        if "ANALYTICS_HEATMAP_INTERVAL_SECONDS" in os.environ:
+            heatmap.snapshot_interval_seconds = max(1.0, float(
+                os.environ["ANALYTICS_HEATMAP_INTERVAL_SECONDS"]))
+
         # 0 disables hibernation; negative is the same thing said clumsily, so
         # it is clamped rather than rejected — this must never fail a start.
         if "ANALYTICS_IDLE_TIMEOUT_SECONDS" in os.environ:
@@ -377,4 +498,5 @@ class AppConfig:
                    tracking=tracking, index_policy=index_policy, plates=plates,
                    faces=faces, models=models, sink=sink, lifecycle=lifecycle,
                    snapshot=snapshot, events=events, activities=activities,
+                   heatmap=heatmap, presence=presence,
                    log_level=os.environ.get("LOG_LEVEL", "INFO").upper())

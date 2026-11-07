@@ -133,9 +133,27 @@ def _ingest(events, now=None):
         rows, rejected = ev.prepare([ev.EventIn(**e) for e in events],
                                     {c.slug: c for c in cams},
                                     now=now or datetime.now(timezone.utc),
-                                    default_retention_days=30)
-        counts = await ev.record(s, rows) if rows else {}
+                                    default_retention_minutes=30 * 1440)
+        counts = (await ev.record(s, rows)).counts if rows else {}
         return counts, rejected
+
+    return _session(go)
+
+
+def _ingest_result(events, now=None):
+    """Like _ingest, but keeps the whole RecordResult — the rule engine fires
+    on `.inserted`, so which rows were genuinely new is the thing under test."""
+    from backend.models import Camera
+    from backend.services import ai_events as ev
+    from sqlalchemy import select
+
+    async def go(s):
+        cams = (await s.execute(select(Camera))).scalars().all()
+        rows, _ = ev.prepare([ev.EventIn(**e) for e in events],
+                             {c.slug: c for c in cams},
+                             now=now or datetime.now(timezone.utc),
+                             default_retention_minutes=30 * 1440)
+        return await ev.record(s, rows)
 
     return _session(go)
 
@@ -360,3 +378,119 @@ class TestEntryExitCounts:
 def test_the_fleet_time_index_exists(cams):
     rows = asyncio.run(_fetch("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_events_started_at'"))
     assert rows and "started_at DESC, id DESC" in rows[0]["indexdef"]
+
+
+class TestInsertedRows:
+    """`record` reports WHICH rows were new, not just how many.
+
+    The rule engine fires on that list. Counts alone cannot separate a new
+    detection from a replayed one, and a producer re-sending its buffer after a
+    restart is routine — firing a gate rule for each replay would not be.
+    """
+
+    def test_record_returns_only_genuinely_new_rows(self, cams):
+        events = [_ev(id=str(uuid.uuid4())), _ev(id=str(uuid.uuid4()))]
+        first = _ingest_result(events)
+        assert first.counts["inserted"] == 2
+        assert len(first.inserted) == 2
+
+        second = _ingest_result(events)          # the producer replays its buffer
+        assert second.counts["duplicates"] == 2
+        assert second.inserted == []
+
+    def test_closing_an_open_event_is_not_an_insert(self, cams):
+        """A close is an update. It must not re-fire the rule the open fired."""
+        ident, start = str(uuid.uuid4()), _ago(minutes=5)
+        opened = _ingest_result([_ev(id=ident, started_at=start)])
+        assert len(opened.inserted) == 1
+
+        closed = _ingest_result([_ev(id=ident, started_at=start,
+                                     ended_at=start + timedelta(seconds=40))])
+        assert closed.counts["closed"] == 1
+        assert closed.inserted == []
+
+    def test_an_inserted_row_carries_what_the_engine_needs(self, cams):
+        """camera_id and activity are what scope and activity gates read."""
+        [row] = _ingest_result([_ev(id=str(uuid.uuid4()))]).inserted
+        assert row["camera_id"] == cams["gate-a1b2"]
+        assert row["activity"] == "restricted_zone_entry"
+        assert row["started_at"] is not None
+
+
+class TestAssistantAggregates:
+    """The Assistant counts the canonical records, including open/closed retries."""
+    def _run(self, **changes):
+        from backend.models import Camera
+        from backend.services import ai_events
+        from backend.services.search_assistant import tools
+        from sqlalchemy import select
+        plan = {'tool': 'count_events', 'cameras': None, 'activities': None,
+                'appearance': '', 'plate': '', 'grouping': 'camera', 'sort': 'latest',
+                'time_from': _ago(days=2).isoformat(), 'time_to': datetime.now(timezone.utc).isoformat(),
+                'timezone': 'Asia/Kolkata', **changes}
+        async def run(session):
+            cameras = (await session.execute(select(Camera))).scalars().all()
+            catalog = await ai_events.load_catalog(session)
+            return await tools.execute(plan, None, session, cameras, catalog)
+        return _session(run)
+
+    def test_closing_and_retrying_event_counts_once(self, cams):
+        ident, start = str(uuid.uuid4()), _ago(minutes=30)
+        event = _ev(id=ident, started_at=start)
+        _ingest([event])
+        _ingest([{**event, 'ended_at': start + timedelta(minutes=1)}])
+        _ingest([event])
+        result = self._run()
+        assert result['count'] == 1
+        assert result['groups'] == [{'label': 'Gate', 'count': 1}]  # the camera's name, not its slug
+
+    def test_multiple_activities_scope_and_expired_records(self, cams):
+        _ingest([_ev(track_id=1), _ev(activity='no_person_area', track_id=2),
+                 _ev(slug='yard-c3d4', activity='stray_parking', track_id=3)])
+        result = self._run(cameras=['gate-a1b2'], activities=['restricted_zone_entry', 'no_person_area'], grouping='activity')
+        assert result['count'] == 2
+        labels = asyncio.run(_fetch("SELECT label FROM analytics_activity_types "
+                                    "WHERE key IN ('restricted_zone_entry', 'no_person_area')"))
+        assert {g['label'] for g in result['groups']} == {r['label'] for r in labels}
+        asyncio.run(_fetch("UPDATE analytics_events SET expires_at = now() - interval '1 second' WHERE activity = 'no_person_area'"))
+        assert self._run(cameras=['gate-a1b2'])['count'] == 1
+
+    def test_camera_groups_are_ranked_highest_first(self, cams):
+        # "Which camera had the most…" reads the first row.
+        # Yard has more, and sorts after Gate alphabetically: only ranking puts it first.
+        _ingest([_ev(slug='yard-c3d4', activity='stray_parking', track_id=1),
+                 _ev(slug='yard-c3d4', activity='stray_parking', track_id=2), _ev(track_id=3)])
+        result = self._run()
+        assert result['groups'] == [{'label': 'Yard', 'count': 2}, {'label': 'Gate', 'count': 1}]
+
+    @pytest.mark.parametrize('group', ['hour', 'day', 'zone'])
+    def test_grouped_totals_are_exact(self, cams, group):
+        _ingest([_ev(track_id=i, started_at=_ago(hours=i+1)) for i in range(3)])
+        result = self._run(grouping=group)
+        assert result['count'] == 3
+        assert sum(g['count'] for g in result['groups']) == 3
+
+    @pytest.mark.parametrize('sort', ['latest', 'earliest'])
+    def test_event_pagination_has_no_overlap(self, cams, sort):
+        _ingest([_ev(track_id=i, started_at=_ago(minutes=i+1)) for i in range(30)])
+        first = self._run(tool='search_events', sort=sort)
+        second = self._run(tool='search_events', sort=sort, cursor=first['next_cursor'])
+        assert len(first['items']) == 24 and len(second['items']) == 6
+        assert not set(first['evidence_ids']) & set(second['evidence_ids'])
+        assert 'attributes' not in first['items'][0]
+
+    def test_alias_migration_and_older_client_preservation(self, cams):
+        from backend.models import ActivityTypesBody, AnalyticsActivityType
+        from backend.routers.cameras import replace_activity_types
+        from sqlalchemy import select
+        async def run(session):
+            row = (await session.execute(select(AnalyticsActivityType).limit(1))).scalar_one()
+            row.search_aliases = ['site activity alias']
+            row.suggested_aliases = ['suggested phrase']
+            await session.commit()
+            body = ActivityTypesBody(types=[{'key': row.key, 'label': row.label, 'color': row.color}])
+            saved = await replace_activity_types(body, session)
+            found = next(t for t in saved if t['key']==row.key)
+            assert found['search_aliases'] == ['site activity alias']
+            assert found['suggested_aliases'] == ['suggested phrase']
+        _session(run)

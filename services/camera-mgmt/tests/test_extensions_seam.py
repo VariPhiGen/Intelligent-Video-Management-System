@@ -191,8 +191,10 @@ def _chain(versions_dir: Path):
     revs = {}
     for f in versions_dir.glob("*.py"):
         src = f.read_text(encoding="utf-8")
-        r = re.search(r'^revision: str = "([^"]+)"', src, re.M)
-        d = re.search(r'^down_revision: Union\[str, None\] = (None|"([^"]+)")', src, re.M)
+        # Both house styles: `revision: str = "063"` and plain `revision = '063'`.
+        # Matching only the first silently dropped 063-068 from the chain check.
+        r = re.search(r'^revision(?:: str)? = ["\']([^"\']+)["\']', src, re.M)
+        d = re.search(r'^down_revision(?:: [^=]+)? = (None|["\']([^"\']+)["\'])', src, re.M)
         if r and d:
             revs[r.group(1)] = d.group(2)
     return revs

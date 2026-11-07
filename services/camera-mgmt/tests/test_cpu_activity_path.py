@@ -4,7 +4,7 @@ What changed, and what must not have:
 
   * saving AI Config hands the stored config to the analytics service (the CPU
     Activity Engine) immediately — and touches DeepStream not at all, because
-    its projection is off by default;
+    its push is off by default;
   * the DeepStream integration is still there and still switches back on with
     its one flag, untouched;
   * AI Config's own validation is exactly what it was;
@@ -33,7 +33,6 @@ from backend.config import Settings, settings  # noqa: E402
 from backend.models import AnalyticsConfigBody  # noqa: E402
 from backend.routers import cameras as cam_router  # noqa: E402
 from backend.services import ai_events, analytics_client, deepstream_client  # noqa: E402
-from backend.services import deepstream_projection  # noqa: E402
 
 ZONE = {"kind": "zone", "name": "Zone 1", "color": "#4fd1c5",
         "points": [[0.1, 0.2], [0.9, 0.2], [0.5, 0.9]]}
@@ -105,14 +104,13 @@ def wired(monkeypatch):
     monkeypatch.setattr(settings, "analytics_sync_enabled", True)
     # PINNED, not assumed. The default is off (asserted below), but settings
     # are read from the environment, and an appliance that still projects to
-    # DeepStream sets DEEPSTREAM_PROJECTION_ENABLED=true — so inside vms_api,
+    # DeepStream sets DEEPSTREAM_SYNC_ENABLED=true — so inside vms_api,
     # which is where scripts/as-if-open-core.sh runs this suite, the default
     # never applies and every test here failed for a reason that is not the
     # code under test.
-    monkeypatch.setattr(settings, "deepstream_projection_enabled", False)
+    monkeypatch.setattr(settings, "deepstream_sync_enabled", False)
     monkeypatch.setattr(deepstream_client, "apply_camera", forbidden)
     monkeypatch.setattr(deepstream_client, "remove_camera", forbidden)
-    monkeypatch.setattr(deepstream_projection, "project_now", forbidden)
     return SimpleNamespace(cam=cam, pushed=pushed)
 
 
@@ -123,13 +121,13 @@ async def _save(cam, body):
 
 # ── DeepStream is disconnected ──────────────────────────────────────────────
 
-def test_the_deepstream_projection_is_off_by_default():
-    assert Settings.model_fields["deepstream_projection_enabled"].default is False
+def test_the_deepstream_push_is_off_by_default():
+    assert Settings.model_fields["deepstream_sync_enabled"].default is False
 
 
 @pytest.mark.asyncio
 async def test_saving_ai_config_reaches_the_cpu_engine_and_never_deepstream(wired, monkeypatch):
-    monkeypatch.setattr(settings, "deepstream_projection_enabled", False)
+    monkeypatch.setattr(settings, "deepstream_sync_enabled", False)
     await _save(wired.cam, SAVED)
     assert wired.cam.analytics_config == AnalyticsConfigBody(**SAVED).model_dump()
     [(slug, domains, cfg)] = wired.pushed
@@ -154,25 +152,27 @@ async def test_removing_the_last_activity_stops_analysing_the_camera(wired, monk
 
 @pytest.mark.asyncio
 async def test_the_deepstream_integration_still_switches_back_on(monkeypatch):
-    """Disconnected, not deleted: the flag alone brings the projection back."""
+    """Disconnected, not deleted: the flag alone brings the push back."""
     reached = []
 
-    async def project_now(reason):
-        reached.append(reason)
-        return SimpleNamespace(locked_out=True, removed_slugs=[], written_slugs=[])
+    async def apply_camera(camera):
+        reached.append(camera.slug)
+        return deepstream_client.CallResult(True)
 
-    monkeypatch.setattr(deepstream_projection, "project_now", project_now)
-    monkeypatch.setattr(settings, "deepstream_projection_enabled", False)
-    await deepstream_client.sync_now("off")
-    monkeypatch.setattr(settings, "deepstream_projection_enabled", True)
-    await deepstream_client.sync_now("on")
-    assert reached == ["on"]
+    cam = SimpleNamespace(slug="gate-a1b2", stage="registered", enabled=True,
+                          analytics_config={"regions": {"region_1": ZONE}})
+    monkeypatch.setattr(deepstream_client, "apply_camera", apply_camera)
+    monkeypatch.setattr(settings, "deepstream_sync_enabled", False)
+    await deepstream_client.sync_camera(cam, "off")
+    monkeypatch.setattr(settings, "deepstream_sync_enabled", True)
+    await deepstream_client.sync_camera(cam, "on")
+    assert reached == ["gate-a1b2"]
 
 
 def test_startup_only_starts_the_deepstream_loop_behind_its_flag():
     from backend import main
     src = inspect.getsource(main.lifespan)
-    guard = src.index("if settings.deepstream_projection_enabled:")
+    guard = src.index("if settings.deepstream_sync_enabled:")
     assert guard < src.index('deepstream_client.sync_now("startup")')
     assert guard < src.index("deepstream_client.reconcile_loop")
 
@@ -205,7 +205,7 @@ def test_the_stored_config_shape_and_its_validation_are_unchanged():
 # ── the CPU engine is an accepted producer ──────────────────────────────────
 
 def test_the_ingest_accepts_the_cpu_engine_as_a_source():
-    cam = SimpleNamespace(id=uuid.uuid4(), slug="gate-a1b2", retention_days=None,
+    cam = SimpleNamespace(id=uuid.uuid4(), slug="gate-a1b2", retention_minutes=None,
                           analytics_config=SAVED)
     now = datetime.now(timezone.utc)
     ev = ai_events.EventIn(sensor_id="gate-a1b2", activity="restricted_zone_entry",
@@ -214,7 +214,7 @@ def test_the_ingest_accepts_the_cpu_engine_as_a_source():
                            confidence=0.9, source="cpu",
                            attributes={"full_frame_zone": False})
     [row], rejected = ai_events.prepare([ev], {"gate-a1b2": cam}, now=now,
-                                        default_retention_days=30)
+                                        default_retention_minutes=30 * 1440)
     assert rejected == []
     assert row["source"] == "cpu" and row["zone"] == "Zone 1"
     assert row["camera_id"] == cam.id and row["activity"] == "restricted_zone_entry"

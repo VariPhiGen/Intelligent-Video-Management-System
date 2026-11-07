@@ -106,6 +106,16 @@ volumes. A developer's own stack (default project name) is untouched, and
 
 These each cost an hour to find. They are documented at their call sites too.
 
+**`compose up` does not rebuild an image that already exists.** `up.sh` used to
+build the three fixtures and leave the product images to compose, which builds
+one only when it is MISSING. So the first run on a machine tested the working
+tree and every run after it tested whatever that first run had compiled. A
+change to a service could be exercised by all 96 tests and never actually run.
+Found on 2026-09-18: six new assertions failed against an `api` image built
+before the code they were written for, which looked exactly like a product
+defect. `up.sh` now runs a full `compose build` (layer-cached, seconds when the
+tree is unchanged); `E2E_BUILD=0` skips it when you know the images are current.
+
 **`RTSP_PORT` is not a host-only port.** It looks like one — the bridge overlay
 publishes `"${RTSP_PORT}:8654"` — but the container side is the literal 8654
 from `deploy/mediamtx.yml`, and the api builds its internal relay URL from the
@@ -190,7 +200,10 @@ e2e/
     j6-recording.spec.ts       8 · camera → relay → NVR → indexed segment → clip
     j7-playback.spec.ts       10 · requested moment decodes to that timecode
     j8-search-isolation.spec.ts 8 · foreign index rows never reach the UI
-    j9-camera-deletion.spec.ts 11 · both tracks torn down and purged
+    j9-camera-deletion.spec.ts 12 · both tracks torn down and purged, and the
+                                    broker and index told to stop
+    j10-ai-opt-in.spec.ts      6 · a new camera runs no AI; switching it on
+                                    reaches the broker and the index at once
 ```
 
 ---

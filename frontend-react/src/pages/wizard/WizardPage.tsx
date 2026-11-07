@@ -4,6 +4,7 @@
  * Confirm) driving the real discovery machinery, ported from the legacy SPA's
  * page-discovery section (wzGo / wzGate / wzStepClick / wzReset).
  */
+import { ViewTransition } from '@/components/ViewTransition';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -126,7 +127,7 @@ export function WizardPage() {
   }
 
   return (
-    <div className="fade">
+    <ViewTransition view={String(step)}>
       {/* Title lives in the topbar (like Live View) — tabs lead the page. */}
       <CamerasTabs active="add" />
 
@@ -170,6 +171,6 @@ export function WizardPage() {
           </button>
         </div>
       </div>
-    </div>
+    </ViewTransition>
   );
 }

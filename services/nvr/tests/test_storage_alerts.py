@@ -37,6 +37,9 @@ GB = 1024 ** 3
 NOW = 1_700_000_000.0
 
 
+DAY_MIN = 1440  # minutes in a day — retention is minute-granular now
+
+
 def snap(**kw):
     """An evaluate() call with everything healthy unless overridden."""
     base = dict(
@@ -45,7 +48,7 @@ def snap(**kw):
         limit_bytes=None,
         pressure={},
         oldest_epoch=NOW - 30 * 86400,
-        configured_days=30,
+        configured_minutes=30 * DAY_MIN,
         now=NOW,
     )
     base.update(kw)
@@ -67,9 +70,12 @@ def test_a_young_install_does_not_warn():
     has been evicting for months — unless you ask whether anything was actually
     evicted. Nothing has been, so this must be silent.
     """
-    r = snap(oldest_epoch=NOW - 2 * 86400, configured_days=30, pressure={})
+    r = snap(oldest_epoch=NOW - 2 * 86400, configured_minutes=30 * DAY_MIN, pressure={})
     assert r["state"] == OK
-    assert r["effective_retention_days"] == 2.0   # reported, but not a warning
+    # Reported, but not a warning. In MINUTES: a fleet kept for hours would
+    # otherwise round to "0.0 days" in the one field that says how much
+    # retention the cap is costing.
+    assert r["effective_retention_minutes"] == 2 * DAY_MIN
 
 
 # ── the disk ─────────────────────────────────────────────────────────────────
@@ -110,16 +116,27 @@ def test_cap_below_threshold_is_silent():
 def test_binding_cap_names_the_shortfall_not_the_mechanism():
     """An operator needs 'you are keeping 11 days, not 30' — not 'eviction ran'."""
     r = snap(pressure={"size_cap_last_at": NOW - 60},
-             oldest_epoch=NOW - 11 * 86400, configured_days=30)
+             oldest_epoch=NOW - 11 * 86400, configured_minutes=30 * DAY_MIN)
     assert r["state"] == WARNING
     assert r["cap_binding"] is True
     assert "configured for 30 days" in r["reasons"][0]
-    assert "11.0 days old" in r["reasons"][0]
+    assert "11 days old" in r["reasons"][0]
+
+
+def test_a_minute_scale_shortfall_is_stated_in_minutes():
+    """The message has to work for the fleet minute-granular retention exists
+    for. In days, "configured for 0 days but the oldest footage is 0.0 days
+    old" is what an operator would have been shown."""
+    r = snap(pressure={"size_cap_last_at": NOW - 60},
+             oldest_epoch=NOW - 12 * 60, configured_minutes=30)
+    assert r["state"] == WARNING
+    assert "configured for 30 minutes" in r["reasons"][0]
+    assert "12 minutes old" in r["reasons"][0]
 
 
 def test_binding_is_read_from_events_not_from_the_span():
     """The same short span, with and without an eviction behind it."""
-    short = dict(oldest_epoch=NOW - 5 * 86400, configured_days=30)
+    short = dict(oldest_epoch=NOW - 5 * 86400, configured_minutes=30 * DAY_MIN)
     assert snap(pressure={}, **short)["state"] == OK
     assert snap(pressure={"size_cap_last_at": NOW - 60}, **short)["state"] == WARNING
 
@@ -130,13 +147,16 @@ def test_binding_expires_so_a_one_off_eviction_does_not_alert_forever():
 
 
 def test_binding_window_spans_several_retention_passes():
-    """Retention runs hourly; a window under ~2 passes would flap."""
+    """Retention runs at most hourly; a window under ~2 passes would flap.
+
+    Sized against the SLOWEST cadence deliberately — a minute-scale camera
+    makes the sweep faster, which only makes this window more generous."""
     assert alerts.CAP_BINDING_WINDOW_S >= 2 * 3600
 
 
 def test_binding_still_warns_without_a_configured_retention():
     """No camera map yet — still say the cap is evicting, just less precisely."""
-    r = snap(pressure={"size_cap_last_at": NOW - 60}, configured_days=None)
+    r = snap(pressure={"size_cap_last_at": NOW - 60}, configured_minutes=None)
     assert r["state"] == WARNING
     assert "evicting footage" in r["reasons"][0]
 
@@ -171,7 +191,7 @@ def test_notifies_only_on_transitions(tmp_path):
     a = make_alerter(tmp_path, sent)
     for _ in range(5):
         a.check(dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-                     pressure={}, oldest_epoch=None, configured_days=None, now=NOW))
+                     pressure={}, oldest_epoch=None, configured_minutes=None, now=NOW))
     assert sent == [(None, CRITICAL)]
 
 
@@ -179,7 +199,7 @@ def test_the_all_clear_is_sent(tmp_path):
     sent = []
     a = make_alerter(tmp_path, sent)
     bad = dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-               pressure={}, oldest_epoch=None, configured_days=None, now=NOW)
+               pressure={}, oldest_epoch=None, configured_minutes=None, now=NOW)
     a.check(bad)
     a.check({**bad, "disk_state": {"used_pct": 40.0}})
     assert sent == [(None, CRITICAL), (CRITICAL, OK)]
@@ -189,7 +209,7 @@ def test_a_restart_does_not_replay_a_standing_alert(tmp_path):
     """...and, more importantly, does not swallow the all-clear afterwards."""
     sent1, sent2 = [], []
     bad = dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-               pressure={}, oldest_epoch=None, configured_days=None, now=NOW)
+               pressure={}, oldest_epoch=None, configured_minutes=None, now=NOW)
     a = make_alerter(tmp_path, sent1)
     a.check(bad)
     assert sent1 == [(None, CRITICAL)]
@@ -204,7 +224,7 @@ def test_a_restart_does_not_replay_a_standing_alert(tmp_path):
 def test_state_file_is_json_and_readable(tmp_path):
     a = make_alerter(tmp_path, [])
     a.check(dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-                 pressure={}, oldest_epoch=None, configured_days=None, now=NOW))
+                 pressure={}, oldest_epoch=None, configured_minutes=None, now=NOW))
     written = json.loads((tmp_path / "alert-state.json").read_text())
     assert written["last_notified_state"] == CRITICAL
 
@@ -214,7 +234,7 @@ def test_a_corrupt_state_file_does_not_stop_alerting(tmp_path):
     sent = []
     a = make_alerter(tmp_path, sent)
     a.check(dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-                 pressure={}, oldest_epoch=None, configured_days=None, now=NOW))
+                 pressure={}, oldest_epoch=None, configured_minutes=None, now=NOW))
     assert sent == [(None, CRITICAL)]
 
 
@@ -225,7 +245,7 @@ def test_a_failing_webhook_never_raises_into_the_nvr(tmp_path):
                        webhook_url="http://127.0.0.1:1/hook",
                        interval_seconds=0, timeout_seconds=0.2)
     r = a.check(dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-                     pressure={}, oldest_epoch=None, configured_days=None, now=NOW))
+                     pressure={}, oldest_epoch=None, configured_minutes=None, now=NOW))
     assert r["state"] == CRITICAL
     assert a._notify_failures == 1  # noqa: SLF001
 
@@ -234,7 +254,7 @@ def test_no_webhook_configured_still_evaluates_and_logs(tmp_path):
     """Log-only is a supported deployment, not a broken one."""
     a = StorageAlerter(state_path=tmp_path / "s.json", webhook_url="", interval_seconds=0)
     assert a.check(dict(disk_state={"used_pct": 96.0}, footage_bytes=0, limit_bytes=None,
-                        pressure={}, oldest_epoch=None, configured_days=None,
+                        pressure={}, oldest_epoch=None, configured_minutes=None,
                         now=NOW))["state"] == CRITICAL
 
 

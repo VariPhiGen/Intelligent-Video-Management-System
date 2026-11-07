@@ -41,7 +41,7 @@ from ..models import (
 )
 from ..services import audit as audit_svc
 from ..services import health as health_svc
-from ..services import nvr_client, relay, rtsp_verify, scan_manager, substream
+from ..services import nvr_client, ptz_control, relay, rtsp_verify, scan_manager, stream_codec, substream
 from ..security import get_principal
 from ..urlutil import host_of, inject_credentials, split_credentials, to_rtsps
 from .cameras import _ensure_unique_slug
@@ -220,7 +220,7 @@ async def _register(
         await db.rollback()
         if "ix_cameras_rtsp_url" not in str(exc.orig):
             raise
-        camera.discovery_error = "Already registered in the relay"
+        camera.discovery_error = await _duplicate_stream_message(rtsp_url, db)
         await db.commit()
         await db.refresh(camera)
         return False
@@ -237,6 +237,11 @@ async def _register(
     # probing takes seconds and must not delay registration. Stores only; it
     # never starts recording on its own.
     asyncio.create_task(substream.resolve_in_background(camera.id))
+    # Same treatment for PTZ: the answer to "does this camera pan?" is cached
+    # on the row (see models.Camera.ptz_capabilities), and registration — the
+    # one moment we are guaranteed to hold working ONVIF credentials — is the
+    # honest time to ask. Detached for the same reason as the sub-track probe.
+    asyncio.create_task(ptz_control.probe_in_background(camera.id))
 
     await db.refresh(camera)
     log.info("discovery.register.ok", ip=camera.ip, slug=slug)
@@ -252,6 +257,23 @@ async def _register(
         detail={"name": name, "via": "discovery", "ip": camera.ip},
     )
     return True
+
+
+async def _duplicate_stream_message(rtsp_url: str, db: AsyncSession) -> str:
+    """Explain a unique-rtsp_url refusal in terms the operator can act on.
+
+    The usual cause is a multi-channel NVR/DVR where the same channel number
+    was typed twice, so name the camera that already owns the stream.
+    """
+    owner = (await db.execute(
+        select(Camera.name).where(Camera.rtsp_url == rtsp_url)
+    )).scalar_one_or_none()
+    who = f'as camera "{owner}"' if owner else "as another camera"
+    return (
+        f"This stream is already added {who}. Each stream can only be added "
+        "once — if this is a multi-channel recorder, check the channel number "
+        "in the RTSP URL."
+    )
 
 
 @router.post("/devices/{device_id}/add", response_model=DeviceOut)
@@ -286,6 +308,13 @@ async def add_to_relay(
     playable: Optional[bool] = None
     if body.verify:
         playable, full_url = await rtsp_verify.resolve_rtsp(full_url)
+        if playable:
+            # The wizard offers the camera's FIRST ONVIF profile, and on i-PRO cameras that's JPEG — it plays, so it
+            # passed, but live view (HLS) can never carry it. Take the best VIDEO profile instead
+            # (services/stream_codec.py).
+            full_url, switched = await stream_codec.video_url_for(camera, full_url)
+            if switched:
+                log.info("discovery.add.video_profile", ip=camera.ip, codec=switched.get("codec"))
         if playable and full_url.startswith("rtsps://"):
             cand["url_raw"] = to_rtsps(cand["url_raw"]) or cand["url_raw"]
         cand["verified"] = playable
@@ -300,7 +329,11 @@ async def add_to_relay(
         lawful_basis=body.lawful_basis, purpose=body.purpose,
         notice_posted=body.notice_posted,
     )
-    if registered and playable is False:
+    if not registered:
+        # A 200 here read as success in the wizard, which moved on and left
+        # the operator wondering where the camera went.
+        raise HTTPException(status_code=409, detail=camera.discovery_error)
+    if playable is False:
         camera.discovery_error = (
             "Added but left disabled — no playable stream at this URL. "
             "Fix the credentials or profile, then enable it."
@@ -390,12 +423,13 @@ async def add_manual(
         await db.commit()
         await db.refresh(camera)
     if not registered:
-        # Keep the row so the user can fix and retry (mirrors old behaviour).
+        # Keep the row so the user can fix and retry (mirrors old behaviour),
+        # but refuse loudly — see add_to_relay.
         camera.stage = (
             CameraStage.VERIFIED.value if verified else CameraStage.DISCOVERED.value
         )
         await db.commit()
-        await db.refresh(camera)
+        raise HTTPException(status_code=409, detail=camera.discovery_error)
     return _out(camera)
 
 

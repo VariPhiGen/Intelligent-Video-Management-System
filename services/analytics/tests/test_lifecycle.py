@@ -152,7 +152,7 @@ class Rig:
 
 
 @pytest.fixture
-def rig(monkeypatch):
+def rig(monkeypatch, tmp_path):
     """Factory: rig(**overrides) builds an engine with everything faked."""
     engines: list[AnalyticsEngine] = []
     calls = {"detector": 0, "plates": 0, "reclaim": 0}
@@ -170,6 +170,9 @@ def rig(monkeypatch):
     monkeypatch.setattr(selection_mod, "DetectorSelector", lambda cfg: object())
     monkeypatch.setattr(sampler_mod, "CameraSampler", FakeSampler)
     monkeypatch.setattr(engine_mod, "DetectionPipeline", FakePipeline)
+    # Model choice has its own tests (test_capacity.py); timing a fake here
+    # would only spend its calls.
+    monkeypatch.setattr(engine_mod, "measure_fps", lambda det: 100.0)
     monkeypatch.setattr(engine_mod.AnalyticsEngine, "_reclaim",
                         staticmethod(lambda: calls.__setitem__(
                             "reclaim", calls["reclaim"] + 1)))
@@ -186,6 +189,11 @@ def rig(monkeypatch):
         cfg.lifecycle.idle_timeout_seconds = idle_timeout
         cfg.lifecycle.poll_seconds = POLL
         cfg.lifecycle.retry_seconds = POLL
+        # PINNED AND HERMETIC: these test the lifecycle, not which model is
+        # chosen. A bare name is never downloaded, and the capacity cache
+        # lands in a temp dir, never in a real models volume.
+        cfg.models.detector_weights = "yolov8n.pt"
+        cfg.models.models_dir = str(tmp_path)
         eng = AnalyticsEngine(cfg)
         engines.append(eng)
         return Rig(eng, calls)

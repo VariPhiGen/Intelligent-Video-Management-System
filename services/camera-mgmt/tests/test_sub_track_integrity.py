@@ -31,7 +31,7 @@ SUB = {"url_raw": "rtsp://10.0.0.5:554/sub", "codec": "h264",
 def camera(**kw):
     base = dict(slug="gate-a1b2", rtsp_url="rtsp://user:pw@10.0.0.5:554/main",
                 enabled=True, recording=True, recording_schedule=None,
-                privacy_masks=[], retention_days=30, groom_after_days=None,
+                privacy_masks=[], retention_minutes=30 * 1440, groom_after_days=None,
                 sub_track=None)
     base.update(kw)
     return SimpleNamespace(**base)
@@ -79,14 +79,16 @@ def http(monkeypatch):
 async def test_never_groom_survives_add_camera(http):
     """0 is a setting, not an absence. A truthy test dropped it and the sub
     inherited the appliance groom default — the rewrite it was opting out of."""
-    await nvr_client.add_camera("gate-a1b2_sub", retention_days=3, groom_after_days=0)
+    await nvr_client.add_camera("gate-a1b2_sub", retention_minutes=3 * 1440,
+                                groom_after_days=0)
     _m, _u, params = http.calls[0]
     assert params["groom_after_days"] == 0
 
 
 @pytest.mark.asyncio
 async def test_no_override_is_omitted_from_add_camera(http):
-    await nvr_client.add_camera("gate-a1b2", retention_days=30, groom_after_days=None)
+    await nvr_client.add_camera("gate-a1b2", retention_minutes=30 * 1440,
+                                groom_after_days=None)
     _m, _u, params = http.calls[0]
     assert "groom_after_days" not in params
 
@@ -111,9 +113,9 @@ class _FakeNVR:
         self.added, self.removed, self.purged = [], [], []
         self.purge_result = True
 
-    async def add_camera(self, name, retention_days=None, masks=None,
+    async def add_camera(self, name, retention_minutes=None, masks=None,
                          groom_after_days=None):
-        self.added.append({"name": name, "retention_days": retention_days,
+        self.added.append({"name": name, "retention_minutes": retention_minutes,
                            "masks": masks, "groom_after_days": groom_after_days})
         return True
 
@@ -157,10 +159,21 @@ async def test_the_sub_is_added_with_never_groom(nvr):
 
 @pytest.mark.asyncio
 async def test_the_sub_keeps_its_own_shorter_retention(nvr):
-    await cam_router._sync_recording_tracks(camera(sub_track=SUB, retention_days=30))
+    await cam_router._sync_recording_tracks(
+        camera(sub_track=SUB, retention_minutes=30 * 1440))
     sub = next(a for a in nvr.added if a["name"] == SUB_NAME)
     main = next(a for a in nvr.added if a["name"] == "gate-a1b2")
-    assert sub["retention_days"] < main["retention_days"]
+    assert sub["retention_minutes"] < main["retention_minutes"]
+
+
+@pytest.mark.asyncio
+async def test_a_minute_scale_main_pulls_the_sub_down_with_it(nvr):
+    """The clamp has to hold below a day, or the scrub track outlives the
+    footage on exactly the setting chosen to stop holding it."""
+    await cam_router._sync_recording_tracks(
+        camera(sub_track=SUB, retention_minutes=20))
+    sub = next(a for a in nvr.added if a["name"] == SUB_NAME)
+    assert sub["retention_minutes"] == 20
 
 
 @pytest.mark.asyncio
@@ -377,7 +390,7 @@ async def test_ensure_path_repoints_an_existing_path(monkeypatch):
 # ── A re-probe must not discard what an operator chose ──────────────────────
 
 PRIOR = {"url_raw": "rtsp://10.0.0.5:554/sub", "recording_enabled": True,
-         "retention_days": 14, "codec": "h264"}
+         "retention_minutes": 14 * 1440, "codec": "h264"}
 
 
 def _fresh():
@@ -387,11 +400,11 @@ def _fresh():
 
 
 def test_a_reprobe_keeps_the_retention_an_operator_chose():
-    """recording_enabled was carried across a re-probe and retention_days was
-    not, so a deliberate 14-day sub retention silently reverted to the 3-day
-    default and footage someone chose to keep started ageing out."""
+    """recording_enabled was carried across a re-probe and retention_minutes
+    was not, so a deliberate 14-day sub retention silently reverted to the
+    3-day default and footage someone chose to keep started ageing out."""
     out = tracks.carry_operator_settings(PRIOR, _fresh())
-    assert out["retention_days"] == 14
+    assert out["retention_minutes"] == 14 * 1440
 
 
 def test_a_reprobe_keeps_the_recording_switched_on():
@@ -410,7 +423,7 @@ def test_a_reprobe_still_adopts_what_the_camera_actually_offers():
 def test_a_first_resolve_has_nothing_to_carry():
     out = tracks.carry_operator_settings(None, _fresh())
     assert out["recording_enabled"] is False
-    assert "retention_days" not in out
+    assert "retention_minutes" not in out
 
 
 def test_carrying_onto_nothing_stays_nothing():
@@ -422,7 +435,7 @@ def test_carrying_onto_nothing_stays_nothing():
 def test_every_operator_field_is_covered_by_this_file():
     """Guards the list itself. A field added to OPERATOR_SET_FIELDS without a
     test above is a field that can silently start being discarded again."""
-    assert set(tracks.OPERATOR_SET_FIELDS) == {"recording_enabled", "retention_days"}
+    assert set(tracks.OPERATOR_SET_FIELDS) == {"recording_enabled", "retention_minutes"}
 
 
 # ── Whole-camera purge covers every track ──────────────────────────────────
@@ -503,6 +516,10 @@ def purge_nvr(monkeypatch):
     async def no_audit(*a, **kw):
         return None
     monkeypatch.setattr(nvr_router.audit_svc, "record", no_audit)
+
+    async def no_presence(slug, frm=None, to=None):
+        return 0
+    monkeypatch.setattr(nvr_router.timeline_svc, "erase_by_slug", no_presence)
 
     def install(table):
         fake = _PurgeHTTP(table)

@@ -5,9 +5,14 @@
  * agree on them without importing the page (which would be a cycle).
  */
 
-/** Which layer the plan is showing. Geofences is a disabled chip until that
+/** Which layer the plan is showing.
+ *
+ *  `coverage` draws what each registered camera actually sees, which is a
+ *  different question from `cameras` (where they stand) and the prerequisite
+ *  for `geofences` — a zone drawn on the plan can only be projected into a
+ *  camera that has been registered. Geofences stays a disabled chip until that
  *  surface exists. */
-export type View = 'cameras' | 'ha' | 'heatmap' | 'geofences';
+export type View = 'cameras' | 'ha' | 'heatmap' | 'coverage' | 'geofences';
 
 export const STATUS_BADGE: Record<string, string> = {
   connected: 'badge-green',

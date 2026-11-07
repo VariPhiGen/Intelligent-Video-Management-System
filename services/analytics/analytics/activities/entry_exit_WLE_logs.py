@@ -35,13 +35,23 @@ IDENTITY IS THE TRACKER'S. Sides are remembered per tracker id. When the tracker
 retires an id (unseen for its max age, 3 s by default) that memory goes, so a
 half-finished crossing is never counted and never counted twice. Only confirmed
 tracks raise: a crossing completed while the track is still tentative is held
-and raised — stamped with the moment it completed — once the tracker confirms
-it, so a one-frame flicker never counts. A detection with no tracker id cannot
+and raised — dated when the person reached the line, like every crossing —
+once the tracker confirms it, so a one-frame flicker never counts. A detection with no tracker id cannot
 have sides and raises nothing.
 
 THE EVENT carries `attributes.direction` ("entry" | "exit"), the tripwire's
 region id and name, and the box at the moment of crossing. The VMS counts these
 per time bucket for the Events page's Entry / Exit graph.
+
+WHEN IT HAPPENED: `started_at` is the moment the person REACHED the tripwire -
+the first frame of this crossing in which their box touched it - because that
+is what an operator looks for in playback. The crossing is only COMPLETE once
+the whole box has cleared the line, which can be seconds later (a tripwire
+near the frame edge: 2.5 s measured on cam1, by when the person was a sliver
+leaving the frame); that moment is kept as `attributes.completed_at`, with
+`attributes.crossing_s` between the two. A crossing seen with no frame on the
+line is dated midway between the last frame on one side and the first on the
+other.
 
 ADMINISTRATOR SETTINGS: none; the tripwire and its entry direction are drawn in
 Zones & Analytics.
@@ -61,7 +71,7 @@ from typing import Optional
 import cv2
 
 from .base import (AVAILABLE, ZONE_TRIPWIRE, Activity, ActivityDefinition, ActivityEvent,
-                   FrameContext, TrackedObject, Zone)
+                   FrameContext, TrackedObject, Zone, iso_utc)
 
 log = logging.getLogger("analytics.activities")
 
@@ -143,6 +153,11 @@ class _Passage:
     across: bool = False
     #: ...and touching the tripwire segment itself, not its extension.
     touched: bool = False
+    #: When the box first touched the tripwire on the way across: the moment
+    #: the person reached the gateway, which is when the crossing is dated.
+    touched_at: Optional[float] = None
+    #: When the box was last seen fully on `side`.
+    side_ts: Optional[float] = None
 
 
 class EntryExitWLELogsActivity(Activity):
@@ -176,43 +191,54 @@ class EntryExitWLELogsActivity(Activity):
                 passage = self._passages.setdefault(key, _Passage())
                 crossing = self._step(passage, obj, wire, ctx)
                 if crossing is not None:
-                    self._pending.setdefault(key, []).append((ctx.ts, crossing, obj))
+                    direction, reached = crossing
+                    self._pending.setdefault(key, []).append((reached, ctx.ts, direction, obj))
                 if obj.confirmed and key in self._pending:
-                    for ts, direction, seen in self._pending.pop(key):
-                        events.append(self._event(ctx, wire, ts, direction, seen))
+                    for reached, done, direction, seen in self._pending.pop(key):
+                        events.append(self._event(ctx, wire, reached, done, direction, seen))
         return events
 
-    def _step(self, p: _Passage, obj: TrackedObject, wire: Zone, ctx: FrameContext) -> Optional[str]:
-        """Advance one person's passage past one tripwire; the crossing it completes, if any."""
+    def _step(self, p: _Passage, obj: TrackedObject, wire: Zone,
+              ctx: FrameContext) -> Optional[tuple[str, float]]:
+        """Advance one person's passage past one tripwire; the crossing it
+        completes, if any, as (direction, when the person reached the line)."""
         side = _side(obj.bbox, wire.points, ctx.width, ctx.height)
         if side == 0:
             p.across = True
             if box_touches_tripwire(obj.bbox, wire.points, ctx.width, ctx.height):
+                if not p.touched:
+                    p.touched_at = ctx.ts
                 p.touched = True
             return None
         crossing = None
         if p.side and side != p.side:
             if p.across:
                 through = p.touched
+                reached = p.touched_at
             else:
                 # No frame in between: did the path from one box to the other meet it?
                 through = box_touches_tripwire(_union(p.side_box, obj.bbox), wire.points,
                                                ctx.width, ctx.height)
+                reached = (p.side_ts + ctx.ts) / 2.0 if p.side_ts is not None else ctx.ts
             if through:
-                crossing = ENTRY if side == ENTRY_SIDE[wire.direction] else EXIT
+                crossing = (ENTRY if side == ENTRY_SIDE[wire.direction] else EXIT,
+                            reached if reached is not None else ctx.ts)
         p.side, p.side_box, p.across, p.touched = side, obj.bbox, False, False
+        p.touched_at, p.side_ts = None, ctx.ts
         return crossing
 
-    def _event(self, ctx: FrameContext, wire: Zone, ts: float, direction: str,
-               obj: TrackedObject) -> ActivityEvent:
+    def _event(self, ctx: FrameContext, wire: Zone, reached: float, done: float,
+               direction: str, obj: TrackedObject) -> ActivityEvent:
         return ActivityEvent(
-            camera=ctx.camera, activity=self.key, started_at=ts, zone=wire,
+            camera=ctx.camera, activity=self.key, started_at=reached, zone=wire,
             confidence=obj.confidence, track_id=obj.track_id, object_class=obj.label,
             attributes={
                 "direction": direction,
                 "tripwire_id": wire.key,
                 "tripwire_name": wire.name,
                 "bbox": [round(v, 4) for v in obj.bbox],
+                "completed_at": iso_utc(done),
+                "crossing_s": round(max(0.0, done - reached), 2),
             },
         )
 

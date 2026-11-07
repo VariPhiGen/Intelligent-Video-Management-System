@@ -4,6 +4,7 @@
  * Nav aliases keep Cameras highlighted on its sub-pages.
  */
 import { useEffect, useState, type ReactNode } from 'react';
+import { MotionConfig, motion, useAnimationControls, useReducedMotion } from 'motion/react';
 import { LICENSE_NAME, LICENSE_URL, SOURCE_URL, SOURCE_CONFIGURED } from '../lib/legal';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { apiFetch } from '@/lib/api';
@@ -26,9 +27,11 @@ const ROLE_PRIORITY: [string, string][] = [
 
 const TITLES: Record<string, string> = {
   '/live': 'Live View', '/smartsearch': 'Smart Search', '/playback': 'Playback & Cases',
+  '/timelapse': 'Time-lapse',
   '/map': 'Map', '/peripherals': 'Peripherals', '/cameras': 'Camera Inventory',
   '/cameras/add': 'Add cameras', '/cameras/config': 'Configuration',
-  '/ai': 'AI Analytics', '/admin': 'Administration',
+  '/ai': 'AI Analytics', '/data-collection': 'Data Collection',
+  '/admin': 'Administration',
   // Extension pages title themselves from the nav entry they registered — the
   // header must not carry a route the build may not contain.
   ...Object.fromEntries(extensionNav.map(n => [n.to, n.label])),
@@ -133,11 +136,16 @@ const NAV = [
   { to: '/live', glyph: '▦', label: 'Live View', cap: 'live_view' },
   { to: '/smartsearch', glyph: '✦', label: 'Smart Search', cap: 'smart_search' },
   { to: '/playback', glyph: '⏱', label: 'Playback & Cases', cap: 'playback_search' },
+  { to: '/timelapse', glyph: '◷', label: 'Time-lapse', cap: 'timelapse_view' },
   { to: '/map', glyph: '⬡', label: 'Map', cap: 'map_view' },
   { section: 'Manage' },
-  // { to: '/peripherals', glyph: '⚡', label: 'Peripherals', cap: 'peripherals' },
+  { to: '/peripherals', glyph: '⚡', label: 'Peripherals', cap: 'peripherals' },
   { to: '/cameras', glyph: '▤', label: 'Cameras', counted: true, cap: 'camera_view' },
   { to: '/ai', glyph: '▣', label: 'AI Analytics', cap: 'ai_analytics' },
+  { section: 'AI Workspace' },
+  // Server-enforced, not a page toggle: /api/datasets rejects a principal
+  // without `data_collection`, so hiding this entry and gating the routes agree.
+  { to: '/data-collection', glyph: '◫', label: 'Data Collection', cap: 'data_collection' },
   { section: 'Govern' },
   { to: '/admin', glyph: '⚷', label: 'Administration', adminOnly: true },
 ] as const;
@@ -163,6 +171,15 @@ const NAV_WITH_EXTENSIONS: readonly any[] = (() => {
 export function Shell() {
   const { me, isAdmin, logout } = useAuth();
   const loc = useLocation();
+  const pageMotion = useAnimationControls();
+  const reducedMotion = useReducedMotion();
+
+  // Animate the existing surface: never key/remount routed video or form state.
+  useEffect(() => {
+    if (reducedMotion) { pageMotion.set({ opacity: 1 }); return; }
+    void pageMotion.start({ opacity: [0.72, 1], transition: { duration: 0.24 } });
+    return () => pageMotion.stop();
+  }, [loc.pathname, pageMotion, reducedMotion]);
   const clock = useClock();
   const [theme, setTheme] = useState(() => document.documentElement.dataset.theme || 'light');
   const [lang, setLang] = useState(() => { try { return localStorage.getItem('vms-lang') || 'en'; } catch { return 'en'; } });
@@ -237,7 +254,22 @@ export function Shell() {
     || Object.entries(TITLES).find(([p]) => loc.pathname.startsWith(p))?.[1] || BRAND.name;
   const nextTheme = theme === 'dark' ? 'light' : 'dark';
 
+  // The browser tab, history and bookmarks said "Camera Management" on every
+  // page; they now say where you are.
+  useEffect(() => {
+    document.title = title === BRAND.name ? BRAND.name : `${title} · ${BRAND.name}`;
+  }, [title]);
+
+  // On a phone the rail is a sideways-scrolling tab strip, and the page you are
+  // on can sit off its right edge with nothing to show it is selected. Bring
+  // it into view. A no-op on the desktop rail, where every item is visible.
+  useEffect(() => {
+    document.querySelector('#app > aside nav a.active')
+      ?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+  }, [loc.pathname]);
+
   return (
+    <MotionConfig reducedMotion="user" transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}>
     <div id="app">
       <aside>
         <Logo />
@@ -312,7 +344,9 @@ export function Shell() {
         {/* Left: where you are. Right: what the appliance is doing right now,
             then how you like the console. */}
         <header className="topbar">
-          <span className="topbar-title">{title}</span>
+          {/* The page's one heading. It was a <span>, so no page had a heading
+              at all and a screen reader's heading list was empty. */}
+          <h1 className="topbar-title">{title}</h1>
           <SiteChip />
           <div className="topbar-right">
             <div className="status-group">
@@ -333,10 +367,11 @@ export function Shell() {
                  options={[['en', 'EN'], ['hi', 'हिं']]} />
           </div>
         </header>
-        <main>
+        <motion.main animate={pageMotion}>
           <Outlet />
-        </main>
+        </motion.main>
       </div>
     </div>
+    </MotionConfig>
   );
 }

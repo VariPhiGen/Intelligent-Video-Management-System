@@ -17,6 +17,7 @@ import { apiFetch } from '@/lib/api';
 import type { Camera } from '@/lib/types';
 import { useToast } from '@/components/Toast';
 import { PolygonEditor, type EditorPolygon } from '@/components/PolygonEditor';
+import { cameraTarget, type AnalyticsTarget } from '../analytics/analyticsTarget';
 import { useActivityCatalog } from '../analytics/useActivityCatalog';
 import { dimHex, isAvailable, zoneOptional } from '../analytics/activities';
 import { ActivityRow } from '../analytics/ActivityRow';
@@ -28,10 +29,13 @@ import {
 
 const label: CSSProperties = { fontSize: 11.5, color: 'var(--muted)' };
 
-export function AiTab({ camera, motionState, onSaved }: {
+/** `camera.analytics_config` is the TARGET's config (a PTZ preset's, when ConfigPage's view picker names one) and
+ *  `target` says where activities are read fresh and saved. Motion and search settings stay camera-wide. */
+export function AiTab({ camera, motionState, onSaved, target = cameraTarget(camera) }: {
   camera: Camera;
   motionState?: string;
   onSaved: () => void;
+  target?: AnalyticsTarget;
 }) {
   const toast = useToast();
   // The catalog is read-only here — admins edit it under Administration → Activity types.
@@ -42,8 +46,11 @@ export function AiTab({ camera, motionState, onSaved }: {
   const [sens, setSens] = useState<string>(camera.motion_sensitivity || 'medium');
   const [savingMotion, setSavingMotion] = useState(false);
 
-  // ── Smart Search indexing (opt-OUT: on unless excluded) ──
-  const [indexing, setIndexing] = useState(camera.search_indexing !== false);
+  // ── Smart Search indexing (opt-IN since migration 038: off unless asked) ──
+  // `=== true`, not `!== false`: a camera that has never been switched on must
+  // render as off, or the dropdown shows "On" for a camera the backend is not
+  // indexing and the operator has no way to tell the two apart.
+  const [indexing, setIndexing] = useState(camera.search_indexing === true);
   const [domains, setDomains] = useState<string[]>(
     camera.search_domains ?? ['person', 'vehicles']
   );
@@ -189,9 +196,8 @@ export function AiTab({ camera, motionState, onSaved }: {
       // camera prop only refreshes via ConfigPage's fire-and-forget refresh()
       // (plus a 15s poll that can fail silently), so a stale copy here could
       // silently delete zones Zones & Analytics just saved. Fail loudly instead.
-      const fresh = await apiFetch<Camera>(`/cameras/${camera.id}`);
-      const freshPayload = buildActivitySave(fresh.analytics_config, activities, byKey);
-      await apiFetch(`/cameras/${camera.id}/analytics`, { method: 'PUT', body: JSON.stringify(freshPayload) });
+      const freshPayload = buildActivitySave(await target.load(), activities, byKey);
+      await target.save(freshPayload);
       toast('Analytics configuration saved');
       onSaved();
     } catch (e: any) { toast(e.message, 'err'); }
@@ -346,7 +352,7 @@ export function AiTab({ camera, motionState, onSaved }: {
           </div>
           <div className="panel-body">
             <div className="cov">
-              <PolygonEditor cameraId={camera.id} polygons={mapShapes} drawing={false} readOnly
+              <PolygonEditor cameraId={camera.id} snapshotPath={target.snapshotPath} polygons={mapShapes} drawing={false} readOnly
                 onFinish={() => { /* read-only map — drawing lives in Zones & Analytics */ }} />
 
               {regionOrder.length > 0 && (
@@ -397,8 +403,8 @@ export function AiTab({ camera, motionState, onSaved }: {
                 onChange={e => saveIndexing(e.target.value === 'true')}
                 style={{ marginTop: 6 }}
               >
-                <option value="true">On — index this camera (default)</option>
-                <option value="false">Off — exclude from Smart Search</option>
+                <option value="true">On — index this camera</option>
+                <option value="false">Off — exclude from Smart Search (default)</option>
               </select>
             </div>
             {indexing && (
@@ -453,7 +459,8 @@ export function AiTab({ camera, motionState, onSaved }: {
             <div className="hint">
               {indexing
                 ? 'Crops are sampled from the relay, so this adds no load to the camera. Recording is unaffected either way.'
-                : 'Excluded. Searches will report this camera as not indexed rather than returning no results — footage is still recorded and playable.'}
+                : 'Not indexed — the default for a newly added camera. Searches will report it as '
+                  + 'not indexed rather than returning no results; footage is still recorded and playable.'}
             </div>
           </div>
         </div>

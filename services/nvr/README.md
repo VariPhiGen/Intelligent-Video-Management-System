@@ -40,7 +40,7 @@ RecordingEngine (monitor thread, 30 s interval)
      └── FS↔DB reconciliation every 10 min (self-heals missed segments)
 
 RetentionManager (hourly)
-     └── deletes segments older than retention_days and clips older than clip_ttl_minutes
+     └── deletes segments older than retention_minutes and clips older than clip_ttl_minutes
 ```
 
 ---
@@ -76,7 +76,7 @@ pip install -r requirements.txt
 
 # 3. Configure cameras
 cp config/cameras.yaml.example config/cameras.yaml
-# Edit cameras.yaml — add your RTSP URLs, camera names, retention_days
+# Edit cameras.yaml — add your RTSP URLs, camera names, retention_minutes
 
 # 4. Create storage directories
 sudo mkdir -p /data/nvr/clips
@@ -136,7 +136,14 @@ Copy `config/cameras.yaml.example` to `config/cameras.yaml` and edit:
 cameras:
   - name: entrance          # Used in API calls (?camera=entrance) and as directory name
     rtsp_url: "rtsp://user:pass@192.168.1.10:554/Streaming/Channels/101"
-    retention_days: 7       # Segments older than this are deleted hourly
+    retention_minutes: 10080  # 7 days. Segments older than this are deleted.
+                              # MINUTES is canonical (segments are 60 s and
+                              # whole ones are deleted, so that is the floor);
+                              # retention_days still works as a day-spelling.
+                              # The sweep paces itself from the SHORTEST
+                              # retention on the appliance — a 30-day fleet is
+                              # still swept hourly, one camera at 10 minutes
+                              # pulls the loop to 150 s.
 
 recording:
   segment_duration: 60      # Seconds per .ts file (60 = 1 440 files/day/camera)
@@ -254,7 +261,8 @@ curl http://localhost:8080/cameras
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/cameras/{name}/range` | Recording time range for a single camera |
-| `POST` | `/cameras/{name}?rtsp_url=&retention_days=` | Add a camera at runtime (no restart needed) |
+| `POST` | `/cameras/{name}?rtsp_url=&retention_minutes=` | Add a camera at runtime (no restart needed). `retention_days=` is the deprecated spelling; sending both is a 422 |
+| `PUT` | `/cameras/{name}/retention?retention_minutes=` | Change retention in place — no worker restart, no 409 on a live camera |
 | `DELETE` | `/cameras/{name}` | Stop recording and remove a camera at runtime |
 | `GET` | `/health` | Per-camera: `alive`, `last_indexed_at`, `index_lag_seconds`, `segments_indexed` |
 | `GET` | `/storage` | Per-camera and total storage in bytes and GB |
@@ -285,7 +293,7 @@ python main.py [OPTIONS]
 | NVR process crashes | `.ts` files on disk are valid (TS has no moov atom requirement). Restart normally; use `--rebuild-index` if the SQLite index was lost. |
 | Indexer stalls silently | Health monitor logs a staleness warning if no segment was indexed for `3 × segment_duration`. FS↔DB reconciliation every 10 min self-heals any segments written to disk but missing from the index. |
 | Clip requested during a gap | Returns whatever footage exists in the window with `X-NVR-Coverage < 1.0` in the response headers. |
-| Disk full | ffmpeg exits → reconnect loop. Monitor `/storage` and set `retention_days` accordingly. |
+| Disk full | ffmpeg exits → reconnect loop. Monitor `/storage` and set `retention_minutes` accordingly. |
 | SQLite index lost/corrupted | Run `python main.py --rebuild-index --config config/cameras.yaml` |
 
 ---
@@ -295,7 +303,7 @@ python main.py [OPTIONS]
 No restart required:
 
 ```bash
-curl -X POST "http://localhost:8080/cameras/parking-lot?rtsp_url=rtsp://admin:pass@192.168.1.20:554/stream&retention_days=14"
+curl -X POST "http://localhost:8080/cameras/parking-lot?rtsp_url=rtsp://admin:pass@192.168.1.20:554/stream&retention_minutes=20160"
 ```
 
 To make it permanent, add the entry to `config/cameras.yaml`.

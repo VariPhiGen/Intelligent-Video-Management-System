@@ -46,6 +46,13 @@ fi
 #            (see docker-compose.gpu-cdi.yml for why that matters)
 #   legacy — nvidia runtime hook; works on older docker/toolkit but loses GPU
 #            access on the next daemon-reload until the container is recreated
+# VMS_GPU comes from the shell, or from .env when the shell did not set it, so
+# an appliance pinned to CPU stays pinned without anyone remembering a flag on
+# every `up`. The shell wins: `VMS_GPU=cdi ./vms up` on a CPU-pinned .env is a
+# deliberate one-off.
+if [ -z "${VMS_GPU:-}" ] && [ -f .env ]; then
+  VMS_GPU=$(sed -n 's/^[[:space:]]*VMS_GPU[[:space:]]*=[[:space:]]*//p' .env | head -1)
+fi
 gpu="${VMS_GPU:-auto}"
 if [ "$gpu" = "auto" ]; then
   gpu=off
@@ -99,6 +106,19 @@ if [ -z "${VMS_NO_OVERLAYS:-}" ]; then
   case ",$_profiles," in
     *,analytics,*)
       [ -f docker-compose.analytics.yml ] && files+=(-f docker-compose.analytics.yml) ;;
+  esac
+  # The modbus overlay maps the RS-485 adapter into the translator. ONLY WHEN
+  # THE DEVICE EXISTS: compose refuses to start a container whose mapped device
+  # is missing, and with MODBUS_DRY_RUN=1 there is no adapter by design.
+  case ",$_profiles," in
+    *,modbus,*)
+      _port="${MODBUS_PORT:-}"
+      if [ -z "$_port" ] && [ -f .env ]; then
+        _port=$(sed -n 's/^[[:space:]]*MODBUS_PORT[[:space:]]*=[[:space:]]*//p' .env | head -1)
+      fi
+      if [ -e "${_port:-/dev/ttyUSB0}" ] && [ -f docker-compose.modbus.yml ]; then
+        files+=(-f docker-compose.modbus.yml)
+      fi ;;
   esac
 fi
 

@@ -34,6 +34,16 @@ function humanize(status: number, detail: any): string {
   // FastAPI lets a handler raise HTTPException(404, {...}); the NVR does, and
   // its dicts always carry a human sentence under `error`.
   if (detail && typeof detail === 'object' && typeof detail.error === 'string') return detail.error;
+  // FastAPI's own 422: a list of {loc, msg}. Say what was wrong ("timezone: unknown timezone 'Asia/Calcutta'")
+  // — a bare "Request failed (HTTP 422)" left a patrol unsaveable with no clue why (2026-10-27).
+  if (Array.isArray(detail) && detail.length) {
+    const parts = detail.slice(0, 3).map((d: any) => {
+      const loc = Array.isArray(d?.loc) ? d.loc.filter((x: unknown) => x !== 'body' && typeof x === 'string').pop() : null;
+      const msg = String(d?.msg || '').replace(/^Value error, /, '');
+      return loc ? `${loc}: ${msg}` : msg;
+    }).filter(Boolean);
+    if (parts.length) return parts.join(' · ');
+  }
   return `Request failed (HTTP ${status})`;
 }
 
@@ -117,4 +127,17 @@ export function hlsSrc(slug: string, variant: 'main' | 'sub' = 'main'): string {
   const path = variant === 'sub' ? `${slug}_sub` : slug;
   if (location.protocol === 'https:') return `/hls/${path}/index.m3u8`;
   return `http://${location.hostname}:8988/${path}/index.m3u8`;
+}
+
+/**
+ * WHEP (WebRTC) URL for the low-latency focus / PTZ view, mediamtx's
+ * http://<host>:8889/<path>/whep. Returns null when WebRTC should not be
+ * attempted — today that is the HTTPS/remote path, which has no /whep proxy on
+ * the optional Caddy front door yet, so it stays on HLS. On the on-prem LAN
+ * (plain HTTP straight to the host) it returns the direct WHEP endpoint.
+ */
+export function whepSrc(slug: string, variant: 'main' | 'sub' = 'main'): string | null {
+  if (location.protocol === 'https:') return null;
+  const path = variant === 'sub' ? `${slug}_sub` : slug;
+  return `http://${location.hostname}:8889/${path}/whep`;
 }

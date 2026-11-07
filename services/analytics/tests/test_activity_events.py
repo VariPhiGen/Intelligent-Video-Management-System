@@ -156,3 +156,22 @@ def test_the_queue_is_bounded_and_evicts_the_oldest():
     sink([first, second, third])
     assert sink.evicted == 1
     assert [e["track_id"] for e in sink._queue] == ["b", "c"]
+
+
+def test_the_same_sink_carries_playback_presence(vms):
+    """Presence reuses this sink with its own path and envelope: ready wire
+    dicts in, `{"segments": [...]}` out, to the timeline ingest."""
+    fake = vms((200, {"inserted": 1, "duplicates": 0, "rejected": []}))
+    sink = ActivityEventSink(fake.url, "k", path="/api/playback/timeline/presence",
+                             envelope="segments", name="presence")
+    seg = {"sensor_id": "cam2-o8iu", "kind": "person", "started_at": "2026-09-23T10:00:00+00:00",
+           "ended_at": "2026-09-23T10:00:30+00:00"}
+    sink([seg])
+    sink.start()
+    try:
+        assert wait_for(lambda: fake.requests)
+    finally:
+        sink.stop()
+    [req] = fake.requests
+    assert req["path"] == "/api/playback/timeline/presence"
+    assert req["body"] == {"segments": [seg]}

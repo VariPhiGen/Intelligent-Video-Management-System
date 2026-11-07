@@ -45,8 +45,8 @@ export interface StoragePressure {
   disk_used_pct: number | null;
   cap_usage_pct: number | null;
   cap_binding: boolean;
-  effective_retention_days: number | null;
-  configured_retention_days: number | null;
+  effective_retention_minutes: number | null;
+  configured_retention_minutes: number | null;
 }
 
 /** Live probe of the volume the footage sits on, from GET /nvr/storage. */
@@ -126,7 +126,7 @@ export function daysLabel(u?: { normal_range?: EpochRange | null; cold_range?: E
 export function SplitBar({ normal, cold, width = 150 }: { normal: number; cold: number; width?: number }) {
   const total = normal + cold || 1;
   return (
-    <span className="meter-track" style={{ width, height: 8, display: 'inline-flex' }}
+    <span className="meter-track storage-split-meter" style={{ width, height: 8, display: 'inline-flex' }}
           title={`Full quality ${gb(normal)} · Cold ${gb(cold)}`}>
       <span style={{ width: `${(normal / total) * 100}%`, background: 'var(--accent)', height: '100%' }} />
       <span style={{ width: `${(cold / total) * 100}%`, background: 'var(--tl-footage)', height: '100%' }} />

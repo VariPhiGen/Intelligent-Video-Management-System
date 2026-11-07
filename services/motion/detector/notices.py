@@ -155,7 +155,7 @@ class NoticeSubscriber:
             cam.last_seen_at = _now()
         self.samples_applied += 1
         apply_feature(cam, float(motion.get("fraction", 0.0)),
-                      self._config, self._engine)
+                      self._config, self._engine, ts)
 
     def _tune_window(self, cam: CameraState, name: str, ts: float) -> None:
         """Keep the confirmation window three SECONDS wide whatever rate the

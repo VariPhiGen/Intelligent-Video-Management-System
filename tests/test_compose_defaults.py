@@ -69,6 +69,14 @@ def test_the_analytics_nested_containment_default_matches_its_config_file():
             == float(shipped))
 
 
+def test_the_analytics_detect_confidence_default_matches_its_config_file():
+    shipped = yaml.safe_load(
+        (ROOT / "services/analytics/config.yaml").read_text(encoding="utf-8")
+    )["detect"]["confidence"]
+    assert (float(compose_default("analytics", "ANALYTICS_DETECT_CONFIDENCE"))
+            == float(shipped))
+
+
 def test_the_sample_env_file_agrees_with_the_compose_defaults():
     """.env.example is what a first install copies to .env, and an explicit
     value there WINS over the compose fallback — so a stale line here quietly

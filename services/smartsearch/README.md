@@ -225,12 +225,18 @@ Retention runs from `scripts/retention.py` (`--dry-run` to count only,
 
 **Retention is per camera, and it follows the camera's RECORDING retention.**
 `camera-mgmt` resolves each camera's policy to a concrete number of days and
-pushes it with the registration (`POST /cameras/{slug}?retention_days=`), which
+pushes it with the registration (`POST /cameras/{slug}?retention_minutes=`), which
 stamps new rows and RESTAMPS the ones already indexed for that camera. Resolved
-upstream on purpose: "default" means `nvr_default_retention_days` to the NVR and
-`SEARCH_RETENTION_DAYS` to this service, and nothing keeps those two in step —
+upstream on purpose: "default" means the recorder's appliance default to the NVR
+and `SEARCH_RETENTION_MINUTES` to this service, and nothing keeps those two in step —
 an appliance dropped to two days of footage would otherwise keep thirty days of
-crops cut from it. `SEARCH_RETENTION_DAYS` remains the fallback for a camera the
+crops cut from it. Retention is in MINUTES, matching the recorder: a camera kept
+for twenty minutes must not leave a day of person crops behind it, and the crop
+IS the footage as far as a data subject is concerned. `retention_days=` is still
+accepted as a day-spelling and converted on arrival; sending both is a 422. The
+sweep paces itself from the shortest retention in play rather than running on a
+fixed hour, for the same reason. `SEARCH_RETENTION_MINUTES` (or the legacy
+`SEARCH_RETENTION_DAYS`) remains the fallback for a camera the
 registry has not spoken for.
 
 **Age is not the only way the index outlives its footage.** The recorder and the

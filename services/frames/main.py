@@ -16,6 +16,14 @@ from __future__ import annotations
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+import cv2
+
+# ONE OpenCV worker thread. Parallelism here is one capture thread per camera;
+# OpenCV's own pool (one thread per core) on top of that made every analyse()
+# cost 8.4 ms of CPU instead of 0.6 ms on a 28-core box -- the pool's threads
+# spinning against each other across every camera at once.
+cv2.setNumThreads(1)
+
 import argparse
 import logging
 import signal

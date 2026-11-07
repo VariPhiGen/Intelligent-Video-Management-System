@@ -482,11 +482,19 @@ class StoreConfig:
     # this default. False keeps the atomic rename (a torn write still cannot be
     # referenced) and drops only the durability half.
     crop_fsync: bool = True
-    retention_days: int = 30
-    # How often the in-service sweep deletes expired rows and their crops.
-    # Hourly matches the NVR's retention cadence. 0 disables the thread, for a
-    # deployment that runs scripts/retention.py from cron instead — the reads
-    # stay filtered either way, so disabling it costs disk, never correctness.
+    # Appliance default for how long a row stays searchable, in MINUTES —
+    # matching the recorder's unit, because the registry pushes each camera's
+    # RECORDING retention here and that can be minute-scale. Set
+    # SEARCH_RETENTION_MINUTES, or the long-standing SEARCH_RETENTION_DAYS,
+    # which is read as a day-spelling of the same setting.
+    retention_minutes: int = 30 * 1440
+    # CEILING for how often the in-service sweep deletes expired rows and their
+    # crops; the thread sweeps more often than this when a camera's retention
+    # is short enough to need it (RetentionThread._sweep_interval), never less
+    # often. Hourly matches the NVR's slowest retention cadence. 0 disables the
+    # thread, for a deployment that runs scripts/retention.py from cron instead
+    # — the reads stay filtered either way, so disabling it costs disk, never
+    # correctness.
     retention_sweep_seconds: int = 3600
     # Run the orphan sweep (crop files no row references) every Nth expiry
     # sweep — 24 is daily at the default interval. It walks the whole crop tree,
@@ -548,6 +556,20 @@ class FaceConfig:
     max_per_crop: int = 2
 
 
+def _env_int(name: str) -> int | None:
+    """An env var as an int, treating unset AND blank alike as "not set".
+
+    docker-compose renders `${FOO:-}` as an empty string rather than omitting
+    the variable, so `"FOO" in os.environ` is True for a knob nobody touched.
+    Every optional integer setting read here has to go through this or it
+    turns a default into an import-time crash.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
 @dataclass
 class AppConfig:
     api: ApiConfig = field(default_factory=ApiConfig)
@@ -585,7 +607,15 @@ class AppConfig:
         faces = FaceConfig(**(raw.get("faces") or {}))
         lifecycle = LifecycleConfig(**(raw.get("lifecycle") or {}))
         models = ModelConfig(**(raw.get("models") or {}))
-        store = StoreConfig(**(raw.get("store") or {}))
+        # `store.retention_days` is the pre-minutes spelling. Folded here
+        # rather than left to fail: StoreConfig is built with **kwargs, so an
+        # untouched config.yaml carrying the old key would raise TypeError at
+        # import and take the whole service down on upgrade.
+        store_raw = dict(raw.get("store") or {})
+        legacy_days = store_raw.pop("retention_days", None)
+        if legacy_days is not None and "retention_minutes" not in store_raw:
+            store_raw["retention_minutes"] = int(legacy_days) * 1440
+        store = StoreConfig(**store_raw)
         log_level = str((raw.get("logging") or {}).get("level", "INFO")).upper()
 
         # Environment wins over the file — the file is the shipped default and
@@ -598,9 +628,22 @@ class AppConfig:
             store.crop_fsync = os.environ["SEARCH_CROP_FSYNC"].lower() not in (
                 "0", "false", "no"
             )
-        store.retention_days = int(
-            os.environ.get("SEARCH_RETENTION_DAYS", store.retention_days)
-        )
+        # Minutes wins; days is the legacy spelling of the same setting, so
+        # an appliance configured before minutes existed keeps its policy.
+        #
+        # `_env_int` rather than a bare `in os.environ` check: docker-compose
+        # passes every declared variable through, so an appliance that has NOT
+        # set SEARCH_RETENTION_MINUTES hands this an empty STRING, not nothing
+        # at all. `int("")` raises, and because this runs at import the whole
+        # service crash-loops — on the one deployment that changed nothing.
+        # Found by deploying it; the equivalent guard on the camera-mgmt side
+        # is Settings._blank_is_unset.
+        minutes_env = _env_int("SEARCH_RETENTION_MINUTES")
+        days_env = _env_int("SEARCH_RETENTION_DAYS")
+        if minutes_env is not None:
+            store.retention_minutes = minutes_env
+        elif days_env is not None:
+            store.retention_minutes = days_env * 1440
         store.retention_sweep_seconds = int(
             os.environ.get("SEARCH_RETENTION_SWEEP_SECONDS",
                            store.retention_sweep_seconds)

@@ -3,8 +3,10 @@ import ReactDOM from 'react-dom/client';
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from '@/lib/auth';
 import { ToastProvider } from '@/components/Toast';
+import { AppErrorBoundary } from '@/components/AppErrorBoundary';
 import { Shell } from '@/layout/Shell';
 import { CamerasPage } from '@/pages/cameras/CamerasPage';
+import { PtzPage } from '@/pages/cameras/PtzPage';
 import { WizardPage } from '@/pages/wizard/WizardPage';
 import { ConfigPage } from '@/pages/config/ConfigPage';
 import { LivePage } from '@/pages/live/LivePage';
@@ -14,11 +16,20 @@ import { AnalyticsOverviewPage } from '@/pages/analytics/AnalyticsOverviewPage';
 import { PeripheralsPage } from '@/pages/peripherals/PeripheralsPage';
 import { SmartSearchPage } from '@/pages/smartsearch/SmartSearchPage';
 import { MapPage } from '@/pages/map/MapPage';
+import { DataCollectionPage } from '@/pages/datacollection/DataCollectionPage';
+import { TimelapsePage } from '@/pages/timelapse/TimelapsePage';
 import { extensionRoutes } from '@/extensions';
 import '@/styles/global.css';
+import '@/styles/motion.css';
+
+// Errors that never reach React (a failed promise in a player, a timer callback) are logged, not swallowed — they're
+// what to look for in the console when a wall misbehaves. They don't blank the page, so no reload for them.
+window.addEventListener('error', (e) => console.error('[vms] uncaught', e.message, e.filename, e.lineno));
+window.addEventListener('unhandledrejection', (e) => console.error('[vms] unhandled rejection', e.reason));
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
+    <AppErrorBoundary>
     <AuthProvider>
       <ToastProvider>
         <HashRouter>
@@ -30,13 +41,16 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <Route path="/cameras" element={<CamerasPage />} />
               <Route path="/cameras/add" element={<WizardPage />} />
               <Route path="/cameras/config" element={<ConfigPage />} />
+              <Route path="/cameras/ptz" element={<PtzPage />} />
               <Route path="/live" element={<LivePage />} />
               <Route path="/playback" element={<PlaybackPage />} />
+              <Route path="/timelapse" element={<TimelapsePage />} />
               <Route path="/admin" element={<AdminPage />} />
               <Route path="/smartsearch" element={<SmartSearchPage />} />
               <Route path="/map" element={<MapPage />} />
               <Route path="/peripherals" element={<PeripheralsPage />} />
               <Route path="/ai" element={<AnalyticsOverviewPage />} />
+              <Route path="/data-collection" element={<DataCollectionPage />} />
               {/* Routes contributed by optional extensions, if any are present.
                   Before the catch-all, or they would never match. */}
               {extensionRoutes.map(r => (
@@ -48,5 +62,6 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         </HashRouter>
       </ToastProvider>
     </AuthProvider>
+    </AppErrorBoundary>
   </React.StrictMode>,
 );

@@ -45,6 +45,7 @@ from typing import Any
 import structlog
 
 from ..config import settings
+from .detection_engine import HEATMAP_ACTIVITY, deepstream_mode, ingest_block
 from ..models import Camera
 
 log = structlog.get_logger(__name__)
@@ -281,6 +282,26 @@ def deepstream_config(
         }
         if tripwire_directions:
             parameters["tripwire_directions"] = tripwire_directions
+        if act_type == HEATMAP_ACTIVITY:
+            # NO DECAY, because the contract says there is none. The catalog's
+            # own definition of this activity (services/analytics/analytics/
+            # activities/Heatmap_overlay.py) states that "nothing decays and
+            # nothing de-duplicates", and its description promises a picture
+            # "accumulated for as long as the heatmap runs on this camera".
+            # The CPU engine implements exactly that.
+            #
+            # The pipeline's implementation of the same activity does
+            # `heatmap_matrix *= decay` every frame with a DEFAULT of 0.95,
+            # which at ~20 fps is a 0.7 s half-life -- a rolling two-second
+            # window wearing the name of a cumulative heatmap. That is what an
+            # operator was seeing: a live overlay that forgot everything before
+            # the last breath.
+            #
+            # `decay` is deliberately NOT an administrator setting: for an
+            # activity DEFINED as cumulative there is no correct value but 1.0.
+            # Sending it as an engine parameter means the pipeline's default
+            # can never silently reintroduce forgetting.
+            parameters["decay"] = 1.0
 
         activities_data[act_type] = {"zones": zones, "parameters": parameters}
 
@@ -297,4 +318,8 @@ def deepstream_config(
         "coords": "pixels" if (width is not None and height is not None) else "normalized",
         "active_activities": list(activities_data),
         "activities_data": activities_data,
+        # DeepStream as the ENGINE: what to detect and report back, and where
+        # (services/detection_engine.py, DEEPSTREAM-VMS-INGEST.md). Absent while
+        # CPU analytics is the engine — the envelope is then exactly as before.
+        **({"vms_ingest": ingest_block(camera)} if deepstream_mode() else {}),
     }

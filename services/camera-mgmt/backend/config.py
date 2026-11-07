@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Optional
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +13,21 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    events_enabled: bool = True
+    events_feed_enabled: bool = False
+    events_public_base_url: str = ""
+    events_deployment_id: str = "vms"
+    events_retention_days: int = Field(default=7, ge=1, le=365)
+    events_include_plates: bool = False
+    events_router_interval_s: float = Field(default=1, ge=0.1)
+    events_sender_interval_s: float = Field(default=1, ge=0.1)
+    events_lease_s: int = Field(default=60, ge=45)
+    # Durable event snapshots for email/SFTP (event_media). One image is capped
+    # at media_max_bytes; past spool_mb in total no new ones are stored, so an
+    # outage of the receiver cannot turn into unbounded database growth.
+    events_media_max_bytes: int = Field(default=2_000_000, ge=10_000)
+    events_media_spool_mb: int = Field(default=512, ge=1)
 
     # ── Network ──────────────────────────────────────────────────────────────
     server_ip: str = Field(default="127.0.0.1", description="Server IP used in local RTSP URLs")
@@ -167,12 +184,85 @@ class Settings(BaseSettings):
         public = {f"{url}/realms/{realm}" for url in self.oidc_public_host_map.values()}
         return frozenset({self.oidc_issuer.rstrip("/")} | derived | public)
 
+    # ── Automation rules (the rule engine) ────────────────────────────────────
+    rules_enabled: bool = Field(
+        default=True,
+        description=(
+            "Boot-time default only. The OPERATIONAL control is "
+            "POST /api/rules/disarm, which reaches every worker without a "
+            "restart; an env var needing a redeploy is not a kill switch."
+        ),
+    )
+    site_timezone: str = Field(
+        default="UTC",
+        description=(
+            "Timezone a rule's active_hours are read in when the rule names "
+            "none. An operator writing 22:00-06:00 means local night."
+        ),
+    )
+    alert_retention_days: int = Field(
+        default=365,
+        description=(
+            "Age at which an alert that is neither resolved nor on legal hold "
+            "is swept. Resolved alerts and holds are never swept by age."
+        ),
+    )
+    annotation_ttl_minutes: int = Field(
+        default=2880,
+        description=(
+            "How long a loose annotation's frame is kept. MINUTES, because "
+            "migration 042 made minutes the canonical retention unit across "
+            "the product and a days knob here would reintroduce exactly the "
+            "drift that change removed. An annotation attached to a dataset "
+            "is exempt and never expires: it has a named owner and a "
+            "deletable parent."
+        ),
+    )
+
+    # ── The peripherals bridge (P2) ──────────────────────────────────────────
+    # EVERY ONE OF THESE DEFAULTS TO EMPTY OR OFF. An unconfigured deployment
+    # reports `not_configured`, which is a supported state and a different fact
+    # from `offline` — the UI draws them differently and an operator is sent to
+    # look at a broker only when there is supposed to be one.
+    mqtt_url: str = Field(
+        default="", description="Broker URL, e.g. mqtts://broker:8883; empty = none")
+    mqtt_username: str = Field(default="")
+    mqtt_password: str = Field(default="")
+    # Off only for a site with a private CA it has not installed. A broker that
+    # can open a barrier is not a place to disable certificate checking lightly.
+    mqtt_tls_verify: bool = Field(default=True)
+    mqtt_topic_prefix: str = Field(default="vms")
+    ha_url: str = Field(default="", description="Home Assistant base URL; empty = none")
+    # A long-lived HA token. It does not expire, so it is never logged and
+    # never returned — see services/bridge/homeassistant.py.
+    ha_token: str = Field(default="")
+    webhook_driver_enabled: bool = Field(default=True)
+    # How often bindings are re-resolved. HA entity ids move between monthly
+    # releases, so a binding that stops resolving has to become visibly
+    # degraded rather than silently doing nothing.
+    bridge_verify_interval_s: int = Field(default=300)
+    # How often the ELECTED subscriber re-asserts its topic set against the
+    # bindings table. Short on purpose: this is the delay between an operator
+    # binding a device and the wall showing its state, and a wall that stays
+    # "unknown" for minutes reads as a broken bridge.
+    bridge_topic_sync_s: int = Field(default=15)
+    # Beyond this a device reading is history, not status, and the wall shows
+    # "unknown" instead. Mirrored in the SPA as STALE_AFTER_MS.
+    bridge_state_stale_s: int = Field(default=300)
+
     # ── NVR service (recording; proxied under /api/nvr/*) ─────────────────────
     nvr_api_url: str = Field(
         default="http://127.0.0.1:8009",
         description="Internal base URL of the NVR recording service",
     )
     nvr_default_retention_days: int = Field(default=30)
+    # The appliance retention default in MINUTES, and the canonical spelling —
+    # retention is minute-granular now (services/retention_units.py). Left
+    # unset, it falls back to nvr_default_retention_days above, so an appliance
+    # configured before minutes existed keeps its policy across the upgrade
+    # without anyone editing .env. Set NVR_RETENTION_MINUTES to express a period
+    # days cannot: a lobby camera kept for 20 minutes, a rig kept for an hour.
+    nvr_retention_minutes: int | None = Field(default=None)
     # Days a camera's low-resolution sub track is kept, when the camera does not
     # set its own. Much shorter than the main on purpose: the sub exists so that
     # SCRUBBING recent footage is fast, while the main is what evidence is drawn
@@ -183,6 +273,11 @@ class Settings(BaseSettings):
     # main automatically: the NVR checks coverage per track, so a missing sub is
     # simply a track with no footage at that time.
     nvr_sub_retention_days: int = Field(default=3)
+    # Same, in minutes, and canonical. Unset = nvr_sub_retention_days above.
+    # A main track kept for minutes makes the sub's own default meaningless —
+    # tracks.sub_retention_minutes clamps it to the main either way — but a
+    # site that wants a 30-minute scrub window over 30-day footage needs this.
+    nvr_sub_retention_minutes: int | None = Field(default=None)
     # Host the NVR pulls the relay from. The NVR is co-located with MediaMTX,
     # so loopback is correct and immune to SERVER_IP/network changes; set to a
     # LAN IP only if the NVR ever runs on a different box.
@@ -268,40 +363,36 @@ class Settings(BaseSettings):
     # Sent as `X-API-Key` when set. Empty = no header, matching a service that
     # does not check one yet.
     smartsearch_api_key: str = Field(default="")
+    # The Smart Search query planner (provider, model, keys) is configured
+    # only in the admin UI and stored encrypted in the database — see
+    # services/search_planner/settings.py. No environment overrides.
 
-    # ── DeepStream analytics pipeline (same appliance; shared directory) ──────
-    # The pipeline consumes one <slug>.json per camera from a directory this
-    # API writes (services/deepstream_projection.py) and the pipeline container
-    # mounts as its config/camera_config. A directory rather than an HTTP hop
-    # because both run on the same air-gapped box: no auth to carry, and the
-    # config is on disk before either service starts, so neither has to wait
-    # for the other. Set the path to the host directory bind-mounted here.
+    # ── DeepStream analytics pipeline (same appliance; HTTP) ─────────────────
+    # Cameras are pushed to the pipeline's control API (:8081) as full config
+    # envelopes (services/deepstream_client.py): POST /camera/modify|add on
+    # create / update / analytics edit, POST /camera/remove on delete, and a
+    # periodic full re-push + reconcile. No shared directory: the pipeline
+    # writes and owns its own config files. Both are host-networked, so
+    # loopback; the request carries X-Internal-Key = INTERNAL_API_KEY, which
+    # the pipeline enforces once it is configured with the same key.
     #
-    # OFF BY DEFAULT: AI activities execute on the CPU Activity Engine in the
-    # analytics service (services/analytics/analytics/activities/), fed by the
-    # same detector and tracker as Smart Search. DeepStream is kept, unmodified,
-    # for deployments that want it back — set DEEPSTREAM_PROJECTION_ENABLED=true
-    # and this projection, its push to :8081 and its reconcile loop all return.
-    deepstream_projection_enabled: bool = Field(default=False)
-    deepstream_config_dir: str = Field(
-        default="/deepstream-config",
-        description="Directory this API projects per-camera pipeline configs into",
-    )
-    # The SAME directory as seen from inside the pipeline container. Its
-    # add/modify endpoints are handed a path and open it themselves, so they
-    # need their own view of the mount, not ours. Keep in step with the
-    # pipeline's docker-compose (it mounts its checkout at /apps/…).
-    deepstream_pipeline_config_dir: str = Field(
-        default="/apps/deepstream-yolo-e2e/config/camera_config",
-        description="Same files, as the pipeline container sees them",
-    )
-    # The pipeline's own REST API (python_module/component/rest_api_server.py).
-    # No auth of its own; both containers are host-networked, so loopback.
+    # THE ENGINE SWITCH (services/detection_engine.py). OFF BY DEFAULT: all AI —
+    # Smart Search detection (person, vehicle, face, ANPR), playback presence
+    # and activities — runs on CPU analytics. TRUE: all of it runs on the
+    # DeepStream pipeline, which posts results back to this API, and CPU
+    # analytics is handed no cameras at all.
+    deepstream_sync_enabled: bool = Field(default=False)
     deepstream_api_url: str = Field(default="http://127.0.0.1:8081")
-    # Only repairs drift (the request-path hooks apply changes immediately), so
-    # this is deliberately slow — a sweep restats every file in the directory.
-    deepstream_projection_interval: int = Field(
-        default=300, description="Drift-repair sweep period (s)"
+
+    # The API root as the PIPELINE calls it back — handed to it in every
+    # camera's envelope (services/detection_engine.py). Empty =
+    # http://127.0.0.1:<API_PORT> (both host-networked).
+    deepstream_callback_url: str = Field(default="")
+    # The request-path hooks apply changes immediately; this only repairs
+    # drift — and re-adds cameras the pipeline lost while it was down, since a
+    # push made during its downtime is lost. Hence shorter than the old 300s.
+    deepstream_sync_interval: int = Field(
+        default=60, description="Pipeline re-push / reconcile period (s)"
     )
     # How often AI activity events past their expires_at are deleted. The row's
     # deadline is fixed at insert (services/ai_events.py); this only sets how
@@ -309,6 +400,7 @@ class Settings(BaseSettings):
     analytics_events_sweep_seconds: int = Field(
         default=3600, description="AI event retention sweep period (s)"
     )
+
 
     # ── User management (Keycloak Admin REST API; /api/users/*) ───────────────
     # Bootstrap-admin credentials — the same ones compose provisions Keycloak
@@ -354,6 +446,26 @@ class Settings(BaseSettings):
     # user token (see security.py).
     internal_api_key: str = Field(default="dev-internal-key-change-me")
 
+    # ── PTZ (ONVIF pan/tilt/zoom) ────────────────────────────────────────────
+    # A continuous move is the only camera command that keeps running after the
+    # HTTP response returns, so both of these are safety limits, not tuning
+    # knobs. ptz_move_timeout is sent to the camera as the ONVIF ContinuousMove
+    # Timeout AND used by the server-side watchdog for the cameras that ignore
+    # it; the UI re-issues a held direction every ~half that interval.
+    ptz_move_timeout: float = Field(
+        default=2.0,
+        description="Seconds a continuous PTZ move may run before it is stopped",
+    )
+    # How long one operator keeps exclusive control after their last command.
+    # Short on purpose: a PTZ head is a shared physical resource and an operator
+    # who walks away must not hold it. Admins bypass the lock.
+    ptz_lock_ttl: int = Field(
+        default=8, description="Seconds of exclusive PTZ control after the last command"
+    )
+    ptz_default_speed: float = Field(
+        default=0.6, description="Default normalised PTZ speed (0..1) when a caller sends none"
+    )
+
     # ── Audit trail ──────────────────────────────────────────────────────────
     # Failed logins, lockouts and logouts happen inside Keycloak (our API only
     # ever sees valid tokens), so a background loop polls Keycloak's events API
@@ -371,6 +483,100 @@ class Settings(BaseSettings):
     # thumbnails). Loopback under Linux host networking; the mediamtx service
     # name under the bridge overlay (docker-compose.bridge.yml).
     relay_internal_host: str = Field(default="127.0.0.1")
+
+    # ── Data Collection (migration 045) ──────────────────────────────────────
+    # Where sampled training frames land. One directory per dataset beneath it,
+    # so deleting a dataset row can delete its bytes in one move. Backed by the
+    # `dataset_data` volume, deliberately separate from `evidence_data`: these
+    # are deletable working images on an operational clock, not an append-only
+    # legal register, and must be removable without touching evidence.
+    dataset_dir: str = Field(default="/dataset-frames")
+
+    # In-flight snapshot requests per dataset run. The cost of one extraction is
+    # a property of the appliance (segment length, codec, whether NVENC is
+    # available), so the safe value is a deployment decision, not a constant.
+    # Too high and every request overruns the NVR's ffmpeg budget and the run
+    # collects nothing — see services/dataset_build._CONCURRENCY.
+    dataset_snapshot_concurrency: int = Field(default=2, ge=1, le=16)
+
+    # Label Studio, the annotation tool datasets are pushed to. BLANK IS A
+    # VALID STATE and means "not configured": collection still works, and the
+    # export route answers 503 with a message rather than failing obscurely.
+    #
+    # The URL must be reachable FROM THE API PROCESS, which is not the same as
+    # from the operator's browser — http://localhost:8080 names the API's own
+    # container and is the most common misconfiguration here.
+    labelstudio_url: str = Field(default="")
+    # Account & Settings -> Access token. Usually a long-lived REFRESH token,
+    # not an access JWT; labelstudio_client probes for which it is.
+    labelstudio_api_key: str = Field(default="")
+    # Fallback project for imports that do not name one. Blank = the operator
+    # enters a project id per import.
+    labelstudio_project_id: Optional[int] = Field(default=None)
+
+
+    # ── S3 mirror ────────────────────────────────────────────────────────────
+    # CREDENTIALS ONLY. The destination bucket and prefix are NOT settings:
+    # they are chosen per import in the UI, so one appliance can feed several
+    # datasets to different destinations without a redeploy. A secret key must
+    # never round-trip through a browser; a bucket name is not a secret.
+    #
+    # Leaving the key pair blank is supported and often correct — boto3 then
+    # falls back to an instance role or a mounted ~/.aws.
+    aws_access_key_id: str = Field(default="")
+    aws_secret_access_key: str = Field(default="")
+    aws_region: str = Field(default="")
+    # Prefill only. These seed the import dialog's fields; the value actually
+    # used is whatever the operator submits with the import.
+    aws_s3_bucket: str = Field(default="")
+    aws_s3_prefix: str = Field(default="")
+
+    # ── Heatmap object store (MinIO) ─────────────────────────────────────────
+    # WHERE THE OVERLAY BYTES LIVE. A heatmap JPEG is ~300 KB and a camera
+    # produces 17 keepers a day (16 half-hourly snapshots plus the session's
+    # final), so they belong in an object store rather than in Postgres rows.
+    # The `live` picture is the exception and deliberately stays in the row:
+    # it is one per session, overwritten every 30 s, and never read again after
+    # that — round-tripping it through the store would be ~2,880 PUT/DELETE
+    # pairs per camera per day for an object nobody keeps.
+    #
+    # SEPARATE FROM the AWS keys above. That pair is the operator's own S3 for
+    # dataset export, chosen per import; this is the appliance's internal store
+    # and is never shown to a browser. Blank endpoint = no object store, and
+    # heatmaps fall back to storing bytes in the row exactly as before.
+    heatmap_s3_endpoint: str = Field(default="")
+    heatmap_s3_bucket: str = Field(default="vms-heatmaps")
+    heatmap_s3_access_key: str = Field(default="")
+    heatmap_s3_secret_key: str = Field(default="")
+
+    # ── Time-lapse (services/timelapse.py) ────────────────────────────────────
+    # Per-camera stills on a schedule, rendered into videos. OFF per camera by
+    # default (cameras.timelapse_enabled); these are the appliance-wide knobs.
+    # Stills share the heatmap object store and bucket under their own
+    # `timelapse/` prefix — one store, one credential set, one backup — and fall
+    # back to bytes in the row when no store is configured, as heatmaps do.
+    timelapse_capture_enabled: bool = Field(
+        default=True,
+        description="Appliance-wide kill switch for time-lapse capture. Per-camera "
+                    "switches still default OFF; this only stops cameras that are on.",
+    )
+    timelapse_tick_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    # Two decodes in flight at most. Each is one FFmpeg reading the relay for a
+    # keyframe (~2-3 s); with the 10 s shared snapshot cache, 2 slots cover
+    # dozens of cameras at the default 5-minute interval.
+    timelapse_capture_concurrency: int = Field(default=2, ge=1, le=16)
+    timelapse_render_retention_days: int = Field(default=30, ge=1, le=3650)
+    # Hard ceiling on one render: 20,000 stills at 30 fps is an 11-minute video,
+    # already longer than anyone watches a time-lapse for. Keeps a mistaken
+    # "render the whole year" from filling the temp disk.
+    timelapse_max_render_frames: int = Field(default=20000, ge=100, le=200000)
+    # NVENC is tried first only when asked: the api container usually has no GPU,
+    # and a failed NVENC attempt costs a whole extra encode before the x264 retry.
+    timelapse_nvenc: bool = Field(default=False)
+    # The disk the stills live on, for the disk guard (services/timelapse.disk_usage). Compose mounts the MinIO
+    # volume here read-only; where it isn't mounted the API's own filesystem is measured instead, which on a
+    # standard install is the same Docker disk.
+    timelapse_disk_path: str = Field(default="/data/timelapse-disk")
 
     def insecure_default_secrets(self) -> list[str]:
         """Env-var names of security-critical secrets still at a shipped/insecure
@@ -401,6 +607,22 @@ class Settings(BaseSettings):
             if not v or low in known_weak or any(m in low for m in markers):
                 offenders.append(name)
         return offenders
+
+    @field_validator("nvr_retention_minutes", "nvr_sub_retention_minutes",
+                     "labelstudio_project_id",
+                     mode="before")
+    @classmethod
+    def _blank_is_unset(cls, v: object) -> object:
+        """An empty string means "not set", not "invalid".
+
+        docker-compose passes every declared variable through, so an appliance
+        that has not set NVR_RETENTION_MINUTES hands this field ``""`` rather
+        than nothing at all. Without this the api container refuses to start on
+        a stock .env — the exact upgrade every existing appliance performs.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     def local_rtsp_url(self, slug: str) -> str:
         """User-facing relay URL (shown/copied in the UI)."""

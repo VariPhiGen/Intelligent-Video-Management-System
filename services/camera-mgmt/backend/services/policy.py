@@ -50,6 +50,28 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
         "hint": "Re-arm a TRIGGERED camera before its cooldown",
         "ui_only": False,
     },
+    # Moving a PTZ camera is an operational action with a physical consequence:
+    # it changes what the site records, and what it stops recording. Hence a
+    # capability of its own, enforced server-side (the /ptz routes check it),
+    # not folded into camera_manage — an operator who tracks someone across a
+    # forecourt is not thereby allowed to reconfigure the camera. Creating and
+    # deleting PRESETS is the other way round: that is configuration and stays
+    # on camera_manage.
+    "ptz_control": {
+        "label": "PTZ control",
+        "hint": "Pan, tilt, zoom and recall presets on cameras that support it. Creating or deleting presets needs 'Add & manage cameras'.",
+        "ui_only": False,
+    },
+    # Who moved which camera, when, to where (2026-10-27, user ask: "remove history of camera control from all
+    # other users except admin"). Off for every role by default — admin always has it — and grantable here.
+    # Enforced server-side: the history / time-at-preset / patrol-log routes refuse without it, and the
+    # current-position answers drop the "moved by" name. Where a camera points NOW stays visible to everyone
+    # who can see the camera: operators need it to work.
+    "ptz_history": {
+        "label": "PTZ movement history",
+        "hint": "Who moved which PTZ camera, when and where to: position history, time-at-preset, patrol run log, preset visit counts and the 'moved by' name. Admins always have it.",
+        "ui_only": False,
+    },
     # camera_manage is the write half of camera_view: onboarding and per-camera
     # configuration. Enforced server-side (not ui_only) so granting it actually
     # opens the cameras CRUD + discovery routes, not just the buttons. Deleting a
@@ -91,20 +113,46 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
     },
     "peripherals": {
         "label": "Peripherals",
-        "hint": "Device wall, automation rules and trigger log for barriers, lights and relays. The inventory is real; device state and control are not — no Home-Assistant bridge exists, so nothing here switches a device.",
+        "hint": "Device wall, automation rules and trigger log for barriers, lights and relays. Device state comes from the bridge (MQTT, Home Assistant or webhook); a device with no binding yet reads as unknown.",
         "ui_only": True,
-        # Still preview: the page is navigable and its inventory is real, but
-        # the control half it advertises has no backend. Drop this the day a
-        # bridge ships, not before.
-        "preview": True,
+        # No longer preview: the bridge (services/bridge) shipped, so the wall
+        # shows state a device actually reported and control has a backend.
     },
-    # The write half of `peripherals`: editing the device inventory. Enforced
-    # server-side (not ui_only) so granting it actually opens the CRUD routes.
-    # Device *control* is not gated here because it does not exist yet — there
-    # is no bridge to switch anything.
+    # The write half of `peripherals`: editing the device inventory and its
+    # bridge bindings. Enforced server-side (not ui_only) so granting it
+    # actually opens the CRUD routes. Device *control* is a separate authority
+    # (`peripheral_control` below).
     "peripheral_manage": {
         "label": "Add & manage peripherals",
-        "hint": "Edit the peripheral inventory — devices, locations and the addresses a Home-Assistant bridge will bind to. Switching a device is not possible on any role until that bridge ships.",
+        "hint": "Edit the peripheral inventory — devices, locations and the bridge binding (MQTT topic, Home Assistant entity or webhook) each one is reached through. Does not include switching a device.",
+        "ui_only": False,
+    },
+    # ── Automation rules and the alerts they raise (migration 039) ───────────
+    # Four capabilities, and the split between them is the safety story.
+    # Reading the trigger log, closing an alert, editing a rule and being able
+    # to arm one are four different authorities, and collapsing any pair of
+    # them would hand somebody a power they were not granted.
+    "alerts_view": {
+        "label": "Alerts",
+        "hint": "See alerts raised by automation rules, and the detections behind them",
+        "ui_only": True,
+    },
+    "alerts_ack": {
+        "label": "Acknowledge & resolve alerts",
+        "hint": "Acknowledge an alert, record whether it was a true or false positive, and place an evidence hold",
+        "ui_only": False,
+    },
+    "rule_manage": {
+        "label": "Manage automation rules",
+        "hint": "Create and edit automation rules, arm them, and disarm the engine. Arming is what lets a rule act on a device — editing a log-only rule is not.",
+        "ui_only": False,
+    },
+    # Enforced server-side by routers/peripherals.py on the manual-control
+    # routes. Only a device whose binding the bridge has verified can be
+    # switched, and every switch is audited.
+    "peripheral_control": {
+        "label": "Switch a peripheral",
+        "hint": "Physically operate a device through its bridge binding — open a barrier, unlock a door, pulse a siren. Separate from editing the inventory: those are different authorities.",
         "ui_only": False,
     },
     # Enforced server-side (not ui_only) since the Events tab reads AI activity
@@ -113,6 +161,32 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
     "ai_analytics": {
         "label": "AI Analytics",
         "hint": "AI detection dashboards, AI activity events and the per-camera analytics configuration",
+        "ui_only": False,
+    },
+    # Server-enforced, not a page toggle. Collection turns recorded footage
+    # into a durable pile of stills on disk and can push them to an EXTERNAL
+    # annotation tool, so hiding the nav item would be a false promise — this
+    # has to gate /api/datasets itself.
+    "data_collection": {
+        "label": "Data Collection",
+        "hint": "Sample training images from recordings and import them into Label Studio",
+        "ui_only": False,
+    },
+    # Time-lapse (services/timelapse.py, migration 057). Two capabilities, not
+    # one and not camera_manage: switching it on starts a durable record of a
+    # camera's view that deliberately outlives its footage, which an admin may
+    # delegate to a site lead without handing over camera configuration; and
+    # WATCHING progress is grantable without opening recorded footage. Both are
+    # enforced by /api/timelapse itself — routers/timelapse.py explains why a
+    # download needs only timelapse_view (the NVR clip-export precedent).
+    "timelapse_view": {
+        "label": "Time-lapse",
+        "hint": "See time-lapse stills, play and download time-lapse videos, request a render",
+        "ui_only": False,
+    },
+    "timelapse_manage": {
+        "label": "Manage time-lapse",
+        "hint": "Switch a camera's time-lapse on or off, change its settings and the default settings every camera follows, turn time-lapse back on after the disk guard paused it, delete stills and videos. The disk protection limits stay admin-only.",
         "ui_only": False,
     },
 }
@@ -159,26 +233,39 @@ def register_capability(
 # behavior: reads open to all, motion reset admin-only. Supervisor is an operator
 # who may also acknowledge alarms; viewer is live-only. The page-visibility caps
 # default per role below (all editable in the matrix); admin always has every cap.
+#   ptz_control   → Supervisor + Operator (aiming a camera is console work);
+#                   viewer stays look-only, DPO oversees rather than operates
 #   camera_view   → Supervisor only (managing cameras is a Manage-section task)
 #   camera_manage → Supervisor only (the shift lead who onboards a camera when no
 #                   admin is on site); an admin can grant it to any role
 #   peripherals   → Supervisor only (physical control is sensitive)
 #   map/search/ai → the working roles; viewer stays live-only
+#   timelapse     → view: Supervisor + Operator; manage: Supervisor (switching it
+#                   on starts a 90-day record — the shift lead's call, not the
+#                   console's); viewer and DPO get it only when granted
 # Extensions add their own rows to each role via register_capability(); a
 # capability absent from this literal is absent from the product.
 DEFAULT_POLICY: dict[str, dict[str, bool]] = {
-    "supervisor": {"live_view": True, "playback_search": True,  "export_reports": True,  "motion_ack": True,
+    "supervisor": {"live_view": True, "playback_search": True,  "export_reports": True,  "motion_ack": True,  "ptz_control": True, "ptz_history": False,
                    "camera_view": True,  "camera_manage": True,  "smart_search": True,  "map_view": True,  "peripherals": True, "peripheral_manage": True,
-                   "ai_analytics": True},
-    "operator":   {"live_view": True, "playback_search": True,  "export_reports": True,  "motion_ack": False,
+                   "ai_analytics": True, "data_collection": True,
+                   "alerts_view": True,  "alerts_ack": True,  "rule_manage": True,  "peripheral_control": True,
+                   "timelapse_view": True, "timelapse_manage": True},
+    "operator":   {"live_view": True, "playback_search": True,  "export_reports": True,  "motion_ack": False, "ptz_control": True, "ptz_history": False,
                    "camera_view": False, "camera_manage": False, "smart_search": True,  "map_view": True,  "peripherals": False, "peripheral_manage": False,
-                   "ai_analytics": True},
-    "viewer":     {"live_view": True, "playback_search": False, "export_reports": False, "motion_ack": False,
+                   "ai_analytics": True, "data_collection": False,
+                   "alerts_view": True,  "alerts_ack": True,  "rule_manage": False, "peripheral_control": False,
+                   "timelapse_view": True, "timelapse_manage": False},
+    "viewer":     {"live_view": True, "playback_search": False, "export_reports": False, "motion_ack": False, "ptz_control": False, "ptz_history": False,
                    "camera_view": False, "camera_manage": False, "smart_search": False, "map_view": True,  "peripherals": False, "peripheral_manage": False,
-                   "ai_analytics": False},
-    "dpo":        {"live_view": True, "playback_search": True,  "export_reports": True,  "motion_ack": False,
+                   "ai_analytics": False, "data_collection": False,
+                   "alerts_view": True,  "alerts_ack": False, "rule_manage": False, "peripheral_control": False,
+                   "timelapse_view": False, "timelapse_manage": False},
+    "dpo":        {"live_view": True, "playback_search": True,  "export_reports": True,  "motion_ack": False, "ptz_control": False, "ptz_history": False,
                    "camera_view": False, "camera_manage": False, "smart_search": True,  "map_view": True,  "peripherals": False, "peripheral_manage": False,
-                   "ai_analytics": True},
+                   "ai_analytics": True, "data_collection": False,
+                   "alerts_view": False, "alerts_ack": False, "rule_manage": False, "peripheral_control": False,
+                   "timelapse_view": False, "timelapse_manage": False},
 }
 
 _cache: dict[str, dict[str, bool]] | None = None

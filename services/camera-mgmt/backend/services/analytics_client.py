@@ -29,8 +29,8 @@ stores. Drift is detected by fingerprint (the same function analytics
 computes), and AI Config's save pushes immediately via `push_camera`.
 
 This replaced DeepStream as the activity execution path. The DeepStream
-projection still exists (services/deepstream_client.py) and is switched off by
-default — see DEEPSTREAM_PROJECTION_ENABLED.
+push still exists (services/deepstream_client.py) and is switched off by
+default — see DEEPSTREAM_SYNC_ENABLED.
 """
 from __future__ import annotations
 
@@ -138,6 +138,30 @@ async def add_camera(slug: str, domains: Optional[list[str]] = None,
     return False
 
 
+async def push_heatmap(slug: str, enabled: bool, *, mode: str = "resume") -> bool:
+    """Push one camera's heatmap RUNTIME switch. Best effort, never raises.
+
+    Analytics holds this in memory only, so it is re-asserted by the reconcile
+    loop below; a push that does not land is healed within one interval. It is
+    deliberately separate from the camera's activity configuration: the AI
+    Config schedule says when the heatmap is allowed to run, this says whether
+    the operator wants it running, and one must never rewrite the other.
+    """
+    if not is_configured():
+        return False
+    try:
+        resp = await _get_client().post(f"{_base()}/cameras/{slug}/heatmap",
+                                        json={"enabled": bool(enabled), "mode": mode})
+        if resp.status_code == 200:
+            log.info("analytics.heatmap.push.ok", slug=slug, enabled=enabled, mode=mode)
+            return True
+        log.warning("analytics.heatmap.push.failed", slug=slug,
+                    status=resp.status_code, detail=resp.text[:200])
+    except httpx.HTTPError as exc:
+        log.warning("analytics.heatmap.push.unreachable", slug=slug, error=str(exc))
+    return False
+
+
 async def remove_camera(slug: str) -> bool:
     """Stop analysing ``slug``. 404 (already gone) is OK."""
     try:
@@ -185,23 +209,34 @@ class Desired:
 
 
 def wants(enabled: bool, indexing: bool, domains, analytics_config) -> bool:
-    """Does analytics consume this camera at all? Either consumer suffices."""
-    if not enabled:
-        return False
-    return bool(indexing and domains) or has_activities(analytics_config)
+    """Does analytics consume this camera at all? Either consumer suffices —
+    and neither while DeepStream is the engine (services/detection_engine.py),
+    which also takes the frame broker's decode for AI off every camera."""
+    from .detection_engine import cpu_wants
+
+    return cpu_wants(enabled, indexing, domains, analytics_config)
 
 
-def desired_sets(rows) -> tuple[dict[str, Desired], set[str]]:
+def _cpu_engine_for(enabled: bool) -> bool:
+    """An enabled camera, with CPU analytics (not DeepStream) the engine."""
+    from .detection_engine import deepstream_mode
+    return bool(enabled) and not deepstream_mode()
+
+
+def desired_sets(rows, keep: Optional[set] = None) -> tuple[dict[str, Desired], set[str]]:
     """(analyse → Desired, do-not-analyse) for registry rows.
 
     A pure function on purpose: this is the rule that decides which cameras
     cost a detector pass, and it is the one thing here worth pinning in a test.
     Rows are (slug, enabled, search_indexing, search_domains, analytics_config).
+    `keep`: slugs registered even with nothing to run right now — a PTZ camera whose AI follows its presets sits
+    between presets with an empty config (services/ptz_views); dropping and re-adding it at every stop would turn a
+    config swap into a re-attach.
     """
     desired: dict[str, Desired] = {}
     absent: set[str] = set()
     for slug, enabled, indexing, domains, cfg in rows:
-        if not wants(enabled, indexing, domains, cfg):
+        if not wants(enabled, indexing, domains, cfg) and not (keep and slug in keep and _cpu_engine_for(enabled)):
             absent.add(slug)
             continue
         # Smart Search's own rule, unchanged: no domains selected is the same
@@ -264,7 +299,7 @@ async def sync_activity_catalog() -> Optional[dict]:
 
 
 async def push_camera(slug: str, enabled: bool, search_indexing: bool,
-                      search_domains, analytics_config) -> None:
+                      search_domains, analytics_config, keep: bool = False) -> None:
     """Apply one camera's state to analytics now. Best-effort, never raises.
 
     Called when AI Config saves, so an activity change is live while the
@@ -273,7 +308,7 @@ async def push_camera(slug: str, enabled: bool, search_indexing: bool,
     if not (settings.analytics_sync_enabled and is_configured()):
         return
     desired, _ = desired_sets([(slug, enabled, search_indexing,
-                                search_domains, analytics_config)])
+                                search_domains, analytics_config)], {slug} if keep else None)
     if slug in desired:
         await add_camera(slug, desired[slug].domains, desired[slug].analytics_config)
     else:
@@ -305,14 +340,94 @@ async def reconcile_loop() -> None:
                         select(
                             Camera.slug, Camera.enabled,
                             Camera.search_indexing, Camera.search_domains,
-                            Camera.analytics_config,
+                            Camera.analytics_config, Camera.id,
                         ).where(Camera.stage == CameraStage.REGISTERED.value)
                     )
                 ).all()
-            desired, absent = desired_sets(rows)
+                # PTZ cameras whose AI follows their presets run the confirmed preset's config (ptz_views).
+                from . import ptz_views
+                rows, keep = await ptz_views.effective_rows(db, [tuple(r) for r in rows])
+            desired, absent = desired_sets(rows, keep)
             await reconcile(desired, absent)
+            # The heatmap runtime switch lives in Postgres and in analytics's
+            # memory; re-assert it for the same reason the camera set is
+            # re-asserted — a restarted analytics knows none of it.
+            async with AsyncSessionLocal() as db:
+                from . import heatmaps
+                wanted = await heatmaps.desired_runtime(db)
+            for slug, enabled in wanted.items():
+                await push_heatmap(slug, enabled)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — the loop must survive anything
             log.warning("analytics.sync.loop_error", error=str(exc))
         await asyncio.sleep(settings.nvr_sync_interval)
+
+
+# ── Data Collection: operator-uploaded detection models ───────────────────────
+#
+# Unlike the reconcile calls above these are NOT best-effort: an operator is
+# waiting on the answer, so failures surface as AnalyticsModelError carrying a
+# message and an HTTP status for the router to relay.
+
+class AnalyticsModelError(Exception):
+    def __init__(self, message: str, status: int = 502) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _model_call_error(resp: httpx.Response) -> AnalyticsModelError:
+    try:
+        detail = resp.json().get("detail") or resp.text
+    except ValueError:
+        detail = resp.text
+    return AnalyticsModelError(str(detail)[:500], resp.status_code)
+
+
+async def _model_request(method: str, path: str, **kw: Any) -> httpx.Response:
+    if not is_configured():
+        raise AnalyticsModelError(
+            "The analytics service is not deployed. Start the appliance with "
+            "the analytics profile to use detection models.", 503)
+    try:
+        resp = await _get_client().request(method, f"{_base()}{path}", **kw)
+    except httpx.HTTPError as exc:
+        raise AnalyticsModelError(f"Analytics service unreachable: {exc}", 503) from exc
+    if resp.status_code >= 400:
+        raise _model_call_error(resp)
+    return resp
+
+
+async def list_models() -> list[dict]:
+    return (await _model_request("GET", "/models")).json().get("models", [])
+
+
+async def upload_model(filename: str, stream: Any, name: Optional[str]) -> dict:
+    """`stream` is a file-like (SpooledTemporaryFile) positioned at 0."""
+    resp = await _model_request(
+        "POST", "/models",
+        files={"file": (filename, stream, "application/octet-stream")},
+        data={"name": name} if name else None,
+        timeout=httpx.Timeout(600.0, connect=10.0))
+    return resp.json()
+
+
+async def delete_model(model_id: str) -> None:
+    await _model_request("DELETE", f"/models/{model_id}")
+
+
+async def get_model(model_id: str) -> Optional[dict]:
+    for m in await list_models():
+        if m.get("id") == model_id:
+            return m
+    return None
+
+
+async def infer(model_id: str, jpeg: bytes, classes: list[str],
+                conf: float) -> list[dict]:
+    resp = await _model_request(
+        "POST", "/infer",
+        params={"model_id": model_id, "classes": ",".join(classes), "conf": conf},
+        content=jpeg, headers={"Content-Type": "image/jpeg"},
+        timeout=httpx.Timeout(60.0, connect=10.0))
+    return resp.json().get("detections", [])

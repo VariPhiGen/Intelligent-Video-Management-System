@@ -17,6 +17,11 @@ API restarting, a timeout) keep the batch at the head of the queue with
 backoff. A 4xx other than 408/429 will not succeed by repeating, so that batch
 is dropped and counted. The queue is still bounded: during a long outage the
 oldest events are evicted, counted, and reported on /health.
+
+THE SAME SINK CARRIES PLAYBACK PRESENCE (analytics/presence.py) to
+`POST /api/playback/timeline/presence`, with `path` and `envelope` set: the
+delivery problem — batch, retry the transient, drop the permanent, never block
+detection — is identical, and so is the trust.
 """
 from __future__ import annotations
 
@@ -40,8 +45,11 @@ INTERNAL_HEADER = "X-Internal-Key"
 class ActivityEventSink:
     def __init__(self, url: str, api_key: str, *, timeout: float = 10.0,
                  queue_size: int = 1024, batch_size: int = 50,
-                 max_backoff: float = 30.0) -> None:
-        self._url = url.rstrip("/") + INGEST_PATH
+                 max_backoff: float = 30.0, path: str = INGEST_PATH,
+                 envelope: str = "events", name: str = "activity-events") -> None:
+        self._url = url.rstrip("/") + path
+        self._envelope = envelope
+        self._name = name
         self._key = api_key
         self._timeout = timeout
         self._batch_size = max(1, min(batch_size, 500))
@@ -64,23 +72,22 @@ class ActivityEventSink:
         self.last_sent_at: Optional[float] = None
 
     # ── producer side (detection worker) ────────────────────────────────────
-    def __call__(self, events: list[ActivityEvent]) -> None:
-        """Never blocks, never raises."""
+    def __call__(self, events: list) -> None:
+        """Never blocks, never raises. Takes ActivityEvents or ready wire dicts."""
         with self._cond:
             for ev in events:
                 if len(self._queue) >= self._capacity:
                     self._queue.popleft()
                     self.evicted += 1
-                self._queue.append(ev.to_ingest())
+                self._queue.append(ev.to_ingest() if isinstance(ev, ActivityEvent) else ev)
                 self.queued += 1
             self._cond.notify()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="activity-events",
-                                        daemon=True)
+        self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
         self._thread.start()
-        log.info("activity events -> %s", self._url)
+        log.info("%s -> %s", self._name, self._url)
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -119,19 +126,19 @@ class ActivityEventSink:
             except _Permanent as exc:
                 self.dropped_http += len(batch)
                 self.last_error = str(exc)
-                log.warning("activity events refused, not retried: %s", exc)
+                log.warning("%s refused, not retried: %s", self._name, exc)
             except Exception as exc:                               # noqa: BLE001
                 self.failures += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                log.info("activity event delivery failed (%s); retrying in %.0fs",
-                         self.last_error, backoff)
+                log.info("%s delivery failed (%s); retrying in %.0fs",
+                         self._name, self.last_error, backoff)
                 self._requeue(batch)
                 self._stop.wait(backoff)
                 backoff = min(self._max_backoff, backoff * 2)
 
     def deliver(self, batch: list[dict]) -> dict:
         """POST one batch. Raises _Permanent for a refusal repeating cannot fix."""
-        body = json.dumps({"events": batch}).encode()
+        body = json.dumps({self._envelope: batch}).encode()
         req = urllib.request.Request(
             self._url, data=body, method="POST",
             headers={"Content-Type": "application/json", INTERNAL_HEADER: self._key})
@@ -152,7 +159,7 @@ class ActivityEventSink:
             self.rejected[reason] = self.rejected.get(reason, 0) + 1
             # Usually configuration moving under a running camera (an activity
             # removed between push and delivery). Worth one line each.
-            log.warning("event refused by the VMS: %s", r)
+            log.warning("%s: refused by the VMS: %s", self._name, r)
         return got
 
     # ── observability ───────────────────────────────────────────────────────

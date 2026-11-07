@@ -84,6 +84,20 @@ rtsp: yes
 protocols: [tcp, udp, multicast]
 rtspAddress: 127.0.0.1:8654
 rtspsAddress: 127.0.0.1:8322
+
+# UDP/RTP transport ports. Pinned off the defaults (:8000/:8001 RTP/RTCP,
+# 8002/8003 multicast) for the same coexistence reason as the control ports
+# above: on a shared appliance those low ports are commonly taken by another
+# service, and MediaMTX treats the failed bind as fatal — it exits at startup
+# with "listen udp :8000: bind: address already in use" and, under
+# `restart: unless-stopped`, crash-loops forever. Keeping them in the 86xx
+# family alongside RTSP makes the collision impossible to re-introduce.
+# Loopback-bound to match rtspAddress: every UDP reader is on this appliance.
+rtpAddress: 127.0.0.1:8656
+rtcpAddress: 127.0.0.1:8657
+multicastRTPPort: 8658
+multicastRTCPPort: 8659
+
 readTimeout: 10s
 writeTimeout: 10s
 writeQueueSize: 512
@@ -99,8 +113,29 @@ hlsPartDuration: 200ms
 hlsSegmentMaxSize: 50M
 hlsAllowOrigin: "*"
 
-# ── WebRTC (disabled) ────────────────────────────────────────────────────────
-webrtc: no
+# ── WebRTC (WHEP low-latency live) ───────────────────────────────────────────
+# Enabled for the expanded / PTZ view, where an operator steers by the picture
+# and LL-HLS's ~1 s floor makes them overshoot. WebRTC is ~200–500 ms.
+#
+# This container is network_mode: host, so these listeners bind straight on the
+# host and, on the LAN the operators sit on, ICE resolves to the host's own
+# address — no STUN, no TURN, no relay. The grid keeps using HLS (buffered,
+# jitter-tolerant); the SPA tries WHEP only on the focus view and falls back to
+# HLS on any failure, so a browser or network that cannot do WebRTC still works.
+#
+# Same auth posture as HLS above (unauthenticated on the LAN media port); this
+# is parity with the existing :8988 HLS listener, not a new class of exposure.
+# For REMOTE access over the optional Caddy/TLS front door, add a /whep reverse
+# proxy there — until then the remote path stays on HLS by design.
+webrtc: yes
+webrtcAddress: :8889
+webrtcAllowOrigin: "*"
+# Local UDP mux for ICE host candidates (single port, host-networked).
+webrtcLocalUDPAddress: :8189
+# No ICE servers: on the operator LAN the host candidate is directly reachable,
+# so STUN/TURN would only add round trips and a dependency. If web operators are
+# ever a hop away (routed subnet), add a STUN server here.
+webrtcICEServers2: []
 
 # ── SRT (disabled) ───────────────────────────────────────────────────────────
 srt: no

@@ -19,6 +19,8 @@ the reconcile loop heals any missed sync on its next pass.
 from __future__ import annotations
 
 import asyncio
+import io
+import tarfile
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -26,6 +28,7 @@ import httpx
 import structlog
 
 from ..config import settings
+from . import retention_units
 
 log = structlog.get_logger(__name__)
 
@@ -62,7 +65,7 @@ def _record_url(slug: str) -> str:
 
 async def add_camera(
     slug: str,
-    retention_days: int | None = None,
+    retention_minutes: int | None = None,
     masks: list | None = None,
     groom_after_days: int | None = None,
 ) -> bool:
@@ -82,7 +85,8 @@ async def add_camera(
 
     params = {
         "rtsp_url": _record_url(slug),
-        "retention_days": retention_days or settings.nvr_default_retention_days,
+        "retention_minutes": retention_units.effective_retention_minutes(
+            retention_minutes),
     }
     if groom_after_days is not None:
         params["groom_after_days"] = groom_after_days
@@ -100,20 +104,27 @@ async def add_camera(
     return False
 
 
-async def set_retention(slug: str, retention_days: int | None) -> bool:
+async def set_retention(slug: str, retention_minutes: int | None) -> bool:
     """Push a camera's retention policy in place (None = appliance default).
 
     Unlike ``add_camera`` this works on an already-recording camera (the NVR's
     add endpoint 409s without touching retention) and on cameras with no live
     worker, whose footage keeps aging out under the policy.
+
+    Minutes, not days: the NVR sweeps on the same unit, and the appliance
+    default is resolved HERE rather than left to the NVR so that the number the
+    registry believes it set is the number the recorder deletes on. The two
+    services read the default from different files, and a None that each one
+    fills in for itself is how they drift.
     """
-    days = retention_days or settings.nvr_default_retention_days
+    minutes = retention_units.effective_retention_minutes(retention_minutes)
     try:
         resp = await _get_client().put(
-            f"{_base()}/cameras/{slug}/retention", params={"retention_days": days}
+            f"{_base()}/cameras/{slug}/retention",
+            params={"retention_minutes": minutes},
         )
         if resp.status_code == 200:
-            log.info("nvr.sync.retention.ok", slug=slug, days=days)
+            log.info("nvr.sync.retention.ok", slug=slug, minutes=minutes)
             return True
         log.warning("nvr.sync.retention.failed", slug=slug, status=resp.status_code,
                     detail=resp.text[:200])
@@ -440,7 +451,7 @@ async def reconcile(
     """Re-assert desired NVR state.
 
     • every enabled registry camera is recording (add is idempotent);
-      ``enabled`` maps slug → (privacy masks, retention_days,
+      ``enabled`` maps slug → (privacy masks, retention_minutes,
       groom_after_days) so a re-add after an NVR restart keeps the camera on
       the masked recording path and on its own retention/grooming policies
       (all of which live only in NVR memory)
@@ -460,7 +471,7 @@ async def reconcile(
 
     for slug in sorted(set(enabled) - current):
         masks, retention, groom = enabled[slug]
-        await add_camera(slug, retention_days=retention, masks=masks,
+        await add_camera(slug, retention_minutes=retention, masks=masks,
                          groom_after_days=groom)
     for slug in sorted(disabled_slugs & current):
         await remove_camera(slug)
@@ -492,7 +503,7 @@ async def reconcile_loop() -> None:
                         select(
                             Camera.slug, Camera.enabled, Camera.recording,
                             Camera.privacy_masks, Camera.recording_schedule,
-                            Camera.retention_days, Camera.groom_after_days,
+                            Camera.retention_minutes, Camera.groom_after_days,
                             Camera.rtsp_url, Camera.sub_track,
                         ).where(Camera.stage == CameraStage.REGISTERED.value)
                     )
@@ -534,7 +545,7 @@ async def reconcile_loop() -> None:
                     for name in names:
                         if name == sub_name:
                             enabled[name] = (masks,
-                                             tracks.sub_retention_days(cam, retention),
+                                             tracks.sub_retention_minutes(cam, retention),
                                              0)
                         else:
                             # `or None`: 0 means "never groom" on the wire now,
@@ -552,3 +563,234 @@ async def reconcile_loop() -> None:
         except Exception as exc:  # noqa: BLE001 — the loop must survive anything
             log.warning("nvr.sync.loop_error", error=str(exc))
         await asyncio.sleep(settings.nvr_sync_interval)
+
+
+# ── Snapshot sampling (Data Collection, migration 045) ────────────────────────
+#
+# The NVR's /snapshot endpoint decodes from the segment start on purpose: input
+# seeking (`-ss` before `-i`) returns silently wrong frames on MPEG-TS, which
+# its own comment documents with measurements. So a single snapshot costs
+# 0.18 s one second into a segment and 2.58 s fifty-five seconds in, and the
+# endpoint now queues behind a semaphore on the NVR side as well.
+#
+# _TIMEOUT (10 s) is therefore much too short here, and the failure mode is
+# nastier than a slow request: fetch_snapshot returns None for "no recording
+# covers this instant", so a timeout would be indistinguishable from a genuine
+# recording gap. It would land in the dataset's `frames_missing` count — the
+# one number an operator reads to judge whether their window had coverage — and
+# quietly overstate it. Hence a dedicated budget, and a log line that names a
+# timeout as a timeout.
+_SNAPSHOT_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+
+# A batch decodes whole segments, so it is slower per REQUEST than /snapshot
+# even though it is far faster per FRAME. 240 frames at roughly a second each,
+# plus headroom for a box that is also recording.
+_BATCH_TIMEOUT = httpx.Timeout(600.0, connect=5.0)
+
+
+async def fetch_snapshots_batch(slug: str, at_isos: list[str],
+                                quality: int = 85) -> dict[str, bytes]:
+    """``{iso: jpeg}`` for as many of ``at_isos`` as the NVR could produce.
+
+    ONE DECODE PER SEGMENT instead of one per frame. `/snapshot` re-opens and
+    re-decodes a segment from frame zero for every timestamp asked of it, so
+    sampling a 60 s segment every 2 s decodes it thirty times; this asks once
+    and takes all thirty frames out of that pass. Measured on the GPU
+    appliance: 1.12 s/frame against 16.06 s/frame, byte-identical frames.
+
+    MISSING KEYS ARE THE NORMAL ANSWER, exactly as a None is from
+    fetch_snapshot: recordings have gaps, and a timestamp the NVR could not
+    produce is simply absent here rather than being filled with a neighbouring
+    frame. The caller counts absences as gaps.
+
+    Raises nothing. A transport failure returns an empty dict and the caller
+    falls back to per-frame fetches, so a batch path that is unavailable costs
+    speed and never correctness.
+    """
+    if not at_isos:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=_BATCH_TIMEOUT) as client:
+            resp = await client.post(f"{_base()}/snapshot/batch", json={
+                "camera": slug, "timestamps": list(at_isos), "quality": quality,
+            })
+        if resp.status_code != 200:
+            log.warning("nvr.snapshot_batch.refused", slug=slug,
+                        status=resp.status_code, asked=len(at_isos),
+                        detail=resp.text[:200])
+            return {}
+        out: dict[str, bytes] = {}
+        with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r") as tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+                handle = tar.extractfile(member)
+                if handle is not None:
+                    out[member.name] = handle.read()
+        return out
+    except Exception as exc:  # noqa: BLE001 — speed is optional, the run is not
+        log.warning("nvr.snapshot_batch.failed", slug=slug,
+                    asked=len(at_isos), error=str(exc))
+        return {}
+
+
+async def fetch_snapshot(slug: str, at_iso: str,
+                         quality: int = 85) -> tuple[Optional[bytes], str]:
+    """``(jpeg_or_None, reason)`` for slug's recording at ``at_iso``.
+
+    The reason is what lets the sampler tell a recording gap ("gap") apart from
+    an appliance that could not deliver ("timeout", "unreachable", "refused",
+    "empty"). Returning a bare None for both is how a busy box gets reported to
+    an operator as missing footage — see services/dataset_build.collect_frames.
+
+    NONE IS THE NORMAL ANSWER, NOT AN ERROR. Recordings have gaps — a camera
+    drop, an NVR restart, retention grooming the front of a window — and the
+    sampler counts them rather than aborting. Only a caller that gets None for
+    *every* timestamp has a real problem, and that is the sampler's own
+    judgement to make (see services/dataset_build.py).
+
+    Raises nothing: transport failures and refusals are logged and reported as
+    None, because a dataset run must survive a flaky NVR the same way it
+    survives a gap.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_SNAPSHOT_TIMEOUT) as client:
+            resp = await client.get(f"{_base()}/snapshot", params={
+                "camera": slug, "timestamp": at_iso, "quality": quality,
+            })
+    except httpx.TimeoutException as exc:
+        # Deliberately distinct from the 404 path below: this is the appliance
+        # being too slow, not the footage being absent, and conflating the two
+        # is how frames_missing starts lying.
+        log.warning("nvr.snapshot.timeout", slug=slug, at=at_iso, error=str(exc))
+        return None, "timeout"
+    except httpx.HTTPError as exc:
+        log.warning("nvr.snapshot.unreachable", slug=slug, at=at_iso, error=str(exc))
+        return None, "unreachable"
+
+    if resp.status_code == 200:
+        data = resp.content
+        if not data:
+            log.warning("nvr.snapshot.empty", slug=slug, at=at_iso)
+            return None, "empty"
+        return data, "ok"
+
+    if resp.status_code == 404:
+        # Gap, unknown camera, or outside the recorded range. All three mean
+        # "no frame here" to the sampler; the coverage pre-check (camera_range)
+        # is what tells an operator which it was, before they start a run.
+        log.debug("nvr.snapshot.no_coverage", slug=slug, at=at_iso)
+        return None, "gap"
+
+    log.warning("nvr.snapshot.failed", slug=slug, at=at_iso,
+                status=resp.status_code, reason=_refusal_reason(resp))
+    return None, "refused"
+
+
+async def camera_range(slug: str) -> Optional[tuple[str, str]]:
+    """(earliest, latest) ISO timestamps the NVR holds for slug, or None.
+
+    Backs the Data Collection coverage check, so an operator is warned that a
+    window falls outside retention BEFORE starting a run that would spend
+    minutes extracting nothing. None means "cannot say" — no recordings, or the
+    NVR is unreachable — and the caller must present that as unknown rather
+    than as an empty range.
+    """
+    try:
+        resp = await _get_client().get(f"{_base()}/cameras/{slug}/range")
+    except httpx.HTTPError as exc:
+        log.warning("nvr.range.unreachable", slug=slug, error=str(exc))
+        return None
+
+    if resp.status_code != 200:
+        log.debug("nvr.range.unavailable", slug=slug, status=resp.status_code)
+        return None
+    try:
+        body = resp.json()
+        earliest, latest = body["earliest"], body["latest"]
+    except (ValueError, KeyError, TypeError) as exc:
+        log.warning("nvr.range.unparseable", slug=slug, error=str(exc))
+        return None
+    if not earliest or not latest:
+        return None
+    return str(earliest), str(latest)
+
+
+# ── Annotations ─────────────────────────────────────────────────────────────
+# The NVR owns the pixels; camera-mgmt owns the index. These are the four calls
+# that keep the two in step. Every one of them answers None/False rather than
+# raising on an unreachable NVR, because the callers must be able to decide
+# NOT to write (or NOT to drop) a row — a failure that looks like success here
+# is how a ghost row or a false erasure gets created.
+
+async def save_annotation(form: dict[str, str],
+                          files: dict[str, Any]) -> Optional[dict]:
+    """Forward an operator's annotation to the NVR. Returns its metadata.
+
+    None on any failure. The caller must not write an index row for a file that
+    may not exist.
+    """
+    try:
+        resp = await _get_client().post(f"{_base()}/annotations",
+                                        data=form, files=files)
+    except httpx.RequestError as exc:
+        log.warning("nvr.annotation.unreachable", error=str(exc))
+        return None
+    if resp.status_code >= 400:
+        log.warning("nvr.annotation.refused", status=resp.status_code,
+                    body=resp.text[:200])
+        return None
+    return resp.json()
+
+
+async def delete_annotation(annotation_id: str) -> bool:
+    """Delete one annotation's image and sidecar. True if the NVR confirmed.
+
+    The NVR's delete is idempotent, so "already gone" comes back True — which
+    is what lets a retried sweep finish instead of stranding the row.
+    """
+    try:
+        resp = await _get_client().delete(
+            f"{_base()}/annotations/{annotation_id}")
+    except httpx.RequestError as exc:
+        log.warning("nvr.annotation.delete_unreachable", error=str(exc))
+        return False
+    if resp.status_code >= 400:
+        log.warning("nvr.annotation.delete_refused", status=resp.status_code)
+        return False
+    return True
+
+
+async def list_annotations(camera: Optional[str] = None,
+                           since: Optional[float] = None
+                           ) -> Optional[list[dict]]:
+    """Every sidecar the NVR holds. None = the NVR could not be asked.
+
+    None and [] mean different things to the adoption pass: "could not look"
+    must not be mistaken for "nothing to adopt".
+    """
+    params: dict[str, Any] = {}
+    if camera:
+        params["camera"] = camera
+    if since is not None:
+        params["since"] = since
+    try:
+        resp = await _get_client().get(f"{_base()}/annotations", params=params)
+    except httpx.RequestError as exc:
+        log.warning("nvr.annotation.list_unreachable", error=str(exc))
+        return None
+    if resp.status_code >= 400:
+        log.warning("nvr.annotation.list_refused", status=resp.status_code)
+        return None
+    return resp.json().get("annotations", [])
+
+
+async def fetch_annotation_image(annotation_id: str) -> Optional[bytes]:
+    """The stored frame's bytes, or None if the NVR has no such annotation."""
+    try:
+        resp = await _get_client().get(
+            f"{_base()}/annotations/{annotation_id}/image")
+    except httpx.RequestError as exc:
+        log.warning("nvr.annotation.image_unreachable", error=str(exc))
+        return None
+    return resp.content if resp.status_code < 400 else None

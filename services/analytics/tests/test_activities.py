@@ -22,14 +22,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analytics.activities import (ACTIVITY_CLASSES, FULL_FRAME, ActivitySpec,  # noqa: E402
                                   FrameContext, Schedule, TrackedObject, resolve_zones)
 from analytics.activities.base import (Activity, ActivityDefinition, ActivityEvent,  # noqa: E402
-                                       AVAILABLE, ZONE_OPTIONAL, ZONE_REQUIRED, ZONE_TRIPWIRE)
+                                       AVAILABLE, ZONE_OPTIONAL, ZONE_REQUIRED, ZONE_TRIPWIRE,
+                                       iso_utc)
 from analytics.activities.engine import ActivityEngine, config_fingerprint  # noqa: E402
 from analytics.activities.people_gathering import COOLDOWN_S, find_clusters_by_zone  # noqa: E402
 
 CAM = "cam3-2qyj"
 W, H = 1920, 1080
 ALL_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-IMPLEMENTED = {"restricted_zone_entry", "people_gathering", "stray_parking", "entry_exit_WLE_logs"}
+IMPLEMENTED = {"restricted_zone_entry", "people_gathering", "stray_parking",
+               "entry_exit_WLE_logs", "Heatmap_overlay", "people_distribution"}
 ON_HOLD = {"no_person_area", "car_detection", "idle_worker"}
 
 LEFT_HALF = {"kind": "zone", "name": "Left half", "color": "#4fd1c5",
@@ -69,8 +71,10 @@ def obj(track="t1", x=0.25, y=0.8, label="person", domain="person", conf=0.9,
                          is_new=False)
 
 
-def car(track="c1", x=0.25, y=0.8, label="car", conf=0.8) -> TrackedObject:
-    return obj(track, x, y, label=label, domain="vehicles", conf=conf, w=0.1, h=0.1)
+def car(track="c1", x=0.25, y=0.8, label="car", conf=0.8,
+        confirmed=True) -> TrackedObject:
+    return obj(track, x, y, label=label, domain="vehicles", conf=conf, w=0.1, h=0.1,
+               confirmed=confirmed)
 
 
 def frame(*objects, ts=1_789_000_000.0, camera=CAM) -> FrameContext:
@@ -555,6 +559,49 @@ class TestPeopleGathering:
 
 # ── stray_parking ────────────────────────────────────────────────────────────
 
+class TestRestrictedZoneConfirmation:
+    """A violation needs a track the tracker believes in."""
+
+    def zone(self, **params):
+        return build(config("restricted_zone_entry", **params))
+
+    def test_an_unconfirmed_track_raises_nothing(self):
+        act = self.zone(cooldown_s=60)
+        assert act.process(frame(obj(confirmed=False))) == []
+
+    def test_the_event_arrives_when_the_track_is_confirmed(self):
+        act = self.zone(cooldown_s=60)
+        assert act.process(frame(obj(confirmed=False), ts=100.0)) == []
+        [ev] = act.process(frame(obj(), ts=101.0))
+        assert ev.started_at == 101.0 and ev.track_id == "t1"
+
+    def test_a_flicker_costs_nothing_and_leaves_no_stay_behind(self):
+        act = self.zone(cooldown_s=60)
+        act.process(frame(obj("flick", confirmed=False), ts=100.0))
+        act.forget_tracks(frozenset({"flick"}))
+        # a different person, confirmed, still raises normally
+        assert len(act.process(frame(obj("real"), ts=101.0))) == 1
+
+    def test_confirmed_people_still_raise_once_per_stay(self):
+        act = self.zone(cooldown_s=60)
+        assert len(act.process(frame(obj(), ts=100.0))) == 1
+        assert act.process(frame(obj(), ts=101.0)) == []
+
+
+class TestStrayParkingConfirmation:
+    def parking(self, **params):
+        params.setdefault("required_duration_s", 60)
+        return build(config("stray_parking", **params))
+
+    def test_an_unconfirmed_vehicle_does_not_start_the_timer(self):
+        act = self.parking()
+        act.process(frame(car(confirmed=False), ts=0.0))
+        # the timer only starts once the track is confirmed, so at t=60 the
+        # vehicle has not yet been parked long enough
+        assert act.process(frame(car(), ts=60.0)) == []
+        assert len(act.process(frame(car(), ts=121.0))) == 1
+
+
 class TestStrayParking:
     def parking(self, **params):
         params.setdefault("required_duration_s", 600)
@@ -668,7 +715,12 @@ class TestEntryExit:
         assert ev.attributes["direction"] == "entry"
         assert (ev.activity, ev.zone.key, ev.track_id, ev.object_class) == \
             ("entry_exit_WLE_logs", "door", "p7", "person")
-        assert ev.started_at == pytest.approx(100.4) and ev.confidence == 0.8
+        # Dated when the person REACHED the line (the ON frame, 100.2), not when
+        # their whole box had cleared it (100.4) - what playback shows as the
+        # crossing. The completion is kept alongside.
+        assert ev.started_at == pytest.approx(100.2) and ev.confidence == 0.8
+        assert ev.attributes["completed_at"] == iso_utc(100.4)
+        assert ev.attributes["crossing_s"] == pytest.approx(0.2)
         assert (ev.attributes["tripwire_id"], ev.attributes["tripwire_name"]) == ("door", "Door line")
         wire = ev.to_ingest()
         assert wire["zone"] == "door" and wire["attributes"]["direction"] == "entry"
@@ -703,7 +755,8 @@ class TestEntryExit:
         act.process(frame(ts=0.4))                                   # not detected
         act.process(frame(ts=1.0))
         [ev] = act.process(frame(person(**ABOVE), ts=2.0))
-        assert ev.attributes["direction"] == "entry" and ev.started_at == 2.0
+        assert ev.attributes["direction"] == "entry" and ev.started_at == pytest.approx(0.2)
+        assert ev.attributes["crossing_s"] == pytest.approx(1.8)
         assert self.walk(act, ABOVE, ABOVE, start=2.2) == []
 
     def test_a_track_the_tracker_retires_mid_crossing_is_not_counted(self):
@@ -723,10 +776,26 @@ class TestEntryExit:
     def test_the_whole_box_must_clear_the_line_not_the_feet(self):
         # Walking down: the feet are past the line in the middle frame, the box still spans it.
         [ev] = self.walk(self.entry_exit(), ABOVE, {"top": 0.45, "bottom": 0.6}, BELOW)
-        assert ev.attributes["direction"] == "exit" and ev.started_at == pytest.approx(0.4)
+        assert ev.attributes["direction"] == "exit" and ev.started_at == pytest.approx(0.2)
+        assert ev.attributes["completed_at"] == iso_utc(0.4)
 
     def test_a_crossing_between_frames_counts_when_the_path_meets_the_tripwire(self):
         assert self.directions(self.walk(self.entry_exit(), BELOW, ABOVE)) == ["entry"]
+
+    def test_a_crossing_between_frames_is_dated_midway(self):
+        # No frame caught them on the line: they reached it somewhere between.
+        [ev] = self.walk(self.entry_exit(), BELOW, ABOVE, start=10.0)
+        assert ev.started_at == pytest.approx(10.1)
+
+    def test_standing_in_the_gateway_is_dated_from_the_first_touch(self):
+        # Reached the line at 0.2, stood in it, cleared it at 2.2.
+        [ev] = self.walk(self.entry_exit(), BELOW, *[ON] * 10, ABOVE)
+        assert ev.started_at == pytest.approx(0.2)
+        assert ev.attributes["crossing_s"] == pytest.approx(2.0)
+
+    def test_every_crossing_is_dated_from_its_own_touch(self):
+        events = self.walk(self.entry_exit(), BELOW, ON, ABOVE, ABOVE, ON, BELOW)
+        assert [round(e.started_at, 1) for e in events] == [0.2, 0.8]
 
     def test_passing_beside_the_end_of_the_tripwire_is_not_a_crossing(self):
         assert self.walk(self.entry_exit(), BELOW, ON, ABOVE, x=0.9) == []   # DOOR_LINE ends at x = 0.8
@@ -743,7 +812,7 @@ class TestEntryExit:
         act = self.entry_exit()
         assert self.walk(act, BELOW, ON, ABOVE, confirmed=False) == []
         [ev] = act.process(frame(person(**ABOVE), ts=5.0))
-        assert ev.attributes["direction"] == "entry" and ev.started_at == pytest.approx(0.4)
+        assert ev.attributes["direction"] == "entry" and ev.started_at == pytest.approx(0.2)
         assert act.process(frame(person(**ABOVE), ts=5.2)) == []
 
     def test_an_unconfirmed_flicker_is_forgotten_with_its_track(self):
@@ -789,6 +858,72 @@ class TestEntryExit:
 
 
 # ── the engine ───────────────────────────────────────────────────────────────
+
+class TestStatePreservedAcrossRebuilds:
+    """Saving AI Config must not turn someone already in a zone into a new violation.
+
+    The camera-wide fingerprint answers "did anything change"; it used to also
+    decide "must every activity forget everything", and that is why a person
+    standing still became a second event whenever an operator saved the page.
+    """
+
+    def two(self, cooldown=60, duration=600):
+        """Two activities on one camera, so one can change without the other."""
+        return {
+            "regions": {"left": LEFT_HALF, "right": RIGHT_HALF},
+            "activities": [
+                {"type": "restricted_zone_entry", "regions": ["left"],
+                 "params": {"active_hours": None, "active_days": list(ALL_DAYS),
+                            "cooldown_s": cooldown}},
+                {"type": "stray_parking", "regions": ["right"],
+                 "params": {"active_hours": None, "active_days": list(ALL_DAYS),
+                            "required_duration_s": duration}},
+            ],
+        }
+
+    def test_changing_one_activity_does_not_reset_the_other(self):
+        engine = ActivityEngine()
+        engine.configure(CAM, self.two())
+        assert len(engine.observe(frame(obj(), ts=0.0))) == 1
+        # an unrelated activity's setting changes: a different fingerprint for
+        # the camera, but nothing about the zone activity
+        engine.configure(CAM, self.two(duration=900))
+        assert engine.observe(frame(obj(), ts=1.0)) == [], "the stay was forgotten"
+        assert engine.snapshot()["states_preserved"] >= 1
+
+    def test_adding_an_activity_does_not_reset_the_existing_one(self):
+        engine = ActivityEngine()
+        engine.configure(CAM, config("restricted_zone_entry", cooldown_s=60))
+        assert len(engine.observe(frame(obj(), ts=0.0))) == 1
+        engine.configure(CAM, self.two())
+        assert engine.observe(frame(obj(), ts=1.0)) == []
+
+    def test_changing_the_activity_itself_still_rebuilds_it(self):
+        engine = ActivityEngine()
+        engine.configure(CAM, self.two(cooldown=60))
+        assert len(engine.observe(frame(obj(), ts=0.0))) == 1
+        engine.configure(CAM, self.two(cooldown=5))
+        assert len(engine.observe(frame(obj(), ts=1.0))) == 1, "settings changed: start over"
+
+    def test_moving_the_zone_rebuilds_the_activity(self):
+        engine = ActivityEngine()
+        engine.configure(CAM, config("restricted_zone_entry", cooldown_s=60))
+        assert len(engine.observe(frame(obj(), ts=0.0))) == 1
+        moved = config("restricted_zone_entry", cooldown_s=60)
+        moved["regions"] = {"left": dict(LEFT_HALF, points=[[0.0, 0.0], [0.6, 0.0],
+                                                            [0.6, 1.0], [0.0, 1.0]])}
+        engine.configure(CAM, moved)
+        assert len(engine.observe(frame(obj(), ts=1.0))) == 1, "the zone moved: start over"
+
+    def test_reasserting_the_same_config_is_still_free(self):
+        engine = ActivityEngine()
+        engine.configure(CAM, self.two())
+        before = engine.snapshot()["states_preserved"]
+        engine.configure(CAM, self.two())
+        # identical config short-circuits on the camera fingerprint, so nothing
+        # is rebuilt and nothing needs carrying
+        assert engine.snapshot()["states_preserved"] == before
+
 
 class TestEngine:
     def test_events_are_handed_to_the_sink(self):

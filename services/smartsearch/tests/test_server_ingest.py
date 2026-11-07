@@ -68,8 +68,8 @@ class StubEngine:
         self._outcome = outcome
         self.ingest_enabled = True
 
-    def upsert_camera(self, name, url, domains, retention_days):
-        self.upserts.append((name, url, domains, retention_days))
+    def upsert_camera(self, name, url, domains, retention_minutes):
+        self.upserts.append((name, url, domains, retention_minutes))
         return SimpleNamespace(domains=domains), self._outcome
 
     def note_producer(self, name, stats):
@@ -92,8 +92,8 @@ class StubStore:
         self._restamped = restamped
         self._error = error
 
-    def set_camera_retention(self, name, days):
-        self.retention_calls.append((name, days))
+    def set_camera_retention(self, name, minutes):
+        self.retention_calls.append((name, minutes))
         return {"rows_restamped": self._restamped, "error": self._error}
 
     def health(self):
@@ -183,8 +183,8 @@ class TestAddCamera:
         # `outcome == "updated"` drops it whenever another worker wins.
         client, _, store = build(engine=StubEngine(outcome=outcome))
         client.post("/cameras/gate-a1b2",
-                    params={"rtsp_url": "rtsp://relay/gate", "retention_days": 7})
-        assert store.retention_calls == [("gate-a1b2", 7)], (
+                    params={"rtsp_url": "rtsp://relay/gate", "retention_minutes": 7 * 1440})
+        assert store.retention_calls == [("gate-a1b2", 7 * 1440)], (
             f"the restamp was skipped for outcome={outcome!r}"
         )
 
@@ -209,11 +209,41 @@ class TestAddCamera:
         client.post("/cameras/gate-a1b2", params={"rtsp_url": "rtsp://relay/gate"})
         assert store.retention_calls == [("gate-a1b2", None)]
 
-    @pytest.mark.parametrize("days", [0, -1, 3651])
-    def test_an_out_of_range_retention_is_refused(self, days):
+    @pytest.mark.parametrize("minutes", [0, -1, 3651 * 1440])
+    def test_an_out_of_range_retention_is_refused(self, minutes):
         client, eng, _ = build()
         r = client.post("/cameras/gate-a1b2", params={
-            "rtsp_url": "rtsp://relay/gate", "retention_days": days})
+            "rtsp_url": "rtsp://relay/gate", "retention_minutes": minutes})
+        assert r.status_code == 422
+        assert eng.upserts == []
+
+    def test_a_minute_scale_retention_reaches_the_store_as_minutes(self):
+        """The registry pushes each camera's RECORDING retention here, and that
+        can now be a matter of minutes. Rounding it to a day would leave crops
+        standing over footage the recorder has already deleted."""
+        client, eng, store = build()
+        client.post("/cameras/gate-a1b2", params={
+            "rtsp_url": "rtsp://relay/gate", "retention_minutes": 20})
+        assert store.retention_calls == [("gate-a1b2", 20)]
+        assert eng.upserts[0][3] == 20
+
+    def test_the_deprecated_day_spelling_is_converted_at_the_edge(self):
+        """A caller written against the day-based API keeps working, and
+        nothing past this route sees two units."""
+        client, eng, store = build()
+        client.post("/cameras/gate-a1b2", params={
+            "rtsp_url": "rtsp://relay/gate", "retention_days": 7})
+        assert store.retention_calls == [("gate-a1b2", 7 * 1440)]
+        assert eng.upserts[0][3] == 7 * 1440
+
+    def test_sending_both_units_is_refused_rather_than_resolved(self):
+        """Two different deletion deadlines for the same footage. Honouring
+        one of them silently is how an appliance ends up holding data it
+        reported as deleted."""
+        client, eng, _ = build()
+        r = client.post("/cameras/gate-a1b2", params={
+            "rtsp_url": "rtsp://relay/gate",
+            "retention_minutes": 20, "retention_days": 7})
         assert r.status_code == 422
         assert eng.upserts == []
 

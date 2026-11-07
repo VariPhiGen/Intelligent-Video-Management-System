@@ -42,6 +42,26 @@ def main(argv: list[str] | None = None) -> None:
     logger = logging.getLogger("motion.main")
 
     engine = MotionEngine(config)
+
+    # Motion ACTIVITY for the playback timeline: runs of motion, posted to the
+    # VMS as presence. Separate from the incident log, which is unchanged.
+    activity = sink = None
+    act = config.activity
+    if act.enabled and act.url and act.internal_api_key:
+        from detector.activity import MotionActivityRecorder
+        from detector.sink import PresenceSink
+        sink = PresenceSink(act.url, act.internal_api_key)
+        sink.start()
+        det = config.detection
+        activity = MotionActivityRecorder(
+            sink, sample_interval=det.sample_interval_seconds,
+            confirm_window=det.confirm_window_seconds, confirm_ratio=det.confirm_ratio,
+            hold_seconds=act.hold_seconds, segment_seconds=act.segment_seconds)
+        activity.start()
+        engine.attach_activity(activity)
+    else:
+        logging.getLogger("motion").info(
+            "motion activity not reported to the VMS (no MOTION_EVENTS_URL / key, or disabled)")
     subscriber = None
     if config.source.frame_source == "broker":
         # No RTSP sessions and no decoding: the frame broker already computed
@@ -60,6 +80,10 @@ def main(argv: list[str] | None = None) -> None:
     def _shutdown(signum, frame):  # noqa: ARG001
         logger.info("shutdown signal received; stopping capture threads")
         engine.stop_all()
+        if activity is not None:
+            activity.stop()
+        if sink is not None:
+            sink.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)

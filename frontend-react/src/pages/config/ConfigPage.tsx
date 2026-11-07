@@ -3,6 +3,7 @@
  * cfgInit / cfgRender / cfgTab / cfgOpen / cfgLoadThumb). Deep-linkable via
  * ?cam=<cameraId>&tab=<recording|ai|device|health>.
  */
+import { ViewTransition } from '@/components/ViewTransition';
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { apiBlob, apiFetch } from '@/lib/api';
@@ -13,30 +14,41 @@ import { Sparkline } from '@/components/Sparkline';
 import { Modal } from '@/components/Modal';
 import { useToast } from '@/components/Toast';
 import { CamerasTabs } from '@/pages/cameras/CamerasPage';
+import { ensurePtzChecked } from '@/lib/ptz';
 import { EditCameraModal } from '@/pages/cameras/EditCameraModal';
 import { Chip, StatusBadge } from './bits';
 import { RecordingTab } from './tabs/RecordingTab';
 import { AiTab } from './tabs/AiTab';
 import { PrivacyTab } from './tabs/PrivacyTab';
 import { AnalyticsTab } from './tabs/AnalyticsTab';
+import { PresetViewScope } from './PresetViewScope';
+import { PtzTab, ptzShowsLive } from './tabs/PtzTab';
 import { DeviceTab } from './tabs/DeviceTab';
 import { HealthTab } from './tabs/HealthTab';
+import { TimelapseTab } from './tabs/TimelapseTab';
 
-type TabKey = 'recording' | 'ai' | 'analytics' | 'privacy' | 'device' | 'health';
+type TabKey = 'recording' | 'ai' | 'analytics' | 'privacy' | 'timelapse' | 'ptz' | 'device' | 'health';
 const TABS: [TabKey, string][] = [
   ['recording', 'Recording'],
   ['ai', 'AI Config'],
   ['analytics', 'Zones & Analytics'],
   ['privacy', 'Privacy'],
+  ['timelapse', 'Time-lapse'],
+  ['ptz', 'PTZ'],
   ['device', 'Device'],
   ['health', 'Health'],
 ];
-// Roadmap tabs, rendered disabled with a visible badge rather than a hover-only
-// title. Keep this list honest: a tab belongs here only while nothing in the
-// product does the job. 'Audit log' used to sit here and was wrong — the
-// hash-chained trail has shipped, so the tab now deep links into it (below)
-// instead of advertising a feature that already exists somewhere else.
-const SOON_TABS = ['PTZ'];
+// PTZ is the one tab that is not universal: it appears only on cameras the
+// DEVICE reported as movable (Camera.ptz_capable, probed over ONVIF — see
+// services/onvif_ptz.py). A greyed "PTZ" tab on every fixed camera in the
+// fleet would be noise on the overwhelming majority of them, and a disabled
+// tab that can never become enabled is not information.
+//
+// There is deliberately no SOON_TABS list any more. It held exactly one entry,
+// 'PTZ', and the tab it advertised now exists. The rule that governed it still
+// stands for whatever comes next: a tab may only claim "soon" while nothing in
+// the product does the job — 'Audit log' sat here once and was already wrong,
+// because the hash-chained trail had shipped and the tab now deep links to it.
 const isTabKey = (t: string | null): t is TabKey => TABS.some(([k]) => k === t);
 
 /** 220×130 snapshot preview — authenticated fetch (apiBlob) → object URL. */
@@ -79,6 +91,8 @@ export function ConfigPage() {
   // Reading the audit trail is require_role("admin", "dpo") server-side.
   const { me, isAdmin } = useAuth();
   const canAudit = isAdmin || (me?.roles || []).includes('dpo');
+  // Time-lapse is its own grant (timelapse_view): a tab its API would 403 is a dead end.
+  const canTimelapse = isAdmin || me?.permissions?.timelapse_view === true;
   const [params, setParams] = useSearchParams();
   const [editing, setEditing] = useState<Camera | null>(null);
   const [deleting, setDeleting] = useState<Camera | null>(null);
@@ -91,11 +105,27 @@ export function ConfigPage() {
   const tab: TabKey = isTabKey(tabParam) ? tabParam : 'recording';
   const camera = cameras.find(c => c.id === camParam) ?? cameras[0];
 
-  const setParam = (key: 'cam' | 'tab', value: string) => {
+  // Self-healing PTZ check: opening a camera's config is "first use" for a
+  // camera nobody has asked about PTZ yet (discovery-onboarded ones store
+  // credentials without ever hitting the endpoint that probes). One SOAP
+  // round trip per camera ever — GET /ptz probes on a NULL cache and
+  // persists — then refresh() lets ptz_capable surface the PTZ tab.
+  useEffect(() => {
+    if (!camera || !camera.onvif_capable || camera.ptz !== null) return;
+    let alive = true;
+    ensurePtzChecked(camera).then(caps => { if (alive && caps) refresh(); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camera?.id, camera?.ptz]);
+
+  const setParam = (key: 'cam' | 'tab' | 'view', value: string) => {
     const next = new URLSearchParams(params);
     next.set(key, value);
+    if (key === 'cam') next.delete('view');            // presets belong to one camera
     setParams(next, { replace: true });
   };
+  // PTZ: which view the Zones / AI tabs edit — "camera" or a preset token (PresetViewScope).
+  const view = params.get('view') || 'camera';
 
   async function reconnect(c: Camera) {
     try {
@@ -138,10 +168,29 @@ export function ConfigPage() {
     }
   }
 
+  // The PTZ tab's big live picture replaces the header's small still (one picture on screen, never two), and the
+  // header drops to one line so the sub-tabs and the picture start higher.
+  const bigLive = (c: Camera) => tab === 'ptz' && !!c.ptz_capable && ptzShowsLive(params);
+
   const renderBody = (c: Camera) => (
     <>
-      {/* Identity header — snapshot, name/status, vital stats, actions. The
-          destructive action is pushed to the far right, away from the rest. */}
+      {bigLive(c) ? (
+        <div className="card" style={{ padding: '10px 14px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s3)', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 16, fontWeight: 650, letterSpacing: '-.02em' }}>{c.name}</span>
+            <StatusBadge status={c.health_status} enabled={c.enabled} />
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--dim)' }}>
+              {c.slug} · {[c.vendor, c.model].filter(Boolean).join(' ') || 'unknown model'}
+            </span>
+            <span style={{ flex: 1 }} />
+            <button className="btn-ghost btn-sm" onClick={() => nav(`/live?cam=${c.id}`)}>▶ Live</button>
+            <button className="btn-ghost btn-sm" onClick={() => setEditing(c)}>Edit</button>
+            <button className="btn-ghost btn-sm" onClick={() => reconnect(c)}>Reconnect</button>
+          </div>
+        </div>
+      ) : (
+      /* Identity header — snapshot, name/status, vital stats, actions. The
+          destructive action is pushed to the far right, away from the rest. */
       <div className="card">
         <div style={{ display: 'flex', gap: 'var(--s5)', alignItems: 'flex-start', flexWrap: 'wrap' }}>
           <SnapshotThumb camera={c} />
@@ -170,18 +219,14 @@ export function ConfigPage() {
           </div>
         </div>
       </div>
+      )}
 
       {/* Sub-tabs */}
       <div className="tabs page-tabs" style={{ marginBottom: 16 }}>
-        {TABS.map(([key, label]) => (
-          <div key={key} className={`tab${tab === key ? ' active' : ''}`} onClick={() => setParam('tab', key)}>
+        {TABS.filter(([key]) => (key !== 'ptz' || c.ptz_capable) && (key !== 'timelapse' || canTimelapse)).map(([key, label]) => (
+          <button type="button" key={key} aria-pressed={tab === key} className={`tab${tab === key ? ' active' : ''}`} onClick={() => setParam('tab', key)}>
             {label}
-          </div>
-        ))}
-        {SOON_TABS.map(label => (
-          <div key={label} className="tab disabled" title="PTZ arrives with the ONVIF PTZ service">
-            {label}<span className="nav-soon" style={{ marginLeft: 6 }}>soon</span>
-          </div>
+          </button>
         ))}
         {/* The audit trail is admin/DPO-only server-side, so only show the tab
             to someone who can actually read it — otherwise it's a link to a 403.
@@ -197,9 +242,31 @@ export function ConfigPage() {
 
       <div className="card">
         {tab === 'recording' && <RecordingTab key={c.id} camera={c} onSaved={refresh} />}
-        {tab === 'ai' && <AiTab key={c.id} camera={c} motionState={motion[c.slug]} onSaved={refresh} />}
-        {tab === 'analytics' && <AnalyticsTab key={c.id} camera={c} onSaved={refresh} />}
+        {tab === 'ai' && (
+          <PresetViewScope camera={c} view={view} onView={v => setParam('view', v)} onSaved={refresh}>
+            {(vc, target, k, saved) => <AiTab key={`${c.id}:${k}`} camera={vc} target={target}
+                                              motionState={motion[c.slug]} onSaved={saved} />}
+          </PresetViewScope>
+        )}
+        {tab === 'analytics' && (
+          <PresetViewScope camera={c} view={view} onView={v => setParam('view', v)} onSaved={refresh}>
+            {(vc, target, k, saved) => <AnalyticsTab key={`${c.id}:${k}`} camera={vc} target={target} onSaved={saved} />}
+          </PresetViewScope>
+        )}
         {tab === 'privacy' && <PrivacyTab key={c.id} camera={c} onSaved={refresh} />}
+        {tab === 'timelapse' && (canTimelapse
+          ? <TimelapseTab key={c.id} camera={c} onSaved={refresh} />
+          : <div className="empty">Seeing time-lapse settings needs the “Time-lapse” permission.</div>)}
+        {/* ?tab=ptz is deep-linkable and a link can outlive the camera it was
+            made for (swapped hardware, a re-probe that came back fixed), so the
+            body answers for itself rather than trusting the tab strip. */}
+        {tab === 'ptz' && (c.ptz_capable
+          ? <PtzTab key={c.id} camera={c} onRefresh={refresh} />
+          : <div className="empty">
+              {c.ptz?.reason || (c.onvif_capable
+                ? 'Checking PTZ support on this camera — the tab appears by itself if it pans.'
+                : 'This camera has no stored ONVIF credentials, so PTZ support is unknown — add them under Device → Maintenance.')}
+            </div>)}
         {tab === 'device' && <DeviceTab key={c.id} camera={c} onRefresh={refresh} />}
         {tab === 'health' && <HealthTab key={c.id} camera={c} />}
       </div>
@@ -207,7 +274,7 @@ export function ConfigPage() {
   );
 
   return (
-    <div className="fade">
+    <ViewTransition view={`${camera?.id ?? ''}:${tab}`}>
       {/* Title lives in the topbar (like Live View) — tabs lead the page. */}
       <CamerasTabs active="config" />
 
@@ -272,6 +339,6 @@ export function ConfigPage() {
           </>
         )}
       </Modal>
-    </div>
+    </ViewTransition>
   );
 }

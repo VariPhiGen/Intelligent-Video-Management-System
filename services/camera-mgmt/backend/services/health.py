@@ -306,14 +306,25 @@ async def _update_db_health(
           FROM (SELECT id, health_status AS old_status
                   FROM cameras WHERE slug = :slug FOR UPDATE) AS o
          WHERE c.id = o.id
-     RETURNING c.id, o.old_status
+     RETURNING c.id, c.name, o.old_status
         """
     )
     try:
         async with AsyncSessionLocal() as db:
             row = (await db.execute(stmt, {"new_status": status, "slug": slug})).first()
             if row is not None and row.old_status != status:
-                db.add(CameraStatusEvent(camera_id=row.id, status=status))
+                from .event_delivery.envelope import CameraRef, camera_status_envelope
+                from .event_delivery.outbox import enqueue
+                previous = (await db.execute(select(CameraStatusEvent.status).where(
+                    CameraStatusEvent.camera_id == row.id,
+                    CameraStatusEvent.status.in_(['connected','disconnected','error']))
+                    .order_by(CameraStatusEvent.changed_at.desc(), CameraStatusEvent.id.desc()).limit(1))).scalar()
+                transition = CameraStatusEvent(camera_id=row.id, status=status)
+                db.add(transition)
+                await db.flush()
+                await enqueue(db, camera_status_envelope(CameraRef(row.id, slug, row.name or slug),
+                    status_event_id=transition.id, new=status, previous=previous,
+                    changed_at=transition.changed_at))
                 log.info("health.status_changed", slug=slug,
                          old=row.old_status, new=status)
             await db.commit()

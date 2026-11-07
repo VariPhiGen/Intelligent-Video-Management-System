@@ -335,3 +335,54 @@ class TestMedia2Naming:
             options=[media2_options()])
         out = om._get_media2(svc)
         assert [e["width"] for e in out] == [3840, 704]
+
+
+class TestSwitchCodec:
+    """A browser-facing stream must be switchable to H.264 — H.265 plays in almost no browser through this player
+    (kec01: every camera H.265, live + playback black on Android / Firefox / Safari)."""
+
+    class _SetRecorder(FakeMedia2Service):
+        def __init__(self, configs, **kw):
+            super().__init__(configs, **kw)
+            self.sets = []
+
+        def SetVideoEncoderConfiguration(self, req):
+            self.sets.append(req["Configuration"])
+
+    def test_media2_switches_h265_to_h264_and_resets_a_codec_bound_profile(self):
+        svc = self._SetRecorder([media2_config(token="sub", encoding="H265", profile="Main10")])
+        om._set_media2(svc, "sub", {"encoding": "H264", "bitrate_kbps": 512})
+        conf = svc.sets[-1]
+        assert conf.Encoding == "H264" and conf.Profile == "Main" and conf.RateControl.BitrateLimit == 512
+
+    def test_an_explicit_profile_wins_and_the_same_codec_leaves_the_profile_alone(self):
+        svc = self._SetRecorder([media2_config(token="sub", encoding="H265", profile="Main10")])
+        om._set_media2(svc, "sub", {"encoding": "H264", "h264_profile": "High"})
+        assert svc.sets[-1].Profile == "High"
+        svc = self._SetRecorder([media2_config(token="sub", encoding="H264", profile="High")])
+        om._set_media2(svc, "sub", {"encoding": "H264", "fps": 15})
+        assert svc.sets[-1].Profile == "High"
+
+    def test_media2_options_list_every_codec_the_camera_offers(self):
+        svc = FakeMedia2Service([media2_config()], options=[media2_options("H265"), media2_options("H264")])
+        assert om._options_media2(svc, media2_config())["encodings"] == ["H264", "H265"]
+
+    def test_ver10_can_go_to_h264_even_without_an_h264_block(self):
+        class Ver10Set:
+            def __init__(self, conf):
+                self.conf, self.sets = conf, []
+
+            def GetVideoEncoderConfiguration(self, _req):
+                return self.conf
+
+            def SetVideoEncoderConfiguration(self, req):
+                self.sets.append(req)
+
+        enc = ver10_encoder(encoding="H265")
+        enc.H264 = None
+        media = Ver10Set(enc)
+        om._set_ver10(media, "vec-1", {"encoding": "H264"})
+        conf = media.sets[-1]["Configuration"]
+        assert conf.Encoding == "H264" and conf.H264["H264Profile"] == "Main"
+        with pytest.raises(om.OnvifError):
+            om._set_ver10(Ver10Set(ver10_encoder()), "vec-1", {"encoding": "H265"})

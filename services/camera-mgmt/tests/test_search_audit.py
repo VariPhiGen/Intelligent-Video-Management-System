@@ -45,6 +45,19 @@ class _Missing(SimpleNamespace):
             raise AttributeError(name)
         return None
 
+    def resolved_retention_minutes(self):
+        """Delegates to the REAL CameraUpdate rather than re-implementing it.
+
+        The endpoint reads retention through this method now, so a stub that
+        returned a hard-coded answer would let every test here pass while the
+        minutes/days conversion was broken.
+        """
+        from backend.models import CameraUpdate  # noqa: PLC0415 — test-local
+        return CameraUpdate(
+            retention_minutes=self.retention_minutes,
+            retention_days=self.retention_days,
+        ).resolved_retention_minutes()
+
 
 class _DB:
     def __init__(self): self.commits = 0
@@ -81,7 +94,8 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(cam_router, "_get_camera_or_404", get_cam)
     monkeypatch.setattr(cam_router, "get_principal", principal)
-    monkeypatch.setattr(cam_router, "sync_now", sync_now)
+    monkeypatch.setattr(cam_router, "sync_camera", sync_now)
+    monkeypatch.setattr(cam_router, "sync_removal", sync_now)
     monkeypatch.setattr(cam_router.audit_svc, "record", record)
     monkeypatch.setattr(cam_router, "_build_response", lambda c: c)
     # The pushes have their own coverage; this test is only about the trail.

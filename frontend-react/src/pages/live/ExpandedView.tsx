@@ -1,7 +1,7 @@
 /**
  * ExpandedView.tsx — expanded single camera (legacy liveRenderFocus +
  * lvfRenderExtras + lvSnapshot): full feed with overlays, 300px info panel
- * (ONVIF facts, PTZ placeholder, AI detections, actions) and the 30-minute
+ * (ONVIF facts, PTZ control, AI detections, actions) and the 30-minute
  * footage-coverage strip with "Open in playback".
  */
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
@@ -11,7 +11,9 @@ import { useAuth } from '@/lib/auth';
 import { up7Color } from '@/components/Sparkline';
 import { useToast } from '@/components/Toast';
 import type { Camera, NvrCoverage, UptimeEntry } from '@/lib/types';
-import { Clock, LiveVideo } from './LiveVideo';
+import { Clock, LiveVideo, PtzPosBadge } from './LiveVideo';
+import { usePtzPositions } from '@/lib/ptz';
+import { PtzClickLayer, PtzControl } from './PtzControl';
 
 interface EncoderMeta { res: string; codec: string }
 interface MotionEvent { started_at: string; ended_at: string | null }
@@ -84,6 +86,7 @@ export function ExpandedView({ cam, uptime, onPushWall }: {
   const { me, isAdmin } = useAuth();
   const canSearch = isAdmin || me?.permissions?.smart_search === true;
   const toast = useToast();
+  const ptzPos = usePtzPositions(cam.ptz_capable ? [cam.id] : [], 3000);
   const [meta, setMeta] = useState<EncoderMeta | null>(metaCache[cam.id] ?? null);
   const [events, setEvents] = useState<MotionEvent[] | null>(null);
   const [cov, setCov] = useState<{ spans: Span[]; winS: number; winE: number } | null>(null);
@@ -163,7 +166,12 @@ export function ExpandedView({ cam, uptime, onPushWall }: {
                       border: '1px solid var(--border)', background: '#0a0e13' }}>
           <LiveVideo slug={cam.slug} variant="focus" staggerMs={50}
                      hasSub={!!cam.sub_track?.url_raw} />
+          {/* Sits above the video and below the badges — click-to-centre only
+              exists on cameras that advertise relative pan/tilt, so on every
+              other camera this renders nothing and the feed behaves as before. */}
+          <PtzClickLayer cam={cam} />
           <div style={{ position: 'absolute', left: 14, top: 14, display: 'flex', gap: 8 }}>
+            {ptzPos[cam.id] && <PtzPosBadge pos={ptzPos[cam.id]} />}
             {online && cam.recording !== false ? (
               <span className="lv-badge" style={{ padding: '4px 10px', fontSize: 10 }}>
                 <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#EF4444', animation: 'blip 1.4s infinite' }} />
@@ -199,17 +207,7 @@ export function ExpandedView({ cam, uptime, onPushWall }: {
             <Kv k="Firmware" v={cam.firmware || '—'} mono />
           </div>
 
-          <div style={SECTION}>PTZ control</div>
-          <div style={{ display: 'flex', gap: 14, alignItems: 'center', opacity: 0.45, marginBottom: 18 }} title="Coming soon">
-            <div className="ptz-pad">
-              <div className="ptz-hub" />
-              <span className="ptz-n">▲</span><span className="ptz-s">▼</span>
-              <span className="ptz-w">◀</span><span className="ptz-e">▶</span>
-            </div>
-            <div style={{ fontSize: 11, color: 'var(--dim)' }}>
-              PTZ arrives with the ONVIF PTZ service <span className="nav-soon" style={{ marginLeft: 0 }}>soon</span>
-            </div>
-          </div>
+          <PtzControl cam={cam} sectionStyle={SECTION} />
 
           <div style={SECTION}>Active AI detections</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>

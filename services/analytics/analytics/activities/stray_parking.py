@@ -81,8 +81,12 @@ class StrayParkingActivity(Activity):
     def evaluate(self, ctx: FrameContext) -> list[ActivityEvent]:
         events: list[ActivityEvent] = []
         for obj in ctx.objects:
+            # CONFIRMED TRACKS ONLY, for the same reason as the zone activity:
+            # a flickering detection must not start a parking timer, and at a
+            # 300-600 s threshold the second it costs to confirm is immaterial.
             if (obj.domain != VEHICLE_DOMAIN or obj.label not in self.vehicle_classes
-                    or obj.track_id is None or obj.track_id in self._reported):
+                    or obj.track_id is None or not obj.confirmed
+                    or obj.track_id in self._reported):
                 continue
             x, y = obj.anchor
             for zone in self.zones:

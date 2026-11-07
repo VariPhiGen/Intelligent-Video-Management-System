@@ -12,6 +12,7 @@
  * constants, the bucketiser and the incident merge are only meaningful to each
  * other.
  */
+import { AnimatedValue } from '@/components/AnimatedValue';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { fmtDuration } from '@/lib/format';
@@ -133,7 +134,7 @@ export function Tile({ label, value, sub, mono }: {
   return (
     <div className="ch-tile">
       <div className="ch-lbl">{label}</div>
-      <div className="ch-val" style={mono ? { fontFamily: 'var(--mono)', fontSize: 18 } : undefined}>{value}</div>
+      <div className="ch-val" style={mono ? { fontFamily: 'var(--mono)', fontSize: 18 } : undefined}><AnimatedValue value={value} /></div>
       {sub != null && <div className="ch-sub">{sub}</div>}
     </div>
   );

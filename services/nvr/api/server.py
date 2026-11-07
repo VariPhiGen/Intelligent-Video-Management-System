@@ -27,18 +27,25 @@ Edge cases handled:
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tarfile
 import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
+from typing import Optional
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (BackgroundTasks, Body, FastAPI, File, Form, HTTPException,
+                     Query, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
@@ -133,6 +140,43 @@ _clip_semaphore_basis: str = "default"
 
 # Slots when the encode is offloaded to hardware; the CPU is not the constraint.
 _HW_EXTRACTION_SLOTS = 4
+
+# Separate cap for /snapshot, and SEPARATE ON PURPOSE — it must not share
+# _clip_semaphore.
+#
+# Until Data Collection (camera-mgmt migration 045) /snapshot was the only
+# ffmpeg path here with no bound at all: one-off snapshots from Playback are
+# rare enough that nobody noticed. A dataset run changes that completely — it
+# is hundreds of back-to-back extractions, and each one decodes from the
+# segment start (see the comment in get_snapshot), so the appliance can end up
+# running arbitrarily many ffmpeg processes against the same disk the recording
+# workers are writing to.
+#
+# The obvious fix is to reuse _clip_semaphore, and it is wrong. /clip REJECTS
+# with 503 the moment that semaphore is locked rather than queuing (see
+# get_clip), so a 200-frame collection holding all the slots would make
+# Playback's clip export fail outright for the length of the run. That trades an
+# invisible resource problem for a user-visible outage.
+#
+# So: its own, smaller semaphore, and snapshots QUEUE rather than 503. A batch
+# sampler wants queuing, and the interactive Playback caller would rather wait a
+# couple of seconds than get an error. Two is deliberate — snapshot extraction
+# is decode-bound rather than encode-bound, so it does not benefit from NVENC
+# the way clip transcoding does, and it is competing with the recorders.
+_snapshot_semaphore: asyncio.Semaphore | None = None
+_snapshot_semaphore_limit: int = 2
+
+# How long ONE snapshot ffmpeg may run before it is killed. Measured on the
+# reference appliance: ~8 s for a single extraction, and well past 15 s once
+# several run beside a recording load, which made the old 15 s budget fire on
+# healthy footage and surface as HTTP 500. The budget still exists to reap a
+# wedged process; it is not a throughput control — _snapshot_semaphore is.
+_SNAPSHOT_FFMPEG_TIMEOUT: int = int(os.getenv("NVR_SNAPSHOT_TIMEOUT", "45"))
+
+# Ceiling on one /snapshot/batch request. Bounds both the tar held in
+# memory and how long a single decode run can occupy a snapshot slot; the
+# sampler chunks its timeline to stay under it.
+_BATCH_MAX: int = int(os.getenv("NVR_SNAPSHOT_BATCH_MAX", "240"))
 # Cores per concurrent CPU transcode (see the reasoning above).
 _CORES_PER_CPU_EXTRACTION = 4
 
@@ -212,6 +256,25 @@ _BROWSER_SAFE_CODECS = {"h264"}
 _CAMERA_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
+def _retention_minutes_param(minutes: int | None, days: int | None) -> int | None:
+    """Fold the two spellings of retention into MINUTES, the canonical unit.
+
+    Rejects both-at-once rather than picking one. A caller that sends
+    `retention_minutes=20&retention_days=30` is asserting two different
+    deletion deadlines for the same footage, and silently honouring one of
+    them is how an appliance ends up keeping data it reported as deleted.
+    """
+    if minutes is not None and days is not None:
+        raise HTTPException(
+            422, "Send retention_minutes or retention_days, not both — they "
+                 "are the same field in two units.")
+    if minutes is not None:
+        return int(minutes)
+    if days is not None:
+        return int(days) * 1440
+    return None
+
+
 def _validate_camera_name(name: str) -> None:
     """Raise HTTPException(400) if `name` isn't a safe camera identifier."""
     if not _CAMERA_NAME_RE.match(name):
@@ -237,9 +300,11 @@ def create_app(index: SegmentIndex, clips_path: str | Path,
                alerter=None,
                segment_duration: float = 60.0,
                groom_default_days: int = 0,
-               max_clip_seconds: float = 6 * 3600.0) -> FastAPI:
+               max_clip_seconds: float = 6 * 3600.0,
+               max_concurrent_snapshots: int | None = None) -> FastAPI:
     global _index, _clips_path, _annotations_path, _engine, _hls_cache
     global _clip_semaphore, _clip_semaphore_limit, _clip_semaphore_basis
+    global _snapshot_semaphore, _snapshot_semaphore_limit
     global _max_clip_seconds
     global _storage_settings, _segment_duration, _groom_default_days
     global _storage_path, _alerter
@@ -275,6 +340,13 @@ def create_app(index: SegmentIndex, clips_path: str | Path,
     logger.info("Extraction concurrency: %d slot(s) — %s",
                 _clip_semaphore_limit, _clip_semaphore_basis)
 
+    # Snapshot extraction gets its own, independent of the clip slots — see the
+    # comment on _snapshot_semaphore for why sharing would break clip export.
+    if max_concurrent_snapshots is not None and int(max_concurrent_snapshots) > 0:
+        _snapshot_semaphore_limit = int(max_concurrent_snapshots)
+    _snapshot_semaphore = asyncio.Semaphore(_snapshot_semaphore_limit)
+    logger.info("Snapshot concurrency: %d slot(s)", _snapshot_semaphore_limit)
+
     # HLS artifact cache. Lives under the clips dir so it shares the volume the
     # retention worker already watches, and is handed the encoder ladder and
     # the extraction slot rather than importing either — see api/hls.py.
@@ -309,6 +381,7 @@ def create_app(index: SegmentIndex, clips_path: str | Path,
     app.add_api_route("/hls/{camera}/index.m3u8", hls_playlist, methods=["GET"])
     app.add_api_route("/hls/{camera}/{mode}/{name}", hls_segment, methods=["GET"])
     app.add_api_route("/snapshot", get_snapshot, methods=["GET"])
+    app.add_api_route("/snapshot/batch", get_snapshot_batch, methods=["POST"])
     app.add_api_route("/cameras", list_cameras, methods=["GET"])
     app.add_api_route("/cameras/{camera}/range", get_camera_range, methods=["GET"])
     app.add_api_route("/cameras/{camera}/recordings", purge_recordings, methods=["DELETE"])
@@ -323,6 +396,11 @@ def create_app(index: SegmentIndex, clips_path: str | Path,
     app.add_api_route("/storage", storage_stats, methods=["GET"])
     app.add_api_route("/storage/limit", set_storage_limit, methods=["PUT"])
     app.add_api_route("/annotations", save_annotation, methods=["POST"])
+    app.add_api_route("/annotations", list_annotations, methods=["GET"])
+    app.add_api_route("/annotations/{annotation_id}", delete_annotation,
+                      methods=["DELETE"])
+    app.add_api_route("/annotations/{annotation_id}/image",
+                      annotation_image, methods=["GET"])
     app.add_api_route("/coverage", coverage, methods=["GET"])
     app.add_api_route("/report/uptime", uptime_report, methods=["GET"])
 
@@ -490,6 +568,22 @@ async def _extraction_slot():
         yield
         return
     async with _clip_semaphore:
+        yield
+
+
+@asynccontextmanager
+async def _snapshot_slot():
+    """Hold one of the snapshot semaphore's slots for the duration of a body.
+
+    Queues rather than rejecting — see the comment on _snapshot_semaphore. The
+    None branch keeps the endpoint working for callers that built the app
+    without create_app (the unit tests do this), exactly as _extraction_slot
+    does.
+    """
+    if _snapshot_semaphore is None:
+        yield
+        return
+    async with _snapshot_semaphore:
         yield
 
 
@@ -665,6 +759,227 @@ async def hls_segment(camera: str, mode: str, name: str):
     return FileResponse(path, media_type="video/mp4", headers=headers)
 
 
+
+# ── segment resolution, shared by /snapshot and /snapshot/batch ──────────────
+# ONE copy of this, deliberately. The boundary rules below were each paid for
+# by a bug, and a second hand-rolled copy in the batch path would drift from
+# them silently — which on these images means a frame from the wrong moment.
+def _pick_segment(segments, ts_epoch):
+    """`(segment, seek_offset)` for a timestamp, with the boundary rules."""
+    # STRICTLY INSIDE FIRST (`< end`, not `<= end`), and the asymmetry is the
+    # point. On an exact segment boundary BOTH neighbours satisfy an inclusive
+    # test: the earlier one with offset == its duration, the later one with
+    # offset == 0. Taking whichever came first took the earlier one, so ffmpeg
+    # was asked to seek to the very end of a segment, found no frame there, and
+    # the request 500'd. A dataset samples at a fixed interval, so if that
+    # interval shares a factor with the segment duration EVERY sample lands on
+    # a boundary.
+    segment = next(
+        (s for s in segments if s.start_epoch <= ts_epoch < s.end_epoch),
+        next((s for s in segments if s.start_epoch <= ts_epoch <= s.end_epoch),
+             segments[0]),
+    )
+    seek_offset = max(0.0, ts_epoch - segment.start_epoch)
+    # Belt and braces for the case the preference above cannot fix: a timestamp
+    # at the very end of the LAST segment has no later neighbour to prefer.
+    # 0.5 s clears one frame interval at anything down to 2 fps.
+    if segment.duration and seek_offset >= segment.duration:
+        seek_offset = max(0.0, segment.duration - 0.5)
+    return segment, seek_offset
+
+
+def _probe_fps(path: str) -> Optional[Fraction]:
+    """Frames per second for a segment, or None if the stream is not safe to
+    index by frame number.
+
+    RETURNS None FOR ANYTHING THAT IS NOT CONSTANT RATE, and that refusal is
+    the whole point. Mapping an offset to a frame index only holds when frames
+    are evenly spaced; on the h264 cameras here they are not. One entry camera
+    reports avg_frame_rate 50 against r_frame_rate 25, and its actual frame
+    times run 1.400, 1.944, 1.991 ... with bursts of nine frames inside two
+    milliseconds. Index arithmetic on that returns a frame from the wrong
+    moment -- measured: a target of 20 s resolved to a frame at 47 s.
+
+    `avg_frame_rate` is NOT usable on its own (it is total frames over
+    duration, which doubles on these cameras). The two rates agreeing is the
+    cheapest honest test for "evenly spaced", so that is the gate: agree and we
+    index, disagree and the caller falls back to the per-frame path, which is
+    slower and always right.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30).stdout
+        stream = json.loads(out)["streams"][0]
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError):
+        return None
+    rates = []
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            rates.append(Fraction(stream.get(key) or "0/0"))
+        except (ZeroDivisionError, ValueError):
+            return None
+    if len(rates) != 2 or rates[0] <= 0 or rates[0] != rates[1]:
+        logger.info("Batch snapshot: not constant-rate (avg=%s r=%s) on %s — "
+                    "falling back to per-frame extraction",
+                    stream.get("avg_frame_rate"), stream.get("r_frame_rate"),
+                    os.path.basename(path))
+        return None
+    return rates[0]
+
+
+async def _extract_many(segment_path: str, offsets: list[float],
+                        ffmpeg_q: int) -> dict[float, bytes]:
+    """`{offset: jpeg}` from ONE sequential decode of `segment_path`.
+
+    THIS IS NOT A SEEK, and that is what makes it safe. `/snapshot` decodes the
+    segment from frame zero for every single frame it is asked for, so sampling
+    a 60 s segment every 2 s decodes it thirty times over — the cost is
+    quadratic in the sampling density. Here the same decode happens once and
+    every wanted frame is picked out of that one pass with the `select` filter.
+    Measured on this appliance: 1.12 s/frame against 16.06 s/frame, and the
+    frames are byte-identical to what `-ss` returns.
+
+    The obvious alternative — moving `-ss` before `-i` — is NOT safe here and
+    is rejected in get_snapshot's comment: MPEG-TS carries no seek index, so
+    ffmpeg estimates from bitrate and lands approximately. This decodes
+    sequentially and never seeks, so that failure mode cannot arise.
+
+    A MISSING FRAME IS REPORTED MISSING, never substituted with its neighbour.
+    Returning a nearby frame under the wrong timestamp is the one outcome worse
+    than returning nothing: it is silently wrong, and these frames are labelled
+    and trained on.
+    """
+    fps = _probe_fps(segment_path)
+    if not fps:
+        return {}
+    frame_dt = 1.0 / float(fps)
+    # 1.5 frame intervals: enough that a target landing between two frames
+    # still selects one, small enough that two targets cannot share a window
+    # (targets are at least one scan interval apart).
+    window = frame_dt * 1.5
+    expr = "+".join(f"between(t,{o:.3f},{o + window:.3f})" for o in offsets)
+
+    tmpdir = tempfile.mkdtemp(prefix="nvrbatch_", dir=str(_clips_path))
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", segment_path,
+            "-vf", f"select='{expr}'",
+            # -vsync 0 keeps every selected frame; -frame_pts 1 names each
+            # output by its own presentation index, which is how a frame is
+            # matched back to the offset that asked for it rather than by
+            # position in the output (position shifts if any frame is absent).
+            "-vsync", "0", "-frame_pts", "1",
+            "-q:v", str(ffmpeg_q), "-pix_fmt", "yuvj420p",
+            "-y", os.path.join(tmpdir, "f_%d.jpg"),
+        ]
+        async with _snapshot_slot():
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            try:
+                await asyncio.wait_for(proc.communicate(),
+                                       timeout=_SNAPSHOT_FFMPEG_TIMEOUT * 4)
+            except asyncio.TimeoutError:
+                # Reap before releasing the slot — an abandoned ffmpeg keeps
+                # burning a core while its slot is handed to the next caller.
+                proc.kill()
+                try:
+                    await proc.communicate()
+                except (ProcessLookupError, OSError):
+                    pass
+                return {}
+
+        produced: dict[int, str] = {}
+        for name in os.listdir(tmpdir):
+            if name.startswith("f_") and name.endswith(".jpg"):
+                try:
+                    produced[int(name[2:-4])] = os.path.join(tmpdir, name)
+                except ValueError:
+                    continue
+
+        out: dict[float, bytes] = {}
+        for off in offsets:
+            # Output seeking lands on the first frame at or after the offset,
+            # so the index is the ceiling — matching `-ss` exactly.
+            idx = -(-int(round(off * float(fps) * 1000)) // 1000)
+            path = produced.get(idx) or produced.get(idx + 1) or produced.get(idx - 1)
+            if path is None:
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    out[off] = fh.read()
+            except OSError:
+                continue
+        return out
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def get_snapshot_batch(payload: dict = Body(...)):
+    """Many frames, grouped by segment, one decode each. Returns a tar.
+
+    FOR THE DATASET SAMPLER, not for Playback. `/snapshot` stays exactly as it
+    was — same command, same accuracy, same cost — because it serves single
+    interactive and evidence requests where one frame is all there is to pay
+    for. This route exists for the opposite shape of work: hundreds of frames
+    from the same handful of segments, where paying the decode once per segment
+    instead of once per frame is the whole difference.
+
+    Members are named by the ISO timestamp requested. A timestamp the decode
+    could not produce is simply ABSENT, which the caller reports as a gap.
+    """
+    camera = str(payload.get("camera") or "")
+    stamps = payload.get("timestamps") or []
+    quality = int(payload.get("quality") or 85)
+    if not camera or not isinstance(stamps, list) or not stamps:
+        raise HTTPException(400, "camera and a non-empty timestamps list are required")
+    if len(stamps) > _BATCH_MAX:
+        raise HTTPException(400, f"at most {_BATCH_MAX} timestamps per request")
+    if camera not in _index.get_cameras():
+        raise HTTPException(404, {"error": f"Camera '{camera}' not found"})
+    quality = max(1, min(95, quality))
+    ffmpeg_q = max(1, int(round(31 - (quality / 95) * 30)))
+
+    # Group by the segment each timestamp falls in, so each segment is opened
+    # once no matter how many frames are wanted from it.
+    by_segment: dict[str, list[tuple[str, float]]] = {}
+    for raw in stamps:
+        try:
+            ts_epoch = datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        segments = _index.find_segments(camera, ts_epoch, ts_epoch)
+        if not segments:
+            segments = _index.find_segments(camera, ts_epoch - 60, ts_epoch + 60)
+        segments = [s for s in segments if os.path.exists(s.filepath)]
+        if not segments:
+            continue                      # genuine gap; absent from the tar
+        segment, offset = _pick_segment(segments, ts_epoch)
+        by_segment.setdefault(segment.filepath, []).append((str(raw), offset))
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for path, wanted in by_segment.items():
+            wanted.sort(key=lambda pair: pair[1])
+            frames = await _extract_many(path, [o for _, o in wanted], ffmpeg_q)
+            for iso, offset in wanted:
+                data = frames.get(offset)
+                if data is None:
+                    continue
+                info = tarfile.TarInfo(name=iso)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    buf.seek(0)
+    logger.info("Batch snapshot: camera=%s asked=%d segments=%d",
+                camera, len(stamps), len(by_segment))
+    return Response(content=buf.getvalue(), media_type="application/x-tar")
+
+
 async def get_snapshot(
     background_tasks: BackgroundTasks,
     camera: str = Query(..., description="Camera name"),
@@ -711,10 +1026,33 @@ async def get_snapshot(
             "error": "No segment covers the requested timestamp (gap in recording)"
         })
 
-    # Pick the segment whose window contains the timestamp, or the closest one
-    segment = next((s for s in segments if s.start_epoch <= ts_epoch <= s.end_epoch), segments[0])
-    seek_offset = max(0.0, ts_epoch - segment.start_epoch)
-
+    # Pick the segment whose window contains the timestamp, or the closest one.
+    #
+    # STRICTLY INSIDE FIRST (`< end`, not `<= end`), and the asymmetry is the
+    # point. On an exact segment boundary BOTH neighbours satisfy an inclusive
+    # test: the earlier one with offset == its duration, the later one with
+    # offset == 0. Taking whichever came first in the list took the earlier one,
+    # so ffmpeg was asked to seek to the very end of a segment, found no frame
+    # there, wrote nothing, and the request 500'd with "produced empty file".
+    #
+    # This is not a rare edge. A dataset samples at a fixed interval, so if that
+    # interval shares a factor with the 60 s segment duration EVERY such sample
+    # lands on a boundary — a 20-frame dataset over 8 minutes lost 4 frames to
+    # it, reproducibly, and they were reported to the operator as gaps in the
+    # recording rather than as a bug.
+    segment, seek_offset = _pick_segment(segments, ts_epoch)
+    # Belt and braces for the one case the preference above cannot fix: a
+    # timestamp at the very end of the LAST segment has no later neighbour to
+    # prefer. Nudging inside the segment returns its final frame, which is the
+    # honest answer to "the newest moment you hold", rather than a 500.
+    #
+    # HALF A SECOND, not a few milliseconds. Output seeking lands on the first
+    # frame at or after the offset, so the backoff has to clear one whole frame
+    # interval or there is still nothing to encode. That interval is unknown
+    # here and probing for it would cost an ffprobe per snapshot: 0.05 s covers
+    # 20 fps but not 15, and a 5 fps sub stream needs 0.2 s. 0.5 s covers
+    # anything down to 2 fps, and the cost is a frame at most half a second
+    # earlier — only ever for a request at the literal newest instant recorded.
     # ffmpeg -q:v uses 1 (best) – 31 (worst); map quality 1-95 → ffmpeg 31-1
     ffmpeg_q = max(1, int(round(31 - (quality / 95) * 30)))
 
@@ -743,16 +1081,64 @@ async def get_snapshot(
         "-ss", f"{seek_offset:.3f}",
         "-frames:v", "1",
         "-q:v", str(ffmpeg_q),
+        # EXPLICIT, and required on ffmpeg 7. Cameras record limited-range
+        # ("tv" range) YUV, and ffmpeg 7's mjpeg encoder refuses it outright:
+        #
+        #   Non full-range YUV is non-standard, set strict_std_compliance to at
+        #   most unofficial to use it
+        #   ff_frame_thread_encoder_init failed
+        #
+        # and the snapshot 500s. ffmpeg 5 negotiated yuvj420p silently, so this
+        # was invisible until the base image moved: `python:3.x-slim` now
+        # resolves to Debian 13 (trixie), which ships ffmpeg 7.1 instead of
+        # bookworm's 5.1. Nothing in this repo pinned it, so the break arrives
+        # on the next image rebuild rather than on any code change — which is
+        # exactly the kind of failure that looks like "snapshots suddenly
+        # stopped working" with no commit to blame.
+        #
+        # yuvj420p is the full-range JPEG pixel format; naming it makes the
+        # conversion explicit and works identically on 5 and 7.
+        "-pix_fmt", "yuvj420p",
         "-y",
         str(snap_path),
     ]
     logger.info("Extracting snapshot: %s", " ".join(cmd))
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    # QUEUE for a slot, never reject. Unlike /clip this waits: the caller is
+    # either a batch sampler (Data Collection), which wants back-pressure rather
+    # than a 503 it would have to retry anyway, or a single interactive snapshot
+    # from Playback, which would rather wait a couple of seconds than error.
+    # The bound exists because each of these decodes a whole segment.
+    async with _snapshot_slot():
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_SNAPSHOT_FFMPEG_TIMEOUT)
+        except asyncio.TimeoutError:
+            # REAP THE PROCESS BEFORE RELEASING THE SLOT. Without this the
+            # timeout only abandons the wait: ffmpeg keeps decoding, and the
+            # slot it was holding is handed to the next queued snapshot while
+            # the old one is still burning a core. Under a dataset run that
+            # compounds — every timeout permanently subtracts capacity from a
+            # box that is also recording.
+            proc.kill()
+            try:
+                await proc.communicate()
+            except (ProcessLookupError, OSError):
+                pass
+            snap_path.unlink(missing_ok=True)
+            logger.warning("Snapshot extraction timed out for %s at %s",
+                           camera, timestamp)
+            raise HTTPException(504, {
+                "error": "Snapshot extraction timed out",
+                "detail": (
+                    "The recorder took too long to decode this frame. The "
+                    "appliance may be under load — retry in a few seconds."
+                ),
+            })
 
     if proc.returncode != 0:
         raise HTTPException(500, {
@@ -834,11 +1220,20 @@ async def get_camera_range(camera: str):
 
 
 async def add_camera(camera: str, rtsp_url: str = Query(...),
-                     retention_days: int = Query(30),
+                     retention_minutes: int | None = Query(None, ge=1, le=3650 * 1440),
+                     retention_days: int | None = Query(None, ge=1, le=3650),
                      masks: str = Query("", description="Privacy masks: JSON list of normalized polygons"),
                      groom_after_days: int | None = Query(None, ge=0, le=3650)):
     """Add a new camera at runtime. With ``masks`` the worker burns the
     polygons into every recorded segment (overlay + re-encode).
+
+    Retention is MINUTES. ``retention_days`` is the deprecated spelling of the
+    same field, converted here and never stored — kept so a caller written
+    against the day-based API still works. Neither given means the appliance
+    default, which is resolved by the retention manager rather than guessed at
+    30 here: this endpoint's old ``retention_days: int = Query(30)`` hard-coded
+    a default that the appliance may not share, so a camera added without the
+    parameter got 30 days whatever cameras.yaml said.
 
     ``groom_after_days`` overrides the appliance groom default: omit to inherit
     it, 0 to never groom this camera, >0 for a threshold in days. 0 was rejected
@@ -848,9 +1243,10 @@ async def add_camera(camera: str, rtsp_url: str = Query(...),
     _validate_camera_name(camera)
     if _engine is None:
         raise HTTPException(500, "Recording engine not available")
+    minutes = _retention_minutes_param(retention_minutes, retention_days)
     from recorder.masking import parse_masks
     try:
-        _engine.add_camera(camera, rtsp_url, retention_days,
+        _engine.add_camera(camera, rtsp_url, minutes,
                            masks=parse_masks(masks),
                            groom_after_days=groom_after_days)
     except ValueError as e:
@@ -876,15 +1272,28 @@ async def invalidate_codec_cache(camera: str):
     return {"status": "ok", "camera": camera, "had_entry": existed}
 
 
-async def set_camera_retention(camera: str,
-                               retention_days: int = Query(..., ge=1, le=3650)):
-    """Update a camera's retention_days in place — no worker restart, no 409
-    for an already-recording camera (unlike POST /cameras/{camera})."""
+async def set_camera_retention(
+        camera: str,
+        retention_minutes: int | None = Query(None, ge=1, le=3650 * 1440),
+        retention_days: int | None = Query(None, ge=1, le=3650)):
+    """Update a camera's retention in place — no worker restart, no 409 for an
+    already-recording camera (unlike POST /cameras/{camera}).
+
+    MINUTES is the canonical unit; ``retention_days`` is the deprecated
+    spelling and is converted here. Exactly one of the two must be given.
+
+    Shortening a camera to a minute-scale period also speeds the sweep up: the
+    retention loop re-reads its cadence from the live map after every pass, so
+    the new policy starts being enforced on a matching clock rather than at the
+    next hour."""
     _validate_camera_name(camera)
     if _engine is None:
         raise HTTPException(500, "Recording engine not available")
-    _engine.set_retention(camera, retention_days)
-    return {"status": "ok", "camera": camera, "retention_days": retention_days}
+    minutes = _retention_minutes_param(retention_minutes, retention_days)
+    if minutes is None:
+        raise HTTPException(422, "retention_minutes (or retention_days) is required")
+    _engine.set_retention(camera, minutes)
+    return {"status": "ok", "camera": camera, "retention_minutes": minutes}
 
 
 async def set_camera_groom(camera: str,
@@ -1079,6 +1488,10 @@ async def health_check():
     slots_available = (
         _clip_semaphore._value if _clip_semaphore is not None else _clip_semaphore_limit
     )
+    snap_available = (
+        _snapshot_semaphore._value if _snapshot_semaphore is not None
+        else _snapshot_semaphore_limit
+    )
     return {
         "status": "ok" if overall_healthy else "degraded",
         "cameras": cameras,
@@ -1093,6 +1506,15 @@ async def health_check():
             "encoder": "nvenc" if _nvenc_ok else "cpu",
             "slots_available": slots_available,
             "slots_in_use": _clip_semaphore_limit - slots_available,
+        },
+        # Snapshot extraction is bounded separately from clips (a dataset run
+        # is hundreds of these). Surfaced for the same reason the clip slots
+        # are: a saturated cap should be diagnosable, not a mystery slowdown.
+        # Watch slots_in_use here during a Data Collection run.
+        "snapshot_extraction": {
+            "slots_total": _snapshot_semaphore_limit,
+            "slots_available": snap_available,
+            "slots_in_use": _snapshot_semaphore_limit - snap_available,
         },
         # What the HLS artifact cache is holding. An empty cache on a busy
         # appliance means every seek is paying full price.
@@ -1504,6 +1926,8 @@ async def save_annotation(
     bbox_y: float = Form(..., ge=0, description="Top edge of bbox in source-video pixels"),
     bbox_w: float = Form(..., gt=0, description="Width of bbox in source-video pixels"),
     bbox_h: float = Form(..., gt=0, description="Height of bbox in source-video pixels"),
+    class_key: str = Form(..., max_length=64,
+                          description="Label class key, validated upstream"),
     frame_width: int = Form(..., gt=0, description="Source frame width in pixels"),
     frame_height: int = Form(..., gt=0, description="Source frame height in pixels"),
     image: UploadFile = File(..., description="Full-frame JPEG at source resolution"),
@@ -1595,6 +2019,10 @@ async def save_annotation(
         metadata = {
             "id": annotation_id,
             "camera": camera,
+            # The NVR does not own the taxonomy and must not pretend to:
+            # camera-mgmt validates the key before forwarding. Recorded
+            # faithfully here because the sidecar is what rebuilds a lost row.
+            "class_key": class_key,
             "timestamp": timestamp,
             "timestamp_epoch": ts_epoch,
             "bbox": {
@@ -1625,6 +2053,78 @@ async def save_annotation(
         camera, timestamp, bbox_x, bbox_y, bbox_w, bbox_h, annotation_id,
     )
     return metadata
+
+
+# An annotation id is the uuid4().hex save_annotation minted. Matching the whole
+# shape is a stronger guarantee than stripping "..": a name that is not this
+# shape is not one of ours, whatever it is.
+_ANNOTATION_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+async def delete_annotation(annotation_id: str) -> dict:
+    """Remove one annotation's image and sidecar.
+
+    Idempotent on purpose. camera-mgmt drives deletion (it owns `expires_at`)
+    and retries a failed pass, so "already gone" must not be an error — a retry
+    that 404s would strand the row the sweep is trying to clear.
+    """
+    if _annotations_path is None:
+        raise HTTPException(500, "Annotation storage is not configured")
+    if not _ANNOTATION_ID.match(annotation_id):
+        raise HTTPException(422, "Malformed annotation id")
+
+    deleted = False
+    for sidecar in _annotations_path.glob(f"*/*_{annotation_id}.json"):
+        for path in (sidecar.with_suffix(".jpg"), sidecar):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Failed to delete %s", path)
+                raise HTTPException(500, "Failed to delete annotation")
+        deleted = True
+    return {"deleted": deleted}
+
+
+async def list_annotations(camera: str | None = None,
+                           since: float | None = None) -> dict:
+    """Every sidecar, optionally filtered by camera and capture time.
+
+    This is what camera-mgmt's adoption pass reads to find files whose index
+    row never landed. The sidecars come back as written — reshaping them here
+    would defeat the point of keeping them as a recovery log.
+
+    An unreadable sidecar is skipped, not fatal: one corrupt file must not stop
+    the adoption pass recovering every other orphan on the volume.
+    """
+    if _annotations_path is None:
+        raise HTTPException(500, "Annotation storage is not configured")
+    if camera is not None:
+        _validate_camera_name(camera)
+
+    root = _annotations_path / camera if camera else _annotations_path
+    pattern = "*.json" if camera else "*/*.json"
+    out: list[dict] = []
+    for sidecar in sorted(root.glob(pattern)):
+        try:
+            meta = json.loads(sidecar.read_text())
+        except (OSError, ValueError):
+            logger.warning("Unreadable annotation sidecar: %s", sidecar)
+            continue
+        if since is not None and float(meta.get("timestamp_epoch", 0)) < since:
+            continue
+        out.append(meta)
+    return {"annotations": out}
+
+
+async def annotation_image(annotation_id: str) -> Response:
+    """The stored frame. 404 once it has been swept or erased."""
+    if _annotations_path is None:
+        raise HTTPException(500, "Annotation storage is not configured")
+    if not _ANNOTATION_ID.match(annotation_id):
+        raise HTTPException(422, "Malformed annotation id")
+    for image in _annotations_path.glob(f"*/*_{annotation_id}.jpg"):
+        return Response(content=image.read_bytes(), media_type="image/jpeg")
+    raise HTTPException(404, "No such annotation")
 
 
 class ClipExtractionError(Exception):

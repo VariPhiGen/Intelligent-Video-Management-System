@@ -59,6 +59,9 @@ class ActivityPipeline:
             stationary_after_seconds=t.stationary_after_seconds,
             stationary_distance=t.stationary_distance,
             max_tracks_per_key=t.max_tracks_per_key,
+            reassociate_within_seconds=t.reassociate_within_seconds,
+            reassociate_iou=t.reassociate_iou,
+            reassociate_distance=t.reassociate_distance,
         )
 
         self.frames_queued = 0

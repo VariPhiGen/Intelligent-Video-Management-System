@@ -101,6 +101,12 @@ INTERNAL_API_KEY="$(gen 48 64)"
 KEYCLOAK_ADMIN_PASSWORD="$(gen 32 32)"
 set_kv "INTERNAL_API_KEY" "$INTERNAL_API_KEY"
 set_kv "KEYCLOAK_ADMIN_PASSWORD" "$KEYCLOAK_ADMIN_PASSWORD"
+# The VMS broker's credential (mqtt profile). Rendered into the broker's
+# password file at start and read by the bridge and the translator, all from
+# .env, so rotating it is a `./vms up -d` away. Every value that is not a
+# secret stays as it is.
+set_kv "MQTT_PASSWORD" "$(gen 32 32)"
+grep -qE '^MQTT_USERNAME=.+' "$ENV_FILE" || set_kv "MQTT_USERNAME" "vms"
 
 # THE LOGINS SOMEONE WOULD ACTUALLY TYPE. KEYCLOAK_ADMIN_PASSWORD above is the
 # Keycloak master console; these two are the application accounts seeded by

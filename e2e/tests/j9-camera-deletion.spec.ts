@@ -35,7 +35,8 @@ import {
 } from '../support/cameras';
 import { resetAppliance } from '../support/reset';
 import {
-  cameraRtspUrl, relayHasPath, relayPathNames, restoreCameras, seedResolvedSubTrack,
+  brokerCameras, cameraRtspUrl, indexCameras, relayHasPath, relayPathNames,
+  restoreCameras, seedResolvedSubTrack,
 } from '../support/stack';
 
 /** Relay reconcile and NVR teardown are both interval-driven; this is the
@@ -143,6 +144,58 @@ test.describe('J9 · camera deletion', () => {
         + '204 — deletion did not tear it down; the health monitor\'s orphan '
         + 'sweep will mask this within 30s, which is why this is checked now',
       ).not.toContain(SUB(cam.slug));
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test('deleting an INDEXED camera stops the broker and the index too', async () => {
+    // THE OTHER HALF OF THE SAME INVARIANT, and it was missing until
+    // 2026-09-18: `delete_camera` tore down the relay, both recording tracks
+    // and the motion service, and told the frame broker and the search index
+    // nothing at all. They kept decoding and ingesting the camera for ever.
+    //
+    // AND NO SWEEP COULD HAVE TIDIED IT UP. Each service's reconcile loop
+    // builds BOTH its desired set and its `absent` set from registry rows, then
+    // deliberately leaves alone any name it does not recognise — another VMS
+    // may be feeding the same index, and removing a stranger's camera would be
+    // worse than leaking one. A deleted camera has no row, so it is in neither
+    // set. Unlike the relay path above there is no orphan sweep to mask this;
+    // the leak was permanent, and with no camera left in the UI there was
+    // nothing to switch it off through either.
+    //
+    // Asserted at the instant of the 204, for the reason the sub-track test
+    // above sets out at length: `delete_camera` awaits all three removals
+    // before it answers.
+    const api = await service();
+    try {
+      const cam = await registerCamera(api, 'one', { name: 'E2E Delete Indexed' });
+      await waitForHealth(api, cam.id, 'connected');
+
+      // Indexing is opt-IN since migration 038, so the precondition has to be
+      // arranged — and arranging it is itself the push J10 covers.
+      const on = await api.put(`/api/cameras/${cam.id}`, {
+        data: { search_indexing: true },
+      });
+      expect(on.status(), await on.text()).toBe(200);
+      expect(await brokerCameras(),
+        'the camera never reached the broker, so its removal proves nothing',
+      ).toContain(cam.slug);
+      expect(await indexCameras(),
+        'the camera never reached the index, so its removal proves nothing',
+      ).toContain(cam.slug);
+
+      expect((await api.delete(`/api/cameras/${cam.id}`)).status()).toBe(204);
+
+      expect(await brokerCameras(),
+        'THE BROKER WAS STILL DECODING A DELETED CAMERA when deletion returned '
+        + '204 — an ffmpeg decode and a shared-memory ring for a camera with no '
+        + 'row, which no reconcile pass will ever collect',
+      ).not.toContain(cam.slug);
+      expect(await indexCameras(),
+        'THE INDEX WAS STILL INGESTING A DELETED CAMERA when deletion returned '
+        + '204 — it keeps writing rows for a camera the operator removed',
+      ).not.toContain(cam.slug);
     } finally {
       await api.dispose();
     }

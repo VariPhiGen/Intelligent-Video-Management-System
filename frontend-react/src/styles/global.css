@@ -34,6 +34,29 @@
 .pk-state { font-size: 12px; font-weight: 600; white-space: nowrap; }
 .pk-tile-name { font-weight: 600; font-size: 13.5px; letter-spacing: -.01em; }
 .pk-tile-loc { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+/* The bridge address (MQTT topic / HA entity / URL). Mono so a topic typo is
+   visible; ellipsised so a long topic cannot widen the tile. */
+.pk-tile-addr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+  color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pk-tile-drv { color: var(--dim); text-transform: uppercase; font-size: 9.5px; letter-spacing: .04em; margin-right: 2px; }
+/* Device health from the gateway's read-only check: dot + label + why. */
+.pk-health { display: flex; align-items: baseline; gap: 5px; margin-top: 5px; font-size: 11px;
+  min-width: 0; white-space: nowrap; overflow: hidden; }
+.pk-health-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--dim);
+  transform: translateY(-1px); }
+.pk-health-label { flex: none; font-weight: 600; }
+.pk-health-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.pk-health-green .pk-health-dot { background: var(--green); }
+.pk-health-green .pk-health-label { color: var(--green); }
+.pk-health-red .pk-health-dot { background: var(--red); }
+.pk-health-red .pk-health-label { color: var(--red); }
+.pk-health-amber .pk-health-dot { background: var(--yellow); }
+.pk-health-amber .pk-health-label { color: var(--yellow); }
+.pk-health-dim .pk-health-label { color: var(--muted); }
+/* Manual override: both commands side by side; the current state is marked. */
+.pk-override { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+.pk-override .btn { width: 100%; }
+.pk-override .pk-override-on { box-shadow: inset 0 0 0 1.5px var(--accent); font-weight: 650; }
 
 /* Rule builder: two equal panels with an arrow between; stacks on narrow. */
 .pk-builder {
@@ -87,6 +110,48 @@
   padding: var(--s3) var(--s5); border-bottom: 1px solid var(--border);
 }
 .pk-rule:last-child { border-bottom: none; }
+
+/* Trigger log: one alert per row, four fixed columns so a long outcome
+   cannot push the controls around; stacks on a narrow screen. */
+.tl-row {
+  display: grid; grid-template-columns: 120px minmax(160px, 1.1fr) minmax(200px, 2fr) auto;
+  gap: var(--s3); align-items: start; padding: var(--s3) var(--s5);
+  border-bottom: 1px solid var(--border);
+}
+.tl-row:last-child { border-bottom: none; }
+.tl-head { padding-top: var(--s2); padding-bottom: var(--s2); font-size: 11px; color: var(--dim);
+  text-transform: uppercase; letter-spacing: .05em; background: var(--surface2); }
+.tl-time { display: flex; flex-direction: column; }
+.tl-clock { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.tl-day { font-size: 11px; color: var(--dim); }
+.tl-rule { display: flex; gap: 8px; align-items: flex-start; min-width: 0; }
+.tl-rule-name { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.tl-sub { font-size: 12px; color: var(--muted); }
+.tl-sev-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: var(--dim); }
+.tl-sev-critical .tl-sev-dot { background: var(--red); }
+.tl-sev-warning .tl-sev-dot { background: var(--yellow); }
+.tl-outcomes { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tl-out { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; font-size: 12.5px;
+  padding: 3px 8px; border-radius: var(--r-sm); border-left: 3px solid var(--border2);
+  background: var(--surface2); }
+.tl-out-dev { font-weight: 600; }
+.tl-out-text { color: var(--text2); }
+.tl-out-ok { border-left-color: var(--green); }
+.tl-out-ok .tl-out-text { color: var(--green); }
+.tl-out-muted .tl-out-text { color: var(--muted); }
+.tl-out-warn { border-left-color: var(--yellow); }
+.tl-out-warn .tl-out-text { color: var(--yellow); }
+.tl-out-bad { border-left-color: var(--red); }
+.tl-out-bad .tl-out-text { color: var(--red); }
+.tl-status { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.tl-badges { display: flex; gap: 6px; }
+.tl-actions { display: flex; gap: 6px; align-items: center; }
+.tl-resolve { font-size: 12px; padding: 3px 6px; max-width: 150px; }
+@media (max-width: 860px) {
+  .tl-row { grid-template-columns: 1fr; gap: var(--s2); }
+  .tl-head { display: none; }
+  .tl-status { align-items: flex-start; }
+}
 .pk-rule-trigger { font-weight: 600; font-size: 13px; }
 .pk-rule-arrow { color: var(--dim); }
 .pk-rule-action { color: var(--accent2); font-size: 13px; }
@@ -257,8 +322,41 @@
 .copy-btn svg { pointer-events: none; }
 
 /* ══ PLAYBACK ════════════════════════════════════════════════════════════ */
-.pb-video-wrap { position: relative; background: #05080B; height: min(58vh, 560px); }
+.pb-video-wrap { position: relative; background: #05080B; height: min(58vh, 560px);
+  /* The stage is translated and scaled inside this box; without clipping, a
+     panned frame paints over the timeline below it. */
+  overflow: hidden; }
+/* The digital-zoom stage (useVideoZoom). Fills the wrap, carries the
+   transform, and holds the video plus the portalled annotate canvas so both
+   are scaled identically — the property AnnotateLayer's coordinate maths
+   depends on. transform-origin is set inline alongside the transform. */
+.pb-stage { position: absolute; inset: 0; will-change: transform; }
 .pb-video-wrap video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.pb-zoom {
+  position: absolute; top: var(--s3); right: var(--s3); z-index: 6;
+  display: flex; align-items: center; gap: 2px;
+  background: rgba(5, 8, 11, .72); border-radius: var(--r-full);
+  padding: 2px 4px;
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+/* Literal light text for the same reason .pb-gapwarn uses literals: this
+   floats over footage, and the neutral scale flips with the theme. */
+.pb-zoom .btn-ghost { color: #E6EAEF; }
+.pb-zoom-level {
+  min-width: 34px; text-align: center; font-size: 11.5px;
+  font-variant-numeric: tabular-nums; color: #E6EAEF; opacity: .85;
+}
+.pb-zoom-hint {
+  position: absolute; bottom: var(--s3); right: var(--s3); z-index: 6;
+  background: rgba(5, 8, 11, .72); color: #E6EAEF;
+  padding: 3px 9px; border-radius: var(--r-full); font-size: 11px;
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+/* Playback card in fullscreen: the card fills the screen as a column and the video takes whatever the header,
+   controls and timeline leave, instead of its fixed 58vh. */
+.pb-card.pb-fs { display: flex; flex-direction: column; width: 100vw; height: 100vh; border-radius: 0; overflow-y: auto !important; }
+.pb-card.pb-fs .pb-video-wrap { flex: 1 1 auto; height: auto; min-height: 240px; }
+.pb-card:fullscreen { background: var(--surface, #0b1117); }
 .pb-overlay {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   background: rgba(5, 8, 11, .72); color: var(--n8); font-size: 13.5px; z-index: 5;
@@ -290,18 +388,106 @@
   width: 100%; height: 100%;
   cursor: crosshair; touch-action: none;
 }
+/* Mode badge. Not an instruction — that lives on the toolbar beside the
+   controls it describes. */
 .pb-annotate-hint {
   position: absolute; top: var(--s3); right: var(--s3);
-  background: var(--accent); color: #fff;
+  display: flex; align-items: center; gap: 6px;
+  background: var(--accent); color: var(--onAccent);
   padding: 4px 11px; border-radius: var(--r-full);
   font-size: 11.5px; font-weight: 650; z-index: 6;
   box-shadow: var(--e2); pointer-events: none;
 }
+
+/* ONE bar, and only ever one. This selector centres its box on a fixed bottom
+   offset, so the two bars this mode used to render — the class picker and the
+   save actions — landed on precisely the same pixels and overlapped the moment
+   a box was drawn. AnnotateLayer now renders a single bar with a swapping
+   right-hand slot; keep it that way.
+
+   Dark in BOTH themes on purpose: it floats over video inside .pb-video-wrap
+   (background #05080B), so a light-theme --surface panel would be a white slab
+   over the footage. Literal colours for the same reason .pb-gapwarn uses them —
+   the neutral scale flips with the theme and this surface must not. */
 .pb-annotate-bar {
   position: absolute; bottom: var(--s3); left: 50%; transform: translateX(-50%);
-  display: flex; gap: var(--s2); z-index: 6;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--r-md); padding: var(--s2); box-shadow: var(--e2);
+  z-index: 6;
+  display: flex; align-items: center; gap: var(--s3);
+  max-width: calc(100% - 2 * var(--s4));
+  padding: 6px 8px 6px 11px;
+  border-radius: var(--r-full);
+  background: rgba(5, 8, 11, .82);
+  border: 1px solid rgba(255, 255, 255, .15);
+  box-shadow: var(--e2);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  color: #E7EAEF;
+}
+/* The empty-taxonomy message is a sentence, not a control strip: let it wrap
+   and drop the pill radius, which only reads well on a single line. */
+.pb-annotate-bar.is-empty {
+  max-width: min(420px, calc(100% - 2 * var(--s4)));
+  border-radius: var(--r-md); padding: 9px 13px;
+}
+.pb-annotate-empty { font-size: 12.5px; line-height: 1.5; color: rgba(255, 255, 255, .8); }
+.pb-annotate-empty b { color: #fff; font-weight: 650; }
+
+.pb-annotate-class { display: flex; align-items: center; gap: 7px; margin: 0; }
+.pb-annotate-class-label {
+  font-size: 10.5px; font-weight: 650; letter-spacing: .05em;
+  text-transform: uppercase; color: rgba(255, 255, 255, .5);
+}
+/* The colour the box will actually be drawn in — the picker's value is
+   otherwise invisible until something is on screen. */
+.pb-annotate-swatch {
+  width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .4);
+}
+.pb-annotate-class select {
+  height: 28px; padding: 3px 6px; max-width: 170px;
+  background: rgba(255, 255, 255, .09);
+  border: 1px solid rgba(255, 255, 255, .17);
+  border-radius: var(--r-sm);
+  color: #F1F3F6; font-size: 12.5px; font-weight: 500;
+}
+.pb-annotate-class select:hover { background: rgba(255, 255, 255, .15); }
+/* The native menu is a separate surface and does not inherit the bar. */
+.pb-annotate-class select option { background: #11151B; color: #F1F3F6; }
+
+.pb-annotate-sep {
+  width: 1px; align-self: stretch; margin: 3px 0; flex-shrink: 0;
+  background: rgba(255, 255, 255, .15);
+}
+.pb-annotate-tip {
+  font-size: 12px; color: rgba(255, 255, 255, .62);
+  white-space: nowrap; padding-right: var(--s1);
+}
+.pb-annotate-actions { display: flex; align-items: center; gap: 6px; }
+.pb-annotate-actions .iconish { padding: 4px 9px; font-size: 13px; line-height: 1; }
+
+/* The neutral buttons assume a theme surface; on this bar they would be a
+   white slab (light) or near-invisible (dark). Restated for the dark panel. */
+.pb-annotate-bar .btn-ghost,
+.pb-annotate-bar .btn-secondary {
+  background: rgba(255, 255, 255, .1);
+  border-color: rgba(255, 255, 255, .18);
+  color: #F1F3F6;
+}
+.pb-annotate-bar .btn-ghost:hover:not(:disabled),
+.pb-annotate-bar .btn-secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, .19);
+  border-color: rgba(255, 255, 255, .3);
+  color: #fff;
+}
+
+/* Narrow players: the strip becomes two rows rather than overflowing the frame
+   or pushing the Save button off the side. */
+@media (max-width: 560px) {
+  .pb-annotate-bar {
+    flex-wrap: wrap; justify-content: center;
+    border-radius: var(--r-md); row-gap: var(--s2);
+  }
+  .pb-annotate-sep { display: none; }
+  .pb-annotate-tip { white-space: normal; text-align: center; }
 }
 .pb-controls {
   display: flex; align-items: center; gap: var(--s2);
@@ -331,10 +517,29 @@
   max-width: 46%; overflow: hidden; text-overflow: ellipsis;
 }
 .pb-labels { position: relative; height: 16px; margin: 4px var(--s4) var(--s4); color: var(--muted); font-size: 10px; overflow: hidden; }
+/* Event marks on the playback timeline: the hover card sits above the bar,
+   anchored on the mark (x is measured inside .pb-timeline, hence the gutter). */
+.pb-timeline-wrap { position: relative; }
+.pb-mark-tip {
+  position: absolute; top: 0; z-index: 5;
+  transform: translate(calc(var(--s4) - 50%), calc(-100% + var(--s3) - 6px));
+  padding: 6px 9px; border-radius: var(--r-md);
+  background: var(--surface); border: 1px solid var(--border2); box-shadow: var(--shadow);
+  color: var(--muted); font-size: 11px; white-space: nowrap; pointer-events: none;
+}
+.pb-mark-tip-head { display: flex; align-items: center; gap: 6px; color: var(--text); font-weight: 600; margin-bottom: 2px; }
+.pb-mark-dot { width: 8px; height: 8px; border-radius: 2px; transform: rotate(45deg); flex-shrink: 0; }
+.pb-marks-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px var(--s4) 0; font-size: 11px; color: var(--muted); }
+.pb-mark-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border2); background: transparent; color: var(--text); font-size: 11px; cursor: pointer;
+}
+.pb-mark-chip[aria-pressed="false"] { opacity: .45; text-decoration: line-through; }
 
-/* Playback: player + cameras rail. The inline style="display:none" wins while
-   hidden; clearing it lets this grid rule take over. */
-#pb-view { display: grid; grid-template-columns: 1fr 248px; gap: var(--s4); align-items: start; }
+/* Playback: the single player, full width — the camera is picked from the
+   dropdown in its header. The inline style="display:none" wins while hidden;
+   clearing it lets this grid rule take over. */
+#pb-view { display: grid; grid-template-columns: 1fr; gap: var(--s4); align-items: start; }
 
 /* ══ LIVE VIEW ═══════════════════════════════════════════════════════════ */
 .video-wrap {
@@ -409,18 +614,251 @@
 }
 .wall-cell:hover { border-color: var(--accentEdge); box-shadow: 0 0 0 2px var(--accentRing); }
 .wall-empty { display: flex; align-items: center; justify-content: center; background: linear-gradient(180deg, #0A1016, #05070C); }
-
-/* Decorative PTZ pad (feature ships with ONVIF PTZ) */
-.ptz-pad {
-  position: relative; width: 100px; height: 100px; min-width: 100px; border-radius: 50%;
-  background: var(--surface2); border: 1px solid var(--border2);
+/* Per-monitor controls. Hidden until the cell is hovered or focused within, so
+   a wall being watched is picture and nothing else — but reachable by keyboard,
+   where there is no hover to reveal them. */
+.wall-ops {
+  position: absolute; right: 6px; top: 6px; display: flex; gap: 4px;
+  opacity: 0; transition: opacity var(--base) var(--ease);
 }
-.ptz-hub { position: absolute; inset: 33px; border-radius: 50%; background: var(--track); border: 1px solid var(--border3); }
-.ptz-pad span { position: absolute; font-size: 10px; color: var(--dim); }
-.ptz-n { top: 7px; left: 50%; transform: translateX(-50%); }
-.ptz-s { bottom: 7px; left: 50%; transform: translateX(-50%); }
-.ptz-w { left: 9px; top: 50%; transform: translateY(-50%); }
-.ptz-e { right: 9px; top: 50%; transform: translateY(-50%); }
+.wall-cell:hover .wall-ops, .wall-cell:focus-within .wall-ops { opacity: 1; }
+.wall-op {
+  background: rgba(5, 8, 11, .72);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  border: 1px solid rgba(220, 227, 236, .18); border-radius: var(--r-xs);
+  color: #DCE3EC; font-size: 9.5px; font-weight: 600; letter-spacing: .04em;
+  padding: 3px 7px;
+}
+/* The whole cell is the control, so the chip is a hint and must not look like a
+   second target sitting on top of one. */
+.wall-filled { cursor: pointer; padding: 0; text-align: left; }
+.wall-filled:hover .wall-op { border-color: var(--accent); color: #fff; }
+@media (prefers-reduced-motion: reduce) { .wall-ops { transition: none; } }
+/* Auto-fit wall (WallView): the grid sizes tiles in px itself, so cells drop the fixed aspect-ratio. */
+.wall-stage .wall-cell { aspect-ratio: auto; }
+.wall-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.wall-title { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall-logo { height: 36px; max-width: 180px; object-fit: contain; border-radius: 4px; }
+#live-grid:fullscreen .wall-logo { height: 44px; }
+.wall-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted);
+  background: var(--input); border: 1px solid var(--border2); border-radius: 20px; padding: 4px 11px; }
+.wall-blip { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: blip 1.6s infinite; }
+.wall-none { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); }
+.wall-spot { width: 100%; height: 100%; aspect-ratio: auto; cursor: zoom-out; }
+.wall-stage .wall-cell:not(.wall-spot) { cursor: zoom-in; }
+.wall-caption { position: absolute; left: 8px; right: 8px; bottom: 7px; pointer-events: none; color: #fff;
+  font-size: 10.5px; text-shadow: 0 1px 3px rgba(0,0,0,.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall-sub { font-family: var(--mono); font-size: 8.5px; color: #DCE3EC; }
+.wall-x { position: absolute; right: 6px; bottom: 6px; z-index: 3; width: 24px; height: 24px; border-radius: 50%;
+  border: 1px solid rgba(255,255,255,.25); background: rgba(5,7,12,.75); color: #fff; font-size: 11px; line-height: 1;
+  cursor: pointer; opacity: 0; transition: opacity var(--base) var(--ease); }
+.wall-cell:hover .wall-x, .wall-x:focus-visible { opacity: 1; }
+.wall-x:hover { background: var(--red); border-color: var(--red); }
+.wall-logo-preview { width: 160px; height: 72px; display: grid; place-items: center; border: 1px dashed var(--border2);
+  border-radius: 6px; background: var(--input); color: var(--muted); font-size: 11px; }
+.wall-logo-preview img { max-width: 150px; max-height: 64px; object-fit: contain; }
+/* "2 offline ▾" chip + its list (cameras dropped from the wall because they're not streaming) */
+.wall-off-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 3px 9px; border-radius: 999px;
+  color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); border: 1px solid color-mix(in srgb, var(--red) 35%, transparent); cursor: pointer; }
+.wall-off-list { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; min-width: 280px; max-height: 50vh; overflow: auto;
+  padding: 10px 12px; border-radius: var(--r-md); background: var(--surface); border: 1px solid var(--border2); box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+.wall-off-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 4px 0; }
+.wall-off-row .d { width: 7px; height: 7px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
+.wall-set-row { display: grid; grid-template-columns: 130px 1fr 112px; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 12.5px; }
+.wall-set-row input[type=range] { width: 100%; }
+.wall-swatch { width: 22px; height: 22px; border-radius: 5px; border: 1px solid var(--border2); cursor: pointer; padding: 0; }
+.wall-swatch.on { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Wall camera picker */
+.wp-zone { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; margin-bottom: 8px; cursor: pointer; }
+.wp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.wp-cam { display: block; border: 1px solid var(--border2); border-radius: 6px; overflow: hidden; cursor: pointer; background: var(--input); }
+.wp-cam.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.wp-thumb { aspect-ratio: 16/9; background: #080C12; display: grid; place-items: center; color: var(--dim); font-size: 10px; }
+.wp-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.wp-meta { display: flex; align-items: center; gap: 6px; padding: 6px 7px; font-size: 11.5px; }
+.wp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ══ PTZ CONTROL ═════════════════════════════════════════════════════════ */
+/* An eight-way pad laid out as a 3x3 grid clipped to a circle, with the centre
+   cell as the stop button. Grid rather than absolutely-placed glyphs because
+   every cell here is a real <button>: it needs a hit area proportional to the
+   pad, a focus ring, and a keyboard tab stop. The old decorative version was
+   four spans and could not have any of those. */
+.ptz-pad {
+  position: relative; display: grid; border-radius: 50%; overflow: hidden;
+  grid-template-areas: "nw n ne" "w hub e" "sw s se";
+  grid-template-columns: 1fr 1.05fr 1fr;
+  grid-template-rows: 1fr 1.05fr 1fr;
+  background: var(--surface2); border: 1px solid var(--border2);
+  user-select: none; touch-action: none;   /* a drag must pan, never scroll */
+}
+.ptz-pad:focus-visible { outline: 2px solid var(--accentEdge); outline-offset: 2px; }
+.ptz-pad-off { opacity: .45; }
+
+.ptz-dir {
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; padding: 0; cursor: pointer;
+  font-size: 11px; line-height: 1; color: var(--dim);
+  transition: background .12s, color .12s;
+}
+.ptz-dir:hover:not(:disabled) { background: var(--surface3, rgba(255,255,255,.05)); color: var(--text2); }
+.ptz-dir.on { background: var(--accentRing); color: var(--accent2); }
+.ptz-dir:disabled { cursor: default; }
+/* Diagonals read as secondary — the cardinals are what an operator aims with. */
+.ptz-nw, .ptz-ne, .ptz-sw, .ptz-se { font-size: 9.5px; opacity: .75; }
+.ptz-nw { grid-area: nw; } .ptz-n { grid-area: n; } .ptz-ne { grid-area: ne; }
+.ptz-w  { grid-area: w; }                            .ptz-e  { grid-area: e; }
+.ptz-sw { grid-area: sw; } .ptz-s { grid-area: s; } .ptz-se { grid-area: se; }
+
+.ptz-hub {
+  grid-area: hub; border-radius: 50%; margin: 14%;
+  background: var(--track); border: 1px solid var(--border3);
+  color: var(--dim); font-size: 9px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: color .12s, border-color .12s;
+}
+.ptz-hub:hover { color: var(--red); border-color: var(--red); }
+
+/* The PTZ control block (PtzPad): pad + zoom rocker on one row, the zoom chips under them. Same everywhere it
+   appears — live expanded view, the PTZ tab's big and mini layouts. */
+.ptz-ctl { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.ptz-ctl-row { display: flex; gap: 14px; align-items: center; }
+
+/* Zoom rocker: one pill — hold + / − to zoom, the readout between them. */
+.ptz-zoom {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 4px; border-radius: 22px; background: var(--surface2); border: 1px solid var(--border2);
+  min-width: 44px;
+}
+.ptz-z {
+  width: 34px; height: 34px; border-radius: 50%; cursor: pointer;
+  background: transparent; border: 1px solid transparent;
+  color: var(--text2); font-size: 15px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  user-select: none; touch-action: none; transition: background .12s, border-color .12s;
+}
+.ptz-zoom.compact .ptz-z { width: 30px; height: 30px; font-size: 14px; }
+.ptz-z:hover { background: var(--surface3, rgba(255,255,255,.05)); border-color: var(--accentEdge); }
+.ptz-z.on { background: var(--accentRing); color: var(--accent2); border-color: var(--accentEdge); }
+.ptz-z-label {
+  font-size: 8.5px; letter-spacing: .1em; color: var(--dim); font-family: var(--mono);
+  padding: 3px 0; min-width: 36px; text-align: center;
+}
+/* A number to read ("3.2×", "35%") replaces the ZOOM caption — bigger, and it carries the accent. */
+.ptz-z-label.mag { font-size: 12px; letter-spacing: 0; color: var(--accent2); font-weight: 600; }
+
+/* Zoom chips: go straight to 1× / 2× / 4× … / Max (calibrated) or Wide / 25 / 50 / 75 % / Tele. */
+.ptz-zchips { display: flex; flex-wrap: wrap; gap: 4px; max-width: 320px; }
+.ptz-zchip {
+  padding: 3px 9px; border-radius: 999px; cursor: pointer; font-size: 11px; font-family: var(--mono);
+  background: var(--surface2); border: 1px solid var(--border2); color: var(--text2); line-height: 1.5;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.ptz-zchip:hover { border-color: var(--accentEdge); color: var(--text); }
+.ptz-zchip.on { background: var(--accentRing); border-color: var(--accentEdge); color: var(--accent2); }
+
+/* Speed: a bounded slider — stretched across a wide panel it read as a page divider, not a control. */
+.ptz-speed { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); max-width: 300px; width: 100%; }
+.ptz-speed input { flex: 1; min-width: 90px; }
+.ptz-speed-val { font-family: var(--mono); font-size: 11px; color: var(--text2); width: 34px; text-align: right; }
+
+/* Aim by degrees (pages/ptz/AimPanel): steps from here, views from Home. */
+.ptz-aim { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-radius: 10px;
+  background: var(--surface2); border: 1px solid var(--border2); max-width: 600px; }
+.ptz-aim-title { font-size: 12.5px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.ptz-aim-now { font-weight: 400; font-size: 11.5px; color: var(--accent2); }
+.ptz-aim-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.ptz-aim-label { font-size: 11px; color: var(--dim); min-width: 82px; }
+.ptz-aim-arrows { display: inline-flex; gap: 4px; margin-left: 6px; }
+.ptz-aim-arrow { width: 28px; height: 26px; border-radius: 7px; cursor: pointer; font-size: 11px;
+  background: var(--surface); border: 1px solid var(--border2); color: var(--text2); }
+.ptz-aim-arrow:hover:not(:disabled) { border-color: var(--accentEdge); color: var(--text); }
+.ptz-aim-arrow:disabled { opacity: .45; cursor: default; }
+/* The app's form controls are full-width by default; here they sit inline in a sentence. */
+.ptz-aim select, .ptz-aim input[type="number"], .ptz-aim input[type="text"], .ptz-aim input:not([type]) {
+  width: auto; height: 28px; padding: 2px 6px; font-size: 12px; margin: 0; }
+.ptz-aim select { padding-right: 24px; min-width: 64px; }
+.ptz-aim .ptz-aim-num { width: 58px; font-family: var(--mono); }
+.ptz-aim .ptz-aim-name { flex: 1; min-width: 160px; }
+.ptz-aim-pair { display: inline-flex; align-items: center; gap: 4px; margin-right: 6px; }
+.ptz-aim-check { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+.ptz-aim-note { font-size: 11px; color: var(--dim); line-height: 1.5; }
+
+/* "Moved from Preset 2 — Update it to this view" (PtzTab), shown once the camera is nudged off a preset. */
+.ptz-moved-from { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; padding: 8px 10px;
+  margin-bottom: 10px; border-radius: 10px; background: var(--accentRing); border: 1px solid var(--accentEdge); }
+.ptz-moved-from span { flex: 1; min-width: 140px; }
+
+/* Bulk calibration on Cameras → PTZ: the toolbar group and the live Calibration cell. */
+.ptz-cal-bar { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }
+.ptz-cal { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.ptz-cal.done { color: var(--text2); }
+.ptz-cal.queued { color: var(--muted); }
+.ptz-cal.running { color: var(--accent2); font-weight: 600; }
+.ptz-cal.failed { display: block; color: var(--warn, #f59e0b); font-size: 11px; margin-top: 2px; }
+.ptz-cal-why { color: var(--dim); font-weight: 400; }
+.ptz-cal-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent2); animation: ptzCalPulse 1.2s ease-in-out infinite; }
+@keyframes ptzCalPulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+.ptz-retention { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.ptz-retention input { height: 26px; padding: 2px 6px; font-size: 12px; width: 64px; }
+
+/* Click-to-centre target over the live feed. Invisible until PTZ is live, and
+   crosshair-cursored so the gesture is discoverable without a caption. A
+   camera with relative zoom but no relative pan/tilt still gets the layer
+   (for the wheel gesture) with a different cursor, since clicking it does
+   nothing. `.busy` covers the window between a click/drag and waitForSettle
+   (lib/ptz.ts) confirming the camera itself has stopped moving. */
+.ptz-click-layer { position: absolute; inset: 0; cursor: crosshair; z-index: 2; touch-action: none; }
+.ptz-click-layer-zoom-only { cursor: ns-resize; }
+.ptz-click-layer.busy { cursor: wait; }
+
+/* The rectangle being drawn for drag-to-zoom, tracking the pointer live —
+   plain and un-animated (unlike the click marker) since it's redrawn on every
+   pointermove already and an animation would fight that. Border matches the
+   marker's solid --accent2 (visibility against a busy video frame matters
+   more here than the softer treatment --accentEdge gets on ordinary UI
+   chrome); fill reuses --accentRing, the same token .ptz-dir.on/.ptz-z.on use
+   for "this accent-coloured thing is active" rather than a one-off tint. */
+.ptz-drag-box {
+  position: absolute; border: 2px solid var(--accent2);
+  background: var(--accentRing);
+  pointer-events: none;
+}
+
+/* Where the last centring click landed. Mounted and unmounted by React
+   exactly when `busy` flips (waitForSettle's poll is variable-length, so
+   there's no fixed duration left to animate a fade-out against) — pops in
+   once, pulses gently while the camera is still confirmed-moving, and
+   disappears the instant the lock lifts, which is itself the "you can click
+   again now" signal. */
+.ptz-click-marker {
+  position: absolute; width: 34px; height: 34px; margin: -17px 0 0 -17px;
+  border: 2px solid var(--accent2); border-radius: 50%; pointer-events: none;
+  animation: ptz-marker-pulse 900ms ease-in-out infinite;
+}
+.ptz-click-marker::before, .ptz-click-marker::after { content: ''; position: absolute; background: var(--accent2); }
+.ptz-click-marker::before { left: 50%; top: 4px; bottom: 4px; width: 2px; margin-left: -1px; }
+.ptz-click-marker::after { top: 50%; left: 4px; right: 4px; height: 2px; margin-top: -1px; }
+@keyframes ptz-marker-pulse {
+  0%   { opacity: 1; transform: scale(.6); }
+  30%  { opacity: 1; transform: scale(1); }
+  100% { opacity: .45; transform: scale(1); }
+}
+
+.ptz-presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.ptz-preset {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  padding: 4px 9px; border-radius: 999px; font-size: 11.5px;
+  background: var(--surface2); border: 1px solid var(--border2); color: var(--text2);
+}
+.ptz-preset:hover { border-color: var(--accentEdge); color: var(--accent2); }
+.ptz-preset .x { color: var(--dim); font-size: 12px; }
+.ptz-preset .x:hover { color: var(--red); }
+.map-split { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--s5); align-items: start; }
+@media (max-width: 900px) {
+  .map-split { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* ══ CAMERA INVENTORY ════════════════════════════════════════════════════ */
 .inv-toolbar { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; margin-bottom: var(--s4); }
@@ -763,7 +1201,6 @@ td .nav-soon, .d-hint .nav-soon { margin-left: 0; }
   .ch-top { grid-template-columns: 1fr; }
 }
 @media (max-width: 1024px) {
-  #pb-view { grid-template-columns: 1fr; }
   .lv-wrap { grid-template-columns: 1fr; }
   .lv-rail { display: none; }
   .wz-methods { grid-template-columns: 1fr; }
@@ -1225,7 +1662,9 @@ html[data-theme="dark"] .aid-filters > button[aria-pressed="true"] { background:
 .aev-ticker-list { list-style: none; margin: 0; padding: 0; max-height: 196px; overflow-y: auto; }
 .aev-row {
   display: grid;
-  grid-template-columns: 96px minmax(90px, 1fr) minmax(150px, 1.4fr) minmax(0, 1fr) auto;
+  /* 118px, not 96: an event from another day carries its date ("18:34:50 18 Sep"),
+     and at 96px the date spilled under the camera name. */
+  grid-template-columns: 118px minmax(90px, 1fr) minmax(150px, 1.4fr) minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--s3);
   min-height: 38px;
@@ -1270,7 +1709,7 @@ html[data-theme="dark"] .aid-filters > button[aria-pressed="true"] { background:
 .aev-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .aev-card-list { list-style: none; margin: 6px 0 0; padding: 0; }
 .aev-card-row {
-  display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; align-items: center; gap: var(--s3);
+  display: grid; grid-template-columns: 118px minmax(0, 1fr) auto; align-items: center; gap: var(--s3);
   padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 12.5px;
 }
 .aev-card-row:last-child { border-bottom: none; }
@@ -1314,6 +1753,9 @@ html[data-theme="dark"] .aid-filters > button[aria-pressed="true"] { background:
 }
 @media (max-width: 720px) {
   .aev-row { grid-template-columns: 80px minmax(0, 1fr) auto; }
+  /* 80px holds the time only; the date goes underneath rather than into the
+     camera name's column. */
+  .aev-row .aev-date { display: block; margin-left: 0; }
   .aev-row .aev-chip { grid-column: 2 / 4; justify-self: start; }
   .aev-row .aev-zone { display: none; }
   .aev-grid { grid-template-columns: 1fr; }
@@ -1366,3 +1808,583 @@ html[data-theme="dark"] .aid-filters > button[aria-pressed="true"] { background:
 .ss-face-possible .ss-face-band { color: var(--yellow); }
 .ss-face-weak .ss-face-band { color: var(--dim); }
 .ss-face-card .btn-sm { margin-top: var(--s1); }
+
+/* ── AI Analytics → Heatmap Overlay ─────────────────────────────────────────
+   One card per camera: the overlay, what period it covers, and the switch.
+   The picture is the ONLY thing the artifact contains — period, status and
+   "last updated" are rendered here, so the same bytes stay readable when the
+   camera is renamed or the session moves on. */
+.hm-page { display: flex; flex-direction: column; gap: var(--s4); }
+.hm-grid {
+  display: grid; gap: var(--s3); align-items: start;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(320px, 26vw, 520px), 1fr));
+}
+.hm-card { margin-bottom: 0; }
+.hm-shot {
+  position: relative; width: 100%; aspect-ratio: 16 / 9; background: var(--track);
+  display: block; overflow: hidden;
+}
+.hm-shot img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* A frozen heatmap is shown quietly, so ON and OFF never look alike at a glance. */
+.hm-shot-frozen img { filter: saturate(.75) brightness(.88); }
+.hm-shot-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: var(--s2); color: var(--dim); text-align: center;
+}
+.hm-shot-empty .glyph { font-size: 28px; opacity: .6; }
+.hm-shot-empty p { margin: 0; font-size: 13px; }
+.hm-skel { width: 100%; height: 100%; }
+.hm-skel-page { height: 220px; border-radius: var(--r-md); }
+.hm-meta { display: flex; flex-direction: column; gap: 6px; padding: var(--s3); font-size: 12.5px; }
+.hm-meta > div { display: flex; gap: var(--s2); justify-content: space-between; }
+.hm-k { color: var(--dim); }
+.hm-v { font-family: var(--mono); font-size: 12px; color: var(--text2); text-align: right; }
+.hm-note { color: var(--dim); font-size: 12px; }
+.hm-actions { display: flex; gap: var(--s2); justify-content: space-between; }
+.hm-badge { font-weight: 650; }
+.hm-badge.hm-on { color: var(--green); }
+.hm-badge.hm-frozen, .hm-badge.hm-off { color: var(--dim); }
+.hm-badge.hm-idle { color: var(--yellow); }
+.hm-warn { padding: var(--s3); color: var(--yellow); }
+.hm-dim { color: var(--dim); font-size: 12.5px; }
+.hm-choice { flex-wrap: wrap; }
+
+@media (max-width: 900px) {
+  .hm-grid { grid-template-columns: 1fr; }
+}
+
+/* ── Data Collection → Annotations ──────────────────────────────────────────
+   A grid of saved boxes. Modelled on .ss-grid/.ss-card rather than invented
+   fresh: Smart Search solves the same shape of problem — a wall of cropped
+   evidence with metadata under each — and two grids that look different for
+   no reason is how a product starts feeling assembled rather than designed. */
+
+.ann-counts {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+  margin-bottom: var(--s4);
+}
+/* The count is the point of the chip, so it outweighs the label it sits next
+   to — this strip is how an operator sees which class is under-sampled. */
+.ann-count b { margin-left: 6px; font-variant-numeric: tabular-nums; font-weight: 650; }
+.ann-count-total { margin-left: auto; color: var(--dim); }
+
+.ann-filters {
+  display: flex; flex-wrap: wrap; gap: var(--s3);
+  align-items: center; margin-bottom: var(--s4);
+}
+.ann-filters input, .ann-filters select { min-width: 160px; }
+.ann-filters .ann-spacer { margin-left: auto; }
+
+.ann-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(220px, 14vw, 280px), 1fr));
+  gap: var(--s4);
+}
+
+.ann-tile {
+  display: flex; flex-direction: column; gap: var(--s2);
+  margin: 0; padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  transition: border-color var(--fast) var(--ease);
+}
+.ann-tile:hover { border-color: var(--border3); }
+
+/* The frame, and the box on it. 16:9 keeps the wall scannable — the frames are
+   full source frames at whatever the camera shoots — but the fit is CONTAIN,
+   not cover: cover crops, and what it crops is frequently the very box this
+   screen exists to show. Letterbox bars are the cheaper price, and boxStyle()
+   in AnnotationsTab.tsx does the arithmetic that keeps the overlay on the
+   pixels rather than on the element. */
+.ann-frame {
+  position: relative; display: block; width: 100%;
+  background: #070A0E; overflow: hidden;
+}
+.ann-frame img, .ann-frame > div[aria-busy] {
+  width: 100%; height: 100%; display: block;
+}
+.ann-box {
+  position: absolute; display: block;
+  border: 2px solid currentColor; border-radius: 2px;
+  pointer-events: none;
+  /* A dark hairline so a pale class colour still reads against a pale frame. */
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), inset 0 0 0 1px rgba(0, 0, 0, .3);
+}
+.ann-box-tag {
+  position: absolute; top: -2px; left: -2px;
+  transform: translateY(-100%);
+  padding: 1px 5px; border-radius: var(--r-xs) var(--r-xs) 0 0;
+  font-family: var(--mono); font-size: 9.5px; font-weight: 650;
+  line-height: 1.5; white-space: nowrap; color: #0B0E12;
+}
+
+/* The counts are buttons now (click to filter), so they must not inherit the
+   button reset's block-ness or lose the chip look. */
+.ann-count {
+  cursor: pointer; border: 1px solid var(--border2); background: var(--surface2);
+  transition: border-color var(--fast) var(--ease), background var(--fast) var(--ease);
+}
+.ann-count:hover { border-color: var(--border3); }
+.ann-count.is-on {
+  background: var(--accentSoft); border-color: var(--accentEdge); color: var(--accent2);
+}
+/* An empty class is the one worth acting on, so it is stated rather than hidden
+   — but it is not competing with the classes that have samples. */
+.ann-count.is-zero { color: var(--dim); }
+.ann-count.is-zero b { color: var(--muted); }
+
+/* Review posture: one frame, its box, and the decision. */
+.ann-zoom { display: grid; place-items: center; }
+.ann-zoom-inner {
+  display: flex; flex-direction: column; gap: var(--s3);
+  align-items: center; max-width: 92vw;
+}
+.ann-zoom-inner .ann-frame {
+  max-width: 92vw; max-height: 80vh;
+  border-radius: var(--r-md); border: 1px solid var(--border2);
+}
+.ann-zoom-inner .ann-frame img { object-fit: contain; max-height: 80vh; }
+.ann-zoom-bar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+  gap: var(--s3); color: var(--muted); font-size: 12px;
+}
+.ann-zoom-meta { font-variant-numeric: tabular-nums; }
+.ann-zoom-meta b { color: var(--text); font-family: var(--mono); }
+
+.ann-tile figcaption {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s3);
+}
+.ann-tile-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.ann-tile-cam { font-family: var(--mono); font-size: 12px; color: var(--text2); }
+.ann-tile-time { font-size: 12px; color: var(--dim); }
+.ann-tile-actions { display: flex; gap: var(--s2); margin-top: auto; }
+.ann-tile-actions .btn-ghost { flex: 1; }
+
+/* A relabel is a correction, not configuration — it sits on the tile so the
+   fix happens where the mistake is visible. */
+.ann-tile select { width: 100%; font-size: 12.5px; }
+
+/* Kept vs expiring must not look alike at a glance: one is a decision somebody
+   made and has to answer for in the posture report, the other is a countdown. */
+.ann-keep { font-size: 12px; }
+.ann-keep-kept { color: var(--green); }
+.ann-keep-soon { color: var(--yellow); }
+.ann-keep-clock { color: var(--dim); }
+
+@media (max-width: 720px) {
+  .ann-grid { grid-template-columns: 1fr; }
+  .ann-filters .ann-spacer { margin-left: 0; }
+}
+/* ── Heatmap history ─────────────────────────────────────────────────────
+   Small, chronological, and dense enough to answer "what did this floor look
+   like all day" in one glance. Deliberately plainer than the live cards: these
+   are stored pictures nobody is watching change. */
+.hm-views { display: flex; gap: .25rem; margin: 0 0 1rem; }
+.hm-views button { padding: .4rem .9rem; border: 0; border-radius: 6px;
+  background: transparent; cursor: pointer; font: inherit; color: inherit; }
+.hm-views button.is-on { background: var(--surface-2, #eef1f5); font-weight: 600; }
+
+.hm-controls { display: flex; gap: 1.25rem; align-items: flex-end;
+  flex-wrap: wrap; margin-bottom: 1rem; }
+.hm-controls label { display: flex; flex-direction: column; gap: .25rem; }
+.hm-controls input, .hm-controls select { padding: .4rem .5rem; }
+.hm-field { display: flex; flex-direction: column; gap: .25rem; }
+
+/* The heatmap day picker: only days with stored heat can be picked. */
+.hm-dt { position: relative; display: flex; gap: 4px; }
+.hm-dt-date { padding: .4rem .6rem; min-width: 8.5rem; text-align: left;
+  border: 1px solid var(--border2); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text); cursor: pointer; }
+.hm-dt-date:disabled { opacity: .6; cursor: default; }
+.hm-cal { position: absolute; top: calc(100% + 4px); left: 0; z-index: 30; width: 260px;
+  padding: var(--s2); background: var(--surface); color: var(--text);
+  border: 1px solid var(--border2); border-radius: var(--r-md); box-shadow: var(--e2, 0 8px 24px rgba(0,0,0,.25)); }
+.hm-cal-head { display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: var(--s2); font-weight: 600; font-size: 13px; }
+.hm-cal-head button { border: 0; background: none; color: var(--text); font-size: 18px;
+  padding: 0 .5rem; cursor: pointer; border-radius: var(--r-xs); }
+.hm-cal-head button:hover { background: var(--surface2); }
+.hm-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.hm-cal-wd { text-align: center; font-size: 11px; color: var(--dim); padding: 2px 0; }
+.hm-cal-day { aspect-ratio: 1; border: 1px solid transparent; border-radius: var(--r-xs);
+  font-size: 12.5px; background: none; color: var(--text); cursor: pointer; padding: 0; }
+.hm-cal-day.has-heat { background: color-mix(in srgb, var(--accent) 16%, transparent); font-weight: 600; }
+.hm-cal-day.has-heat:hover { background: color-mix(in srgb, var(--accent) 32%, transparent); }
+/* No heat: struck through and dimmed, so "nothing here" reads at a glance. */
+.hm-cal-day.no-heat { color: var(--dim); opacity: .45; text-decoration: line-through; cursor: not-allowed; }
+.hm-cal-day.is-other { opacity: .35; }
+.hm-cal-day.is-today { border-color: var(--border3); }
+.hm-cal-day.is-picked { background: var(--accent); color: #fff; }
+.hm-cal-key { display: flex; gap: var(--s3); margin-top: var(--s2); font-size: 11px; color: var(--dim); }
+.hm-cal-key span { display: inline-flex; align-items: center; gap: 4px; }
+.hm-cal-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.hm-cal-swatch.has-heat { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+.hm-cal-swatch.no-heat { border: 1px solid var(--border2); }
+
+/* Download, on top of any heatmap picture. */
+.hm-save { position: absolute; right: 8px; bottom: 8px; padding: 4px 10px; font-size: 12px;
+  border: 0; border-radius: var(--r-full); background: rgba(0,0,0,.6); color: #fff;
+  cursor: pointer; opacity: .85; }
+.hm-save:hover { opacity: 1; background: rgba(0,0,0,.8); }
+
+.hm-daygroup { margin-bottom: 1.5rem; }
+.hm-daygroup .hm-h { margin: 0 0 .5rem; font-size: .95rem; }
+
+/* A wrapping grid rather than a horizontal scroller: a full day is up to 48
+   tiles, and hiding 40 of them behind a sideways scrollbar is how an operator
+   misses the half hour they were looking for. */
+.hm-strip { display: grid; gap: .75rem;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+
+.hm-thumb { margin: 0; border: 1px solid var(--border, #dfe3e8); border-radius: 8px;
+  overflow: hidden; background: var(--surface, #fff); }
+/* HeatmapImage wraps its <img> in .hm-shot, which is 16/9 and full width.
+   Override there rather than on the img, or the aspect ratio wins and the
+   thumbnails come out card-sized. */
+.hm-thumb .hm-shot { aspect-ratio: auto; height: 96px; }
+.hm-thumb .hm-shot img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.hm-thumb .hm-shot-empty { display: grid; place-items: center; font-size: .7rem; }
+.hm-thumb .hm-shot-empty p { margin: 0; }
+.hm-thumb figcaption { display: flex; align-items: center; justify-content: space-between;
+  gap: .5rem; padding: .35rem .5rem; font-size: .8rem; }
+.hm-time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.btn-sm { padding: .15rem .4rem; font-size: .75rem; }
+
+.hm-finals .hm-thumb { border-color: var(--accent, #d97706); }
+
+/* ── People Distribution ─────────────────────────────────────────────────
+   A table, not a chart: the question is "how many, where", and a number an
+   operator can read at a glance beats a trend line they have to interpret. */
+.pd-zones { width: 100%; border-collapse: collapse; }
+.pd-zones th[scope="row"] { text-align: left; font-weight: 500; padding: .35rem 0; }
+.pd-zones td { text-align: right; padding: .35rem 0; font-variant-numeric: tabular-nums; }
+.pd-zones tr + tr th, .pd-zones tr + tr td { border-top: 1px solid var(--border, #eef1f5); }
+.pd-total th, .pd-total td { border-top: 2px solid var(--border, #dfe3e8) !important;
+  padding-top: .5rem; font-size: 1.05em; }
+.pd-dwell { font-size: .85em; }
+.pd-day thead th { text-align: right; font-size: .8rem; text-transform: uppercase;
+  letter-spacing: .04em; padding-bottom: .35rem; }
+.pd-day thead th:first-child { text-align: left; }
+.pd-hours td, .pd-hours th[scope="col"] { text-align: right; }
+.pd-hours th[scope="row"] { font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Feed filter on the recent-detections panel. Sits in the panel head, so it
+   reads as scoping that panel rather than the page — which it does: the tiles
+   and charts above are never narrowed by it. */
+.aid-feed-tabs { display: flex; gap: var(--s1); flex-wrap: wrap; }
+/* "customised" chip on the wall header: this browser overrides part of the admin's default wall */
+.wall-custom { font-size: 10.5px; padding: 2px 8px; border-radius: 999px; color: var(--muted); border: 1px dashed var(--border2); }
+.wall-set-row .wall-cust { font-size: 10.5px; color: var(--accent); cursor: pointer; background: none; border: none; padding: 0; text-align: right; }
+.wall-scope { font-size: 12px; color: var(--muted); padding: 8px 10px; border-radius: var(--r-md);
+  border: 1px solid var(--border); background: var(--surface2); margin-bottom: 14px; }
+/* ⚙ panel live preview: a miniature wall per theme, side by side */
+.wall-preview-row { position: sticky; top: -16px; z-index: 2; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  padding: 8px 0 12px; margin-bottom: 6px; background: var(--raised, var(--surface)); }
+.wall-preview { border: 1px solid var(--border); border-radius: var(--r-md); padding: 6px; min-width: 0; }
+.wall-preview.on { border-color: var(--accent); }
+.wall-preview-cap { font-size: 10.5px; color: var(--muted); margin-bottom: 5px; }
+.wall-preview-pad { background: repeating-linear-gradient(45deg, rgba(148,163,184,.28) 0 3px, transparent 3px 7px); }
+
+/* Camera filter chips (components/CameraFilterBar.tsx) — Live grid rail + Cameras inventory. */
+.cf-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s4); margin-bottom: var(--s4); }
+.cf-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.cf-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.cf-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.cf-chip { min-height: 26px; padding: 0 10px; font-size: 12px; gap: 6px; }
+.cf-n { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 11px; }
+.cf-chip.active .cf-n { color: inherit; }
+.cf-compact { flex-direction: column; align-items: stretch; gap: var(--s2); }
+.cf-compact .cf-row { flex-direction: column; align-items: flex-start; gap: 4px; }
+.cf-compact .cf-clear { align-self: flex-start; }
+
+/* PTZ presets as cards (PtzTab): picture, name, Home, "here now", missing-on-camera. */
+.ptz-preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.ptz-preset-card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface2); }
+.ptz-preset-card.at { border-color: var(--accent2); box-shadow: 0 0 0 1px var(--accent2); }
+.ptz-preset-card.missing { opacity: .7; border-style: dashed; }
+.ptz-preset-thumb { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9; padding: 0; border: 0;
+  background: #0a0e13; cursor: pointer; }
+.ptz-preset-thumb:disabled { cursor: default; }
+.ptz-preset-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ptz-preset-nopic { color: var(--dim); font-size: 11px; }
+.ptz-preset-here { position: absolute; left: 6px; bottom: 6px; background: rgba(0,0,0,.65); color: #fff;
+  font-size: 10.5px; padding: 2px 6px; border-radius: 4px; }
+.ptz-preset-meta { padding: 6px 8px 8px; display: flex; flex-direction: column; gap: 4px; }
+.ptz-preset-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.btn-xs { padding: 1px 6px !important; font-size: 10.5px !important; line-height: 1.6 !important; }
+.ptz-section { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--border); }
+/* Where a PTZ camera points, on the live tile / focus view ("📍 Gate", "Moving…"). */
+.ptz-pos-badge { background: rgba(0,0,0,.6); color: #fff; font-size: 10.5px; padding: 2px 7px; border-radius: 4px;
+  white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.ptz-pos-badge.off { color: #fbbf24; }
+/* PTZ tab: a big live picture to aim with, controls beside it (stack on narrow screens). */
+.ptz-stage { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 20px; align-items: start; margin-bottom: 22px; }
+.ptz-live { position: relative; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden; background: #0a0e13;
+  border: 1px solid var(--border); max-height: 70vh; }
+.ptz-live-badge { position: absolute; left: 12px; top: 12px; z-index: 3; pointer-events: none; }
+/* One live picture for every PTZ sub-tab (PtzTab): Control = picture + 250px pad column; Presets / Patrols /
+   Calibration = picture left (sticky while the list scrolls) + panel right; History = panel only unless "Show live". */
+.ptz-stage.ptz-split { grid-template-columns: minmax(0, 11fr) minmax(0, 9fr); }
+.ptz-stage.ptz-nolive { grid-template-columns: minmax(0, 1fr); }
+.ptz-split .ptz-live-col { position: sticky; top: 12px; }
+.ptz-side { min-width: 0; overflow-x: auto; }
+.ptz-mini { display: flex; gap: 14px; align-items: flex-start; margin-top: 10px; }
+.ptz-paused { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 20px;
+  text-align: center; color: #8aa0b4; font-size: 12px; }
+.ptz-peek { position: absolute; right: 10px; bottom: 10px; z-index: 3; width: 32%; max-width: 280px; pointer-events: none;
+  border: 2px solid var(--accent2); border-radius: 8px; overflow: hidden; background: #0a0e13; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+.ptz-peek img { display: block; width: 100%; }
+.ptz-peek span { position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 7px; font-size: 11px; color: #fff;
+  background: rgba(0,0,0,.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 900px) { .ptz-stage, .ptz-stage.ptz-split { grid-template-columns: minmax(0, 1fr); }
+  .ptz-split .ptz-live-col { position: static; } }
+/* Lists with toolbars + paging (PTZ presets / history / patrol log / PTZ page). */
+.pager { display: flex; align-items: center; gap: 6px; justify-content: flex-end; margin-top: 10px; }
+.pager-note { font-size: 11.5px; color: var(--dim); margin-right: 6px; }
+.list-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.list-toolbar input[type="search"], .list-toolbar input[type="text"] { width: 220px; }
+.list-toolbar select { max-width: 200px; }
+.chip-toggle { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 999px; font-size: 11.5px;
+  border: 1px solid var(--border2); background: var(--surface2); color: var(--text2); cursor: pointer; user-select: none; }
+.chip-toggle.on { border-color: var(--accentEdge); color: var(--accent2); background: var(--accentRing); }
+.subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; flex-wrap: wrap; }
+.subtabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 7px 12px; font-size: 12.5px;
+  color: var(--muted); cursor: pointer; }
+.subtabs button.on { color: var(--text); border-bottom-color: var(--accent2); font-weight: 600; }
+.split-bar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--surface2); margin: 6px 0; }
+.split-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11.5px; color: var(--text2); }
+.split-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.ptz-preset-list td, .ptz-preset-list th { vertical-align: middle; }
+.ptz-preset-list tr.dragging { opacity: .4; }
+.ptz-preset-list .drag { cursor: grab; color: var(--dim); }
+
+/* ── Event integrations ──────────────────────────────────────────────────────
+   Destinations are a status board: what each one targets, whether it is
+   delivering, and the switch, on one row. Site-wide settings live on their own
+   tab. Only system tokens are used, so light and dark themes follow. */
+.ei-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s4); margin-bottom: var(--s4); }
+.ei-title { font-size: 18px; font-weight: 600; letter-spacing: -.015em; margin: 0 0 2px; }
+.ei-gap { margin-bottom: var(--s4); }
+
+.ei-list { list-style: none; margin: 0; padding: 0; }
+.ei-dest { padding: var(--s4) var(--s5); border-bottom: 1px solid var(--border); }
+.ei-dest:last-child { border-bottom: none; }
+.ei-dest-main {
+  display: grid; align-items: center; gap: var(--s4);
+  /* Fixed tracks: every row's badge, numbers and switch line up down the list. */
+  grid-template-columns: 36px minmax(0, 1fr) 128px 230px 36px;
+}
+.ei-kind {
+  width: 36px; height: 36px; border-radius: var(--r-md); flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface2); border: 1px solid var(--border); color: var(--accent2);
+}
+.ei-dest-main > .badge { justify-self: start; }
+.ei-dest-name { display: flex; flex-direction: column; min-width: 0; }
+.ei-dest-name strong { font-size: 14.5px; font-weight: 600; letter-spacing: -.01em; }
+.ei-dest-name span { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ei-dest-stats { display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: var(--text2); text-align: right; font-variant-numeric: tabular-nums; }
+.ei-dest-stats .ei-last { font-size: 12px; color: var(--dim); }
+.ei-dest-stats b { font-weight: 600; color: var(--text); }
+.ei-dest-error {
+  margin: var(--s3) 0 0 calc(36px + var(--s4)); padding: var(--s2) var(--s3);
+  font-size: 12.5px; line-height: 1.5; color: var(--red);
+  background: var(--redSoft); border-radius: var(--r-sm); overflow-wrap: anywhere;
+}
+.ei-dest-actions {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2);
+  margin: var(--s3) 0 0 calc(36px + var(--s4));
+}
+.ei-dest-actions [role="status"] { font-size: 12.5px; }
+.ei-dest-actions .ei-push { margin-left: auto; display: flex; gap: var(--s2); }
+.ei-ok { color: var(--green); }
+.ei-bad { color: var(--red); }
+.btn-ghost.ei-danger { color: var(--red); }
+.btn-ghost.ei-danger:hover:not(:disabled) { border-color: color-mix(in srgb, var(--red) 40%, transparent); color: var(--red); }
+.ei-select-sm { width: auto; max-width: 260px; min-height: 30px; padding-top: 3px; padding-bottom: 3px; font-size: 13px; }
+
+/* A switch: the checkbox itself, so labels, focus and tests stay native. Scoped
+   above the app's own input[type="checkbox"] so its tick never shows. */
+input[type="checkbox"].ei-switch {
+  flex-shrink: 0; width: 36px; min-width: 36px; height: 20px; padding: 0; margin: 0;
+  border: none; border-radius: var(--r-full); background: var(--n5);
+  transition: background var(--base) var(--ease);
+}
+input[type="checkbox"].ei-switch::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border: none; border-radius: 50%; background: #fff; box-shadow: var(--e1);
+  transform: none; transition: transform var(--base) var(--ease-out);
+}
+input[type="checkbox"].ei-switch:checked { background: var(--accent); }
+input[type="checkbox"].ei-switch:checked::after { left: 2px; top: 2px; width: 16px; height: 16px; border: none; transform: translateX(16px); }
+input[type="checkbox"].ei-switch:hover:not(:disabled) { background: var(--n6); }
+input[type="checkbox"].ei-switch:checked:hover:not(:disabled) { background: var(--accent-hi); }
+input[type="checkbox"].ei-switch:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accentRing); }
+
+.ei-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.ei-muted { color: var(--muted); font-size: 13px; }
+.ei-nowrap { white-space: nowrap; }
+.ei-num { font-variant-numeric: tabular-nums; }
+.ei-detail { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); font-size: 13px; }
+.ei-row-actions { white-space: nowrap; text-align: right; }
+.ei-row-actions button + button { margin-left: var(--s2); }
+
+.ei-setting {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s5);
+  padding: var(--s4) var(--s5); border-bottom: 1px solid var(--border);
+}
+.ei-setting:last-child { border-bottom: none; }
+.ei-setting > div { display: flex; flex-direction: column; gap: 2px; max-width: 72ch; }
+.ei-setting b { font-size: 14px; font-weight: 600; }
+/* Description lines only — a blanket `span` rule also greyed the status badges. */
+.ei-setting > div > span { font-size: 13px; color: var(--muted); line-height: 1.55; }
+.ei-endpoints { margin-top: var(--s2); color: var(--text2) !important; }
+.ei-endpoints code, .ei-setting code {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r-xs); padding: 1px 5px; font-size: 12px; font-family: var(--mono);
+}
+.ei-inline { display: flex; gap: var(--s2); align-items: center; }
+.ei-inline input { flex: 1; min-width: 0; }
+.ei-inline button { flex-shrink: 0; }
+
+/* Modals */
+.ei-modal-foot { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); width: 100%; }
+.ei-modal-foot .hint { margin: 0 auto 0 0; }
+.ei-modal-foot .ei-left { margin-right: auto; }
+.ei-kinds { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s2); margin-bottom: var(--s5); }
+.wz-method.tile-btn {
+  display: flex; flex-direction: column; align-items: flex-start; min-width: 0;
+  text-align: left; white-space: normal; padding: var(--s3) var(--s4); font: inherit; color: inherit; height: auto;
+}
+.wz-method.tile-btn .wz-mi { width: 32px; height: 32px; margin-bottom: var(--s2); }
+.ei-kind-line { display: flex; align-items: center; gap: var(--s3); font-weight: 600; margin: 0 0 var(--s4); }
+.ei-section {
+  font-size: 13.5px; font-weight: 600; color: var(--text);
+  margin: var(--s5) 0 var(--s3); padding-top: var(--s4); border-top: 1px solid var(--border);
+}
+.form-grid > .full, .form-grid > .ei-span { grid-column: 1 / -1; }
+.ei-check { display: flex; align-items: center; gap: var(--s2); font-size: 13.5px; color: var(--text2); margin: var(--s2) 0; cursor: pointer; }
+.ei-align { align-self: end; margin-bottom: 10px; }
+.ei-advanced { margin-top: var(--s4); border: 1px solid var(--border); border-radius: var(--r-md); padding: 0 var(--s4); }
+.ei-advanced > summary { cursor: pointer; padding: var(--s3) 0; font-size: 13.5px; font-weight: 500; color: var(--text2); }
+.ei-advanced[open] { padding-bottom: var(--s4); }
+.ei-fieldset { border: none; padding: 0; margin: var(--s5) 0 var(--s4); }
+.ei-fieldset legend { font-size: 13.5px; font-weight: 600; padding: 0; margin-bottom: var(--s3); }
+.ei-chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+input[type="checkbox"].ei-chip-box { position: absolute; opacity: 0; width: 1px; min-width: 0; height: 1px; pointer-events: none; }
+.chip:has(.ei-chip-box:focus-visible) { box-shadow: 0 0 0 3px var(--accentRing); }
+.ei-filters { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s3); }
+.ei-filters select[multiple] { padding: 4px; background-image: none; }
+.ei-narrow { max-width: 760px; }
+
+@media (max-width: 900px) {
+  .ei-dest-main { grid-template-columns: 36px minmax(0, 1fr) auto; }
+  .ei-dest-main > .badge { grid-column: 2; justify-self: start; }
+  .ei-dest-stats { grid-column: 2 / -1; text-align: left; }
+  .ei-dest-main > .ei-switch { grid-row: 1; grid-column: 3; }
+  .ei-kinds, .ei-filters { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 560px) {
+  .ei-kinds, .ei-filters, .ei .form-grid, .modal .form-grid { grid-template-columns: 1fr; }
+  .ei-dest-error, .ei-dest-actions { margin-left: 0; }
+  .ei-head { flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) { input[type="checkbox"].ei-switch, input[type="checkbox"].ei-switch::after { transition: none; } }
+
+/* ── Event subscription popup (es-) ──────────────────────────────────────────
+   Read top to bottom as a sentence: send to → which events → from which
+   cameras → repeats → name. An event group reveals only its own filters. */
+.es-intro { font-size: 13.5px; color: var(--muted); line-height: 1.55; margin: 0 0 var(--s2); }
+.es-h { display: block; font-size: 13.5px; font-weight: 600; color: var(--text); margin: var(--s5) 0 var(--s2); }
+label > .es-h { margin-bottom: 0; }
+.es-first > .es-h { margin-top: var(--s4); }
+.es-groups { display: flex; flex-direction: column; gap: var(--s2); }
+.es-group {
+  border: 1px solid var(--border2); border-radius: var(--r-lg); background: var(--surface);
+  transition: border-color var(--base) var(--ease), background var(--base) var(--ease);
+}
+.es-group.on { border-color: var(--accentEdge); background: color-mix(in srgb, var(--accentSoft) 45%, var(--surface)); }
+.es-group-head { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s3) var(--s4); cursor: pointer; }
+.es-group-head input { margin-top: 2px; }
+.es-group-head > span { display: flex; flex-direction: column; gap: 2px; }
+.es-group-head b { font-size: 14px; font-weight: 600; color: var(--text); }
+.es-group-head > span > span { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+.es-group-body {
+  display: flex; flex-direction: column; gap: var(--s3);
+  padding: var(--s3) var(--s4) var(--s4) calc(var(--s4) + 16px + var(--s3));
+  border-top: 1px solid var(--border);
+}
+.es-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); }
+.es-radio { display: inline-flex; align-items: center; gap: var(--s2); font-size: 13.5px; color: var(--text2); cursor: pointer; }
+.es-radio input[type="radio"] { width: 16px; height: 16px; min-height: 0; margin: 0; }
+.es-scope { display: flex; flex-direction: column; gap: var(--s2); }
+.es-scope-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s5); }
+.es-scope-label { font-size: 13px; font-weight: 500; color: var(--text2); min-width: 72px; }
+.es-pick { display: flex; flex-direction: column; gap: var(--s2); }
+.es-search { max-width: 280px; }
+.es-pick-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0 var(--s4);
+  max-height: 188px; overflow-y: auto; padding: var(--s1) var(--s3);
+  border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface);
+}
+.es-pick-list .ei-check { margin: 6px 0; }
+.es-narrow { max-width: 420px; }
+.es-narrow input[type="number"] { max-width: 120px; }
+.es-unit { font-size: 13.5px; color: var(--muted); }
+.es-summary { margin-right: auto; font-size: 13px; color: var(--text2); line-height: 1.45; }
+@media (max-width: 560px) {
+  .es-group-body { padding-left: var(--s4); }
+  .es-pick-list { grid-template-columns: 1fr; }
+}
+
+/* ── Query interpretation (qi-) ─────────────────────────────────────────────
+   Model → features → limits, with each feature's readiness in the header and
+   one save bar at the bottom. Reuses the event-integrations switch and rows. */
+/* Each feature's status sits beside its name, on the row with its switch. */
+.qi-feature { display: inline-flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.ei-setting .qi-feature .badge { font-size: 12px; font-weight: 500; }
+.qi-providers { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s2); margin-bottom: var(--s5); }
+.qi-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s3); margin-top: var(--s4); }
+.qi-actions .hint { margin: 0; }
+.ei-setting .qi-actions { margin-top: var(--s3); }
+.qi-result { margin: var(--s3) 0 0; font-size: 13px; line-height: 1.5; }
+.qi-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s5) var(--s6); max-width: 900px; }
+.qi-limits input[type="number"] { max-width: 120px; }
+.qi-savebar {
+  z-index: 2;
+  display: flex; align-items: center; justify-content: flex-end; gap: var(--s3);
+  padding: var(--s3) var(--s5); margin-top: var(--s2);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--e1);
+}
+.qi-savebar > [role="status"] { margin-right: auto; font-size: 13px; }
+/* Not sticky: a pinned bar covered the test results just above it. The header
+   badges already say "Save to apply"; the bar itself lights up when dirty. */
+.qi-savebar.dirty { border-color: var(--accentEdge); background: color-mix(in srgb, var(--accentSoft) 50%, var(--surface)); }
+@media (max-width: 760px) {
+  .qi-providers, .qi-limits { grid-template-columns: 1fr; }
+}
+
+/* ── People Distribution charts ─────────────────────────────────────────── */
+.pd-live { margin-bottom: var(--s4); }
+.pd-chart { margin-bottom: var(--s4); padding: var(--s4) var(--s5); }
+.pd-chart-head { display: flex; justify-content: space-between; align-items: flex-start;
+  gap: var(--s3); flex-wrap: wrap; margin-bottom: var(--s2); }
+.pd-chart-note { margin: .15rem 0 0; font-size: 12px; max-width: 60ch; }
+.pd-seg { flex-wrap: wrap; }
+.pd-plot { position: relative; }
+.pd-plot .ch-legend { margin-bottom: var(--s2); }
+.pd-skel { height: 260px; }
+.pd-foot { font-size: 12px; }
+
+/* ── Heatmap: any period ───────────────────────────────────────────────── */
+.hm-range { margin-bottom: 0; }
+.hm-range-controls { flex-wrap: wrap; padding: var(--s3) var(--s4); margin: 0; }
+.hm-live-toggle { align-items: center; }
+.hm-live-toggle input { width: 18px; height: 18px; }
+.hm-range-shot img { cursor: zoom-in; }
+.hm-cards-title { margin: var(--s2) 0 0; }
+.hm-card-selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+.hm-pick { cursor: pointer; }
+.hm-toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: var(--s3); flex-wrap: wrap; }

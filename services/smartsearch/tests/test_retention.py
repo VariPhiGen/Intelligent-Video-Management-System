@@ -1,6 +1,6 @@
 """Unit tests for the retention sweep (index/retention.py).
 
-`retention_days` stamps `expires_at` on every row at insert, and until the
+`retention_minutes` stamps `expires_at` on every row at insert, and until the
 thread existed nothing ever acted on it: no cron entry, no sidecar, no thread —
 so the index and crop directory grew without bound on a service whose own plan
 named storage as the binding constraint. It had not bitten only because the

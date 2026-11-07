@@ -287,13 +287,14 @@ Every 30 seconds:
 ## 7. RetentionManager
 
 ```
-Thread: retention   interval: 3600 s (1 hour)
+Thread: retention   interval: shortest retention ÷ 4, clamped to [60 s, 3600 s]
+                    (re-read after every pass — retention is edited at runtime)
 
 run_once():
   │
   ├─ SEGMENT RETENTION (per camera)
   │   for each camera in config["cameras"]:
-  │     cutoff = now - retention_days × 86400
+  │     cutoff = now - retention_minutes × 60
   │     filepaths = index.delete_before(camera, cutoff)
   │       SQL: SELECT filepath WHERE camera=? AND (start_epoch+duration) < ?
   │            DELETE WHERE camera=? AND (start_epoch+duration) < ?

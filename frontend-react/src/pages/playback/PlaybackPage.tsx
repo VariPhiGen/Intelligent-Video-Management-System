@@ -4,11 +4,12 @@
  * (recLoad), the single timeline player (pb-view) and the synced multi-camera
  * player (pm-view). ?cam=<slug> deep-links straight into the single player.
  */
+import { ViewTransition } from '@/components/ViewTransition';
 import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { apiFetch } from '@/lib/api';
 import { useCameras } from '@/lib/cameras';
-import type { NvrCamera } from './coverage';
+import { isStalled, type NvrCamera } from './coverage';
 import { MultiPlayer } from './MultiPlayer';
 import { SinglePlayer } from './SinglePlayer';
 
@@ -87,16 +88,16 @@ export function PlaybackPage() {
   const regName = (n: string) => cameras.find(c => c.slug === n)?.name || n;
 
   return (
-    <div className="fade">
+    <ViewTransition view={tab}>
       {/* The page title lives in the topbar (matching Live View) — no duplicate
           heading above the tabs. */}
       <div className="tabs page-tabs">
-        <div className={`tab${tab === 'single' ? ' active' : ''}`} onClick={() => switchTab('single')}>
+        <button type="button" aria-pressed={tab === 'single'} className={`tab${tab === 'single' ? ' active' : ''}`} onClick={() => switchTab('single')}>
           Playback
-        </div>
-        <div className={`tab${tab === 'multi' ? ' active' : ''}`} onClick={() => switchTab('multi')}>
+        </button>
+        <button type="button" aria-pressed={tab === 'multi'} className={`tab${tab === 'multi' ? ' active' : ''}`} onClick={() => switchTab('multi')}>
           Multi-camera playback
-        </div>
+        </button>
         {/* Roadmap tab — badge it visibly rather than hiding the status in a
             hover title, matching the Map and camera-config tab rows. */}
         <div className="tab disabled" title="Incident cases are not available yet">
@@ -125,8 +126,13 @@ export function PlaybackPage() {
             {!nvrErr && !loading && !!nvrCams.length && (
               <div className="panel-actions">
                 <span className="badge badge-green">
-                  <span className="badge-dot" />{nvrCams.filter(c => c.recording).length} recording
+                  <span className="badge-dot" />{nvrCams.filter(c => c.recording && !isStalled(c)).length} recording
                 </span>
+                {nvrCams.some(c => isStalled(c)) && (
+                  <span className="badge badge-yellow" style={{ marginLeft: 6 }}>
+                    <span className="badge-dot" />{nvrCams.filter(c => isStalled(c)).length} stalled
+                  </span>
+                )}
               </div>
             )}
           </div>
@@ -178,9 +184,13 @@ export function PlaybackPage() {
                       <code style={{ fontSize: 10.5, color: 'var(--dim)' }}>{c.name}</code>
                     </td>
                     <td>
-                      {c.recording
-                        ? <span className="badge badge-green badge-live"><span className="badge-dot" />Recording</span>
-                        : <span className="badge badge-gray"><span className="badge-dot" />Stopped</span>}
+                      {!c.recording
+                        ? <span className="badge badge-gray"><span className="badge-dot" />Stopped</span>
+                        : isStalled(c)
+                          ? <span className="badge badge-yellow" title="Recording is on, but no new footage has arrived in over 10 minutes — check the camera's connection">
+                              <span className="badge-dot" />No new footage
+                            </span>
+                          : <span className="badge badge-green badge-live"><span className="badge-dot" />Recording</span>}
                     </td>
                     <td style={{ color: 'var(--muted)', fontSize: 12.5 }}>{recFmtTs(c.earliest)}</td>
                     <td style={{ color: 'var(--muted)', fontSize: 12.5 }}>{recFmtTs(c.latest)}</td>
@@ -196,6 +206,6 @@ export function PlaybackPage() {
           </div>
         </div>
       )}
-    </div>
+    </ViewTransition>
   );
 }

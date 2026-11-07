@@ -9,10 +9,11 @@
  *   • a camera can leave the searchable set while it is selected, and holding
  *     the stale slug turns the next search into a 404, so it is reset.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { ApiError } from '@/lib/api';
+import { naturalSearch, plannerStatus, type PlannerStatus } from '@/lib/searchPlanner';
 import {
   indexStats, searchPeople, searchVehicles, searchableCameras, summariseWithheld,
   type DomainStats, type PersonHit, type SearchCamera, type SortBy, type SortDir,
@@ -29,7 +30,30 @@ export interface Outcome<T> {
   truncated: boolean;
 }
 
+const INTERPRET_PREF = 'vms.smartsearch.interpret';
+
 export function useSmartSearch() {
+  const [planner, setPlanner] = useState<PlannerStatus | null>(null);
+  // The operator's own choice, kept across visits and across an admin saving
+  // the planner settings. Interpretation is on by default once an admin has
+  // enabled and tested a planner; it only applies while the planner is ready.
+  const [interpretChoice, setInterpretChoice] = useState(() => {
+    try { return localStorage.getItem(INTERPRET_PREF) !== 'off'; } catch { return true; }
+  });
+  const interpret = !!planner?.ready && interpretChoice;
+  const setInterpret = useCallback((on: boolean) => {
+    setInterpretChoice(on);
+    try { localStorage.setItem(INTERPRET_PREF, on ? 'on' : 'off'); } catch { /* private mode */ }
+  }, []);
+  const [appliedSummary, setAppliedSummary] = useState('');
+  const [clarification, setClarification] = useState('');
+  const requestId = useRef(0);
+  const pending = useRef<AbortController | null>(null);
+  const refreshPlanner = useCallback(() => {
+    plannerStatus().then(setPlanner).catch(() => {});
+  }, []);
+  useEffect(() => { refreshPlanner(); }, [refreshPlanner]);
+  useEffect(() => () => { requestId.current++; pending.current?.abort(); }, []);
   // Deep-link seed (e.g. #/smartsearch?q=<subject>&mode=people). Read once on
   // mount; local state after.
   const [sp] = useSearchParams();
@@ -123,19 +147,45 @@ export function useSmartSearch() {
   const run = useCallback(async () => {
     const q = query.trim();
     if (!q) return;
+    pending.current?.abort();
+    const id = ++requestId.current;
+    const controller = new AbortController(); pending.current = controller;
     setBusy(true);
     setErr(null);
+    setAppliedSummary(''); setClarification('');
     try {
-      if (mode === 'people') {
-        setPeople(await searchPeople({
+      if (interpret) {
+        const result = await naturalSearch({
+          query: q, domain: mode, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          camera: camSlug || null,
+          time_from: timeFrom ? new Date(timeFrom).toISOString() : null,
+          time_to: timeTo ? new Date(timeTo).toISOString() : null,
+          top_k: topK, score_threshold: threshold, sort_by: sortBy, sort_dir: sortDir,
+          plate: mode === 'vehicles' ? plate.trim().toUpperCase() || null : null,
+          vehicle_type: mode === 'vehicles' ? vehType || null : null,
+          color: mode === 'vehicles' ? colour || null : null,
+        }, controller.signal);
+        if (id !== requestId.current) return;
+        if (result.status !== 'results') {
+          setPeople(null); setVehicles(null);
+          setClarification(result.message + (result.choices?.length ? ' Choices: ' + result.choices.join(', ') : ''));
+          return;
+        }
+        setAppliedSummary(result.summary);
+        if (result.domain === 'people') setPeople(result.outcome as Outcome<PersonHit>);
+        else setVehicles(result.outcome as Outcome<VehicleHit>);
+      } else if (mode === 'people') {
+        const result = await searchPeople({
           query: q, top_k: topK, score_threshold: threshold,
           camera: camSlug || null,
           time_from: timeFrom ? new Date(timeFrom).toISOString() : null,
           time_to: timeTo ? new Date(timeTo).toISOString() : null,
           sort_by: sortBy, sort_dir: sortDir,
-        }));
+        });
+        if (id !== requestId.current) return;
+        setPeople(result);
       } else {
-        setVehicles(await searchVehicles({
+        const result = await searchVehicles({
           query: q, top_k: topK, score_threshold: threshold,
           plate: plate.trim().toUpperCase() || null,
           vehicle_type: vehType || null,
@@ -146,22 +196,31 @@ export function useSmartSearch() {
           time_from: timeFrom ? new Date(timeFrom).toISOString() : null,
           time_to: timeTo ? new Date(timeTo).toISOString() : null,
           sort_by: sortBy, sort_dir: sortDir,
-        }));
+        });
+        if (id !== requestId.current) return;
+        setVehicles(result);
       }
       setReachable(true);
       setPage(0);
     } catch (e) {
+      if (id !== requestId.current || controller.signal.aborted) return;
       setErr(e instanceof ApiError ? e.message : 'Search failed.');
       // 502 is the backend saying the index did not answer; anything else is a
       // bad query or a permission problem, and the index is fine.
-      if (e instanceof ApiError && e.status === 502) setReachable(false);
+      const plannerFailure = e instanceof ApiError && e.detail?.code === 'planner_unavailable';
+      if (e instanceof ApiError && e.status === 502 && !plannerFailure) setReachable(false);
       // 503 is the backend saying no index is deployed here.
-      if (e instanceof ApiError && e.status === 503) { setReachable(false); setConfigured(false); }
+      if (e instanceof ApiError && e.status === 503 && !plannerFailure) { setReachable(false); setConfigured(false); }
     } finally {
-      setBusy(false);
+      if (id === requestId.current) setBusy(false);
     }
   }, [mode, query, topK, threshold, camSlug, timeFrom, timeTo, plate, vehType, colour,
-      sortBy, sortDir]);
+      sortBy, sortDir, interpret]);
+
+  useEffect(() => {
+    requestId.current++; pending.current?.abort(); setBusy(false);
+    setAppliedSummary(''); setClarification('');
+  }, [mode, query, camSlug, timeFrom, timeTo, interpret, plate, vehType, colour, topK, threshold, sortBy, sortDir]);
 
   const switchMode = (m: Mode) => {
     if (m === mode) return;
@@ -191,5 +250,6 @@ export function useSmartSearch() {
     busy, err, stats, reachable, configured,
     page, setPage,
     run,
+    planner, interpret, setInterpret, appliedSummary, clarification, refreshPlanner,
   };
 }

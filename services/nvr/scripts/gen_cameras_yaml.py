@@ -83,12 +83,13 @@ def yaml_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def render_yaml(cameras: list[tuple[str, str]], retention_days: int = 2) -> str:
+def render_yaml(cameras: list[tuple[str, str]],
+                retention_minutes: int = 2 * 1440) -> str:
     out: list[str] = ["cameras:"]
     for name, url in cameras:
         out.append(f"  - name: {yaml_quote(name)}")
         out.append(f"    rtsp_url: {yaml_quote(url)}")
-        out.append(f"    retention_days: {retention_days}")
+        out.append(f"    retention_minutes: {retention_minutes}")
         out.append("")
     out.append("recording:")
     out.append("  segment_duration: 60")
@@ -111,8 +112,20 @@ def main() -> int:
     ap.add_argument("--server", required=True, choices=["s110", "s100", "s139", "s113"])
     ap.add_argument("--inventory", default=str(repo_root / "CAMERA_INVENTORY.md"))
     ap.add_argument("--output", default=str(repo_root / "config" / "cameras.yaml"))
-    ap.add_argument("--retention-days", type=int, default=2)
+    # Both spellings, minutes canonical. --retention-days stays because every
+    # runbook and shell history on these boxes uses it.
+    ap.add_argument("--retention-minutes", type=int, default=None)
+    ap.add_argument("--retention-days", type=int, default=None)
     args = ap.parse_args()
+    if args.retention_minutes is not None and args.retention_days is not None:
+        print("error: pass --retention-minutes or --retention-days, not both",
+              file=sys.stderr)
+        return 1
+    retention_minutes = (
+        args.retention_minutes if args.retention_minutes is not None
+        else (args.retention_days * 1440) if args.retention_days is not None
+        else 2 * 1440
+    )
 
     inv_path = Path(args.inventory)
     if not inv_path.exists():
@@ -124,7 +137,7 @@ def main() -> int:
         print(f"error: no cameras found for server '{args.server}' in {inv_path}", file=sys.stderr)
         return 1
 
-    yaml_text = render_yaml(cameras, args.retention_days)
+    yaml_text = render_yaml(cameras, retention_minutes)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(yaml_text)

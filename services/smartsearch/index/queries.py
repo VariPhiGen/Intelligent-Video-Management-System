@@ -511,7 +511,7 @@ class QueryService:
             where.append("ts >= %(frm)s")
             params["frm"] = frm
         if to is not None:
-            where.append("ts <= %(to)s")
+            where.append("ts < %(to)s")
             params["to"] = to
 
         # OLDEST FIRST IS BOUNDED TO 30 DAYS. Newest-first walks outward from
@@ -609,7 +609,7 @@ class QueryService:
             where.append("ts >= %(frm)s")
             params["frm"] = frm
         if (to := _parse_when(time_to)) is not None:
-            where.append("ts <= %(to)s")
+            where.append("ts < %(to)s")
             params["to"] = to
         if min_width_px > 0:
             where.append("face_width_px >= %(minw)s")

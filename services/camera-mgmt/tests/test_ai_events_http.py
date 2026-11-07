@@ -26,7 +26,7 @@ KEY = {"X-Internal-Key": "test-internal-key"}
 URL = "/api/analytics/events"
 
 GATE = SimpleNamespace(
-    id=uuid.uuid4(), slug="gate-a1b2", name="Gate", enabled=True, retention_days=None,
+    id=uuid.uuid4(), slug="gate-a1b2", name="Gate", enabled=True, retention_minutes=None,
     analytics_config={
         "regions": {"region_1": {"kind": "zone", "name": "Zone 1", "color": "#4fd1c5",
                                  "points": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]]}},
@@ -77,9 +77,12 @@ async def test_ingest_refuses_a_signed_in_user_even_an_admin(client, mint):
 async def test_the_pipeline_stores_events_only_for_configured_activities(client, monkeypatch):
     stored = []
 
-    async def record(db, rows):
+    async def record(db, rows, **kwargs):
         stored.extend(rows)
-        return {"inserted": len(rows), "closed": 0, "duplicates": 0}
+        # Mirrors the real signature: counts for the response, and the rows
+        # that were genuinely new for the rule engine to fire on.
+        return ai_events.RecordResult(
+            {"inserted": len(rows), "closed": 0, "duplicates": 0}, list(rows))
 
     monkeypatch.setattr(ai_events, "record", record)
     r = await client.post(URL, headers=KEY, json={"events": [

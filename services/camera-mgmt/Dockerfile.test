@@ -1,0 +1,19 @@
+# Test runner for camera-mgmt: the dependencies only, no source.
+#
+# The source is mounted at run time, so editing code never needs a rebuild —
+# only a change to requirements.txt does. Built and run with host networking
+# because bridge networking does not work on the Jetson (no iptables `raw`
+# table in its kernel); the tests themselves open no connections.
+#
+#   docker build --network host -f Dockerfile.test -t vms-camera-mgmt-test .
+#   docker run --rm --network host -v "$PWD":/src:ro vms-camera-mgmt-test \
+#       python -m pytest -q -p no:cacheprovider tests/test_bridge_ha.py
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_ROOT_USER_ACTION=ignore
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --timeout 120 --retries 10 -r /tmp/requirements.txt \
+        pytest pytest-asyncio
+
+WORKDIR /src

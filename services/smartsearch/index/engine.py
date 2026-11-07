@@ -60,7 +60,7 @@ class CameraEntry:
     #: appliance default. Pushed by the registry from the camera's recording
     #: retention so the index cannot outlive the footage it describes — see
     #: Store.set_camera_retention for why this has to restamp existing rows.
-    retention_days: int | None = None
+    retention_minutes: int | None = None
     added_at: float = field(default_factory=time.time)
 
     def to_dict(self, ingest_state: str = "", ingest_error: Optional[str] = None,
@@ -82,7 +82,7 @@ class CameraEntry:
             # Reported so the registry's reconcile pass can see drift. Without
             # it a retention change whose push failed would heal only on the
             # next restart, which is the failure mode reconcile exists for.
-            "retention_days": self.retention_days,
+            "retention_minutes": self.retention_minutes,
             "state": ("REGISTERED_NO_INGEST"
                       if (ingest_state in (DISABLED, UNAVAILABLE) or ingest_error)
                       else "RECEIVING"),
@@ -259,7 +259,7 @@ class IndexEngine:
     # ── registry ─────────────────────────────────────────────────────────────
     def add_camera(self, slug: str, rtsp_url: str,
                    domains: tuple[str, ...] = DEFAULT_DOMAINS,
-                   retention_days: int | None = None) -> CameraEntry:
+                   retention_minutes: int | None = None) -> CameraEntry:
         """Idempotent from the caller's side: an existing camera raises KeyError
         so the API can answer 409, which the registry sync treats as success."""
         with self._slug_lock(slug), self._lock:
@@ -267,7 +267,7 @@ class IndexEngine:
                 raise KeyError(slug)
             entry = CameraEntry(slug=slug, rtsp_url=rtsp_url,
                                 domains=tuple(domains) or DEFAULT_DOMAINS,
-                                retention_days=retention_days)
+                                retention_minutes=retention_minutes)
             self._cameras[slug] = entry
             first = len(self._cameras) == 1
             pipeline = self._pipeline
@@ -282,7 +282,7 @@ class IndexEngine:
 
     def upsert_camera(self, slug: str, rtsp_url: str,
                       domains: tuple[str, ...] = DEFAULT_DOMAINS,
-                      retention_days: int | None = None
+                      retention_minutes: int | None = None
                       ) -> tuple[CameraEntry, str]:
         """Create the camera, or bring an existing one to this state. Returns
         (entry, "created" | "updated" | "unchanged").
@@ -315,22 +315,22 @@ class IndexEngine:
                     # where frames come from, so a change to it never restarts
                     # capture — it is applied here and again in the route, which
                     # owns the store and does the restamp.
-                    retention_changed = entry.retention_days != retention_days
+                    retention_changed = entry.retention_minutes != retention_minutes
                     if entry.domains == domains and not retention_changed:
                         return entry, "unchanged"
                     entry.domains = domains
-                    entry.retention_days = retention_days
+                    entry.retention_minutes = retention_minutes
                     if self._pipeline is not None:
                         self._pipeline.set_domains(slug, domains)
-                    log.info("camera updated slug=%s domains=%s retention_days=%s",
-                             slug, list(domains), retention_days)
+                    log.info("camera updated slug=%s domains=%s retention_minutes=%s",
+                             slug, list(domains), retention_minutes)
                     return entry, "updated"
             # URL changed, or brand new. Outside the REGISTRY lock, because
             # stopping a capture thread joins; still inside the slug lock, so no
             # other worker can interleave its own remove/add with this one.
             if entry is not None:
                 self.remove_camera(slug)
-            return self.add_camera(slug, rtsp_url, domains, retention_days), "created"
+            return self.add_camera(slug, rtsp_url, domains, retention_minutes), "created"
 
     def remove_camera(self, slug: str) -> bool:
         with self._slug_lock(slug):

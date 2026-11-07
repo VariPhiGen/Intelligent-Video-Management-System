@@ -32,12 +32,12 @@ log = logging.getLogger("smartsearch.store")
 
 
 class Store:
-    def __init__(self, dsn: str, retention_days: int = 30) -> None:
+    def __init__(self, dsn: str, retention_minutes: int = 30 * 1440) -> None:
         self._dsn = dsn
-        self._retention = timedelta(days=retention_days)
+        self._retention = timedelta(minutes=retention_minutes)
         # Per-camera override of the appliance default, pushed by the registry
-        # (POST /cameras/{slug}?retention_days=). A camera set to keep two days
-        # of footage must not leave thirty days of crops cut from it behind:
+        # (POST /cameras/{slug}?retention_minutes=). A camera set to keep two
+        # days of footage must not leave thirty days of crops cut from it behind:
         # the crop IS the footage as far as a data subject is concerned, and a
         # deletion promise the operator made about a camera has to bind
         # everything derived from it. Kept in memory, not in a table, because
@@ -61,7 +61,19 @@ class Store:
         with self._retention_lock:
             return self._camera_retention.get(camera, self._retention)
 
-    def set_camera_retention(self, camera: str, days: int | None) -> dict[str, Any]:
+    def shortest_retention_minutes(self) -> float:
+        """The shortest retention any registered camera is held to, in minutes.
+
+        Read by RetentionThread to pace itself. The appliance default counts:
+        it applies to every camera that has no override, including all of them
+        on a fresh install, so pacing off the per-camera map alone would sweep
+        hourly on a box whose default is twenty minutes.
+        """
+        with self._retention_lock:
+            spans = [self._retention, *self._camera_retention.values()]
+        return min(s.total_seconds() for s in spans) / 60.0
+
+    def set_camera_retention(self, camera: str, minutes: int | None) -> dict[str, Any]:
         """Adopt a camera's retention and RESTAMP the rows already indexed for it.
 
         Restamping is the whole point, and stamping new rows alone would be a
@@ -80,7 +92,11 @@ class Store:
         cannot be registered because the search database is briefly down is a
         worse outcome than a stale deadline the next reconcile pass fixes.
         """
-        interval = timedelta(days=days) if days else None
+        # MINUTES. The registry resolves the camera's recording retention to a
+        # concrete figure before pushing it, and that figure can now be smaller
+        # than a day — a camera kept for twenty minutes must not leave a day of
+        # person crops standing over deleted footage.
+        interval = timedelta(minutes=minutes) if minutes else None
         with self._retention_lock:
             previous = self._camera_retention.get(camera)
             if interval is None:
@@ -128,8 +144,8 @@ class Store:
             log.warning("store.retention.restamp_failed camera=%s: %s",
                         camera, out["error"])
             return out
-        log.info("store.retention camera=%s days=%s rows_restamped=%d",
-                 camera, days if days else "default", out["rows_restamped"])
+        log.info("store.retention camera=%s minutes=%s rows_restamped=%d",
+                 camera, minutes if minutes else "default", out["rows_restamped"])
         return out
 
     def _get_pool(self) -> ConnectionPool:

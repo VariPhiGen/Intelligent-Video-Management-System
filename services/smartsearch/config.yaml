@@ -355,7 +355,7 @@ models:
   square_letterbox: true
 
 store:
-  # Overridden by SEARCHDB_URL / SEARCH_CROP_DIR / SEARCH_RETENTION_DAYS.
+  # Overridden by SEARCHDB_URL / SEARCH_CROP_DIR / SEARCH_RETENTION_MINUTES.
   crop_dir: "/data/search/crops"
   # fsync every crop before a row may reference it (SEARCH_CROP_FSYNC=0 turns it
   # off). Measured 5.6 ms per crop against 0.5 ms without, on NVMe. It buys the
@@ -363,7 +363,12 @@ store:
   # cut, a row and its JPEG agree. 80 zero-byte crops on this appliance were
   # what the default is answering — see index/writer.py.
   crop_fsync: true
-  retention_days: 30
+  # How long a row stays searchable, in MINUTES — the recorder's unit, because
+  # the registry pushes each camera's RECORDING retention here and a camera can
+  # be kept for twenty minutes. `retention_days` still works and is read as a
+  # day-spelling of this. The sweep paces itself from the shortest retention in
+  # play, so a minute-scale camera is swept on a minute-scale clock.
+  retention_minutes: 43200   # 30 days
   # Whole frames for the Recent-detections feed are kept this long — less than
   # rows, because the feed only shows recent detections and a frame is tens of
   # KB against a crop's ~5. A row that outlives its frame falls back to the crop

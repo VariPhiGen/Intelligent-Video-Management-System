@@ -99,6 +99,7 @@ def _handle_reconnect(
 
 def apply_feature(
     cam: CameraState, feature: float, config: AppConfig, engine: "MotionEngine",
+    ts: float | None = None,
 ) -> None:
     """THE DECISION. Everything an operator sees comes from this function.
 
@@ -115,6 +116,10 @@ def apply_feature(
     motion = feature >= cam.threshold
     logger.debug("[%s] pixel_feature=%.5f threshold=%.5f motion=%s",
                  cam.name, feature, cam.threshold, motion)
+    # The playback timeline's view of the same decision: runs of motion, not
+    # incidents (detector/activity.py). Wall time of the sample — the broker
+    # stamps its own; a frame decoded here was taken just now.
+    engine.note_motion(cam.name, motion, time.time() if ts is None else ts)
 
     triggered = False
     with cam.lock:

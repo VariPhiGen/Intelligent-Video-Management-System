@@ -286,13 +286,13 @@ def test_zero_no_longer_clears(engine):
 
 def test_a_runtime_added_track_can_be_added_as_never_groom(engine):
     """The path the reconcile loop actually uses — add_camera, not set_groom."""
-    engine.add_camera("cam_sub", "rtsp://relay/cam_sub", retention_days=3,
+    engine.add_camera("cam_sub", "rtsp://relay/cam_sub", retention_minutes=3 * 1440,
                       groom_after_days=0)
     assert engine.get_groom_map()["cam_sub"] == 0
 
 
 def test_a_runtime_camera_with_no_override_stores_none(engine):
-    engine.add_camera("cam", "rtsp://relay/cam", retention_days=30,
+    engine.add_camera("cam", "rtsp://relay/cam", retention_minutes=30 * 1440,
                       groom_after_days=None)
     assert "cam" not in engine.get_groom_map()
 

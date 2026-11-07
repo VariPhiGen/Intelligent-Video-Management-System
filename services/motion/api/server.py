@@ -46,6 +46,8 @@ def create_app(engine: MotionEngine, config: AppConfig) -> FastAPI:
             # semantics are identical either way — both paths run the same
             # confirmation window and state machine.
             "frame_source": source,
+            # Runs of motion reported to the playback timeline, and their delivery.
+            "activity": engine.activity_snapshot(),
         }
 
     @app.get("/cameras")

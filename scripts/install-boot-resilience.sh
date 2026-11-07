@@ -101,6 +101,17 @@ install_cdi() {
   fi
 
   install -d -m 0755 "$CDI_DIR"
+  # Some driver installations load NVIDIA successfully without listing it in
+  # modules.dep. The vendor ExecCondition then skips every refresh, leaving
+  # auto-detection on the legacy runtime. Check the running driver instead.
+  install -d -m 0755 /etc/systemd/system/nvidia-cdi-refresh.service.d
+  cat > /etc/systemd/system/nvidia-cdi-refresh.service.d/vms.conf <<'EOF'
+[Service]
+ExecCondition=
+ExecCondition=/usr/bin/nvidia-smi -L
+EOF
+  systemctl daemon-reload
+  systemctl enable --now nvidia-cdi-refresh.path
   # Generate it now so the fix takes effect without waiting for a reboot.
   if nvidia-ctk cdi generate --output="$CDI_SPEC" >/dev/null 2>&1; then
     say "generated $CDI_SPEC ($(wc -c < "$CDI_SPEC") bytes)"
@@ -133,6 +144,10 @@ do_uninstall() {
   if [ -f "$ENV_FILE" ]; then
     sed -i "\#^$MARKER\$#d; \#^NVIDIA_CTK_CDI_OUTPUT_FILE_PATH=$CDI_SPEC\$#d" "$ENV_FILE"
     say "reverted $ENV_FILE (spec returns to /var/run/cdi on next refresh)"
+  fi
+  if [ -f /etc/systemd/system/nvidia-cdi-refresh.service.d/vms.conf ]; then
+    rm -f /etc/systemd/system/nvidia-cdi-refresh.service.d/vms.conf
+    systemctl daemon-reload
   fi
   say "left $CDI_SPEC in place — harmless, and removing it re-opens the race"
   if [ -f "$UNIT_DST" ]; then

@@ -132,7 +132,7 @@ export function ResultCard({
   when: number;
   sensor: string | null;
   camera: SearchCamera;
-  score: number;
+  score?: number;
   facts: Array<[string, string | null | undefined]>;
   onOpen: () => void;
   onShowEvent: () => void;
@@ -147,7 +147,7 @@ export function ResultCard({
           {title}
           {subtitle && <span className="ss-card-sub">{subtitle}</span>}
         </div>
-        <Score value={score} />
+        {score != null && <Score value={score} />}
       </div>
 
       <div className="ss-card-meta">

@@ -49,6 +49,9 @@ import urllib.request
 BASE = os.environ.get("KC_URL", "http://127.0.0.1:8085").rstrip("/")
 USER = os.environ.get("KEYCLOAK_ADMIN", "admin")
 PASSWORD = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
+# How long "Remember this workstation" keeps a sign-in (idle AND max). A video wall / kiosk ticks it once and must survive
+# reloads and overnight screen-offs; the realm's normal 30 min idle / 10 h max then only applies to un-ticked sign-ins.
+REMEMBER_ME_SECONDS = max(1, int(os.environ.get("KC_REMEMBER_ME_DAYS", "30") or 30)) * 86400
 REALM = os.environ.get("KC_REALM", "vms")
 CLIENT_ID = os.environ.get("KC_CLIENT_ID", "vms-web")
 PWCHECK_CLIENT_ID = "vms-pwcheck"
@@ -72,6 +75,7 @@ WANT_ATTRS = {
 # Must stay in step with backend/services/keycloak_admin.py PRODUCT_ROLES.
 WANT_ROLES = {
     "admin": "Configure cameras, users, retention, integrations",
+    "integration": "Read the optional VMS event feed with a service account",
     "supervisor": "Everything an operator can do, plus acknowledge and reset alarms",
     "operator": "View, search, acknowledge alarms, trigger peripherals",
     "viewer": "Live view only — no recorded footage, no exports",
@@ -230,6 +234,8 @@ def sync_realm_login(auth: dict) -> None:
         "supportedLocales": ["en", "hi"],
         "defaultLocale": "en",
         "loginTheme": "vms",
+        "ssoSessionIdleTimeoutRememberMe": REMEMBER_ME_SECONDS,
+        "ssoSessionMaxLifespanRememberMe": REMEMBER_ME_SECONDS,
     }
     if all(realm.get(k) == v for k, v in want.items()):
         log("realm login settings already in sync")
@@ -237,7 +243,7 @@ def sync_realm_login(auth: dict) -> None:
     realm.update(want)
     call(f"{BASE}/admin/realms/{REALM}",
          data=json.dumps(realm).encode(), headers=auth, method="PUT")
-    log("updated realm login settings (rememberMe, i18n en/hi, vms theme)")
+    log(f"updated realm login settings (rememberMe {REMEMBER_ME_SECONDS // 86400} d, i18n en/hi, vms theme)")
 
 
 def sync_realm_brand(auth: dict) -> None:

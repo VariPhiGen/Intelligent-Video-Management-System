@@ -72,6 +72,18 @@ RUN useradd --no-create-home --shell /bin/false relay
 # and every package build fails with PermissionError.
 RUN mkdir -p /evidence-exports/keys && chown -R relay:relay /evidence-exports
 
+# Data Collection frames live on the dataset_data volume mounted here. Same
+# reasoning as the evidence directory above and the same failure if it is
+# missed: Docker seeds a fresh named volume from the image path, ownership
+# included, so without this chown the directory lands root-owned and the very
+# first frame write fails with PermissionError on a brand-new appliance.
+#
+# A SEPARATE VOLUME FROM EVIDENCE, deliberately. These are deletable working
+# images on an operational clock, not an append-only legal register, and an
+# operator must be able to reclaim the space without going anywhere near
+# evidence packages.
+RUN mkdir -p /dataset-frames && chown -R relay:relay /dataset-frames
+
 USER relay
 
 # Documentation only; the real listen port follows $API_PORT (see CMD). Under

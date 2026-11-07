@@ -1,7 +1,7 @@
 """Unit tests for per-camera retention (index/store.py).
 
 The index stamps `expires_at` once, at insert, from a single appliance-wide
-`retention_days`. That was wrong in one specific and consequential way: a camera
+`retention_minutes`. That was wrong in one specific and consequential way: a camera
 whose RECORDING retention is two days had thirty days of crops cut from it left
 searchable — the index outliving the footage it describes, and the appliance
 reporting a deletion deadline for that camera which it was not keeping for the
@@ -23,6 +23,7 @@ elsewhere; what regresses is which calls happen and when.
 Run: python3 -m pytest tests -q
 """
 import sys
+import pathlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -109,10 +110,18 @@ class FakePool:
         return FakeConn(self, self._raises)
 
 
+DAY = 1440  # minutes — retention is minute-granular, matching the recorder
+
+
 def make_store(rowcount=0, raises=False, retention_days=30):
     """`rowcount` is per table: every registered domain's table starts with that
-    many rows carrying the wrong deadline."""
-    store = Store("postgresql://unused", retention_days=retention_days)
+    many rows carrying the wrong deadline.
+
+    Still spelled in days at this seam because every case below reasons in
+    days; it is converted once, here, so the tests stay readable while the
+    store under test only ever sees minutes.
+    """
+    store = Store("postgresql://unused", retention_minutes=retention_days * DAY)
     pool = FakePool(rowcount, raises, batch=Store.RESTAMP_BATCH)
     store._get_pool = lambda: pool          # noqa: SLF001 — the seam under test
     return store, pool
@@ -125,7 +134,7 @@ def test_unset_camera_follows_the_appliance_default():
 
 def test_camera_retention_overrides_the_default_for_that_camera_only():
     store, _ = make_store(retention_days=30)
-    store.set_camera_retention("cam-a", 2)
+    store.set_camera_retention("cam-a", 2 * DAY)
     assert store.retention_for("cam-a") == timedelta(days=2)
     assert store.retention_for("cam-b") == timedelta(days=30)
 
@@ -134,7 +143,7 @@ def test_shortening_retention_restamps_the_rows_already_indexed():
     """The whole point. Stamping new rows alone leaves a month of crops behind
     on a camera just dropped to two days."""
     store, pool = make_store(rowcount=7)
-    out = store.set_camera_retention("cam-a", 2)
+    out = store.set_camera_retention("cam-a", 2 * DAY)
     assert out["changed"] is True
     assert out["error"] is None
     # Both domain tables restamped, each scoped to this camera.
@@ -156,10 +165,10 @@ def test_lengthening_retention_restamps_too():
     existing deadlines as well, or the correction silently applies to new rows
     only."""
     store, pool = make_store(rowcount=3)
-    store.set_camera_retention("cam-a", 2)
+    store.set_camera_retention("cam-a", 2 * DAY)
     pool.sql.clear()
     pool.seed(3)
-    out = store.set_camera_retention("cam-a", 90)
+    out = store.set_camera_retention("cam-a", 90 * DAY)
     assert out["changed"] is True
     assert out["rows_restamped"] == 3 * len(ALL_TABLES)
     assert all(p["iv"] == timedelta(days=90) for _s, p in pool.sql)
@@ -174,7 +183,7 @@ def test_a_large_restamp_is_done_in_batches():
     store, pool = make_store()
     per_table = Store.RESTAMP_BATCH * 2 + 17
     pool.seed(per_table)
-    out = store.set_camera_retention("cam-a", 2)
+    out = store.set_camera_retention("cam-a", 2 * DAY)
     assert out["rows_restamped"] == per_table * len(ALL_TABLES)
     updates = [s for s, _ in pool.sql if s.startswith("UPDATE")]
     assert all(f"LIMIT {Store.RESTAMP_BATCH}" in s for s in updates)
@@ -189,9 +198,9 @@ def test_reasserting_the_same_retention_touches_nothing():
     would be an UPDATE over the entire index once per sync interval, from each
     of four workers."""
     store, pool = make_store(rowcount=5)
-    store.set_camera_retention("cam-a", 2)
+    store.set_camera_retention("cam-a", 2 * DAY)
     pool.sql.clear()
-    out = store.set_camera_retention("cam-a", 2)
+    out = store.set_camera_retention("cam-a", 2 * DAY)
     assert out["changed"] is False
     assert out["rows_restamped"] == 0
     assert pool.sql == []
@@ -199,7 +208,7 @@ def test_reasserting_the_same_retention_touches_nothing():
 
 def test_clearing_retention_returns_the_camera_to_the_default_and_restamps():
     store, pool = make_store(rowcount=4, retention_days=30)
-    store.set_camera_retention("cam-a", 2)
+    store.set_camera_retention("cam-a", 2 * DAY)
     pool.sql.clear()
     out = store.set_camera_retention("cam-a", None)
     assert store.retention_for("cam-a") == timedelta(days=30)
@@ -207,13 +216,41 @@ def test_clearing_retention_returns_the_camera_to_the_default_and_restamps():
     assert all(p["iv"] == timedelta(days=30) for _s, p in pool.sql)
 
 
-def test_zero_days_is_treated_as_unset_not_as_delete_everything():
+def test_zero_is_treated_as_unset_not_as_delete_everything():
     """0 is the registry's "reset to appliance default" sentinel (see the
-    retention_days handling in routers/cameras.py). Reading it as a literal zero
-    day would expire every crop from that camera on the next sweep."""
+    retention handling in routers/cameras.py). Reading it as a literal zero
+    would expire every crop from that camera on the next sweep."""
     store, _ = make_store(retention_days=30)
     store.set_camera_retention("cam-a", 0)
     assert store.retention_for("cam-a") == timedelta(days=30)
+
+
+def test_a_minute_scale_retention_is_adopted_as_minutes():
+    """The reason this seam moved off days. A camera kept for twenty minutes
+    must not leave a day of person crops behind it — the crop IS the footage
+    as far as a data subject is concerned, so the granularity of the promise
+    has to match the granularity of the policy."""
+    store, pool = make_store(rowcount=3, retention_days=30)
+    out = store.set_camera_retention("cam-a", 20)
+    assert store.retention_for("cam-a") == timedelta(minutes=20)
+    assert out["changed"] is True
+    assert all(p["iv"] == timedelta(minutes=20) for _s, p in pool.sql)
+
+
+def test_a_minute_scale_retention_reaches_the_insert_stamp_too():
+    """Restamping old rows and stamping new ones are separate code paths, and
+    a conversion that reached only one of them would leave the index deleting
+    on two different clocks."""
+    store, pool = make_store(retention_days=30)
+    store.set_camera_retention("cam-a", 20)
+    pool.sql.clear()
+    ts = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
+    store.write_batch("person", [{
+        "embedding": [0.0], "camera": "cam-a", "ts": ts,
+        "crop_path": "/tmp/a.jpg",
+    }])
+    (_sql, params), = [r for r in pool.sql if r[0].startswith("INSERT")]
+    assert params[0][6] == ts + timedelta(minutes=20)
 
 
 def test_a_database_failure_is_reported_not_raised():
@@ -221,7 +258,7 @@ def test_a_database_failure_is_reported_not_raised():
     because the search database blinked is worse than a stale deadline, and the
     next reconcile pass re-asserts it anyway."""
     store, _ = make_store(raises=True)
-    out = store.set_camera_retention("cam-a", 2)
+    out = store.set_camera_retention("cam-a", 2 * DAY)
     assert out["error"] is not None
     assert out["rows_restamped"] == 0
     # Adopted in memory regardless, so new rows get the right stamp even while
@@ -231,7 +268,7 @@ def test_a_database_failure_is_reported_not_raised():
 
 def test_write_batch_stamps_expiry_from_the_camera_not_the_default():
     store, pool = make_store(retention_days=30)
-    store.set_camera_retention("cam-a", 2)
+    store.set_camera_retention("cam-a", 2 * DAY)
     pool.sql.clear()
     ts = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
     store.write_batch("person", [{
@@ -252,3 +289,50 @@ def test_write_batch_falls_back_to_the_default_for_an_unknown_camera():
     }])
     (_sql, params), = [r for r in pool.sql if r[0].startswith("INSERT")]
     assert params[0][6] == ts + timedelta(days=30)
+
+
+# ── how the appliance actually hands us this setting ────────────────────────
+#
+# Found by deploying, not by any test above: the unit conversion was right in
+# every direction and the service still crash-looped on boot, because
+# docker-compose renders `${SEARCH_RETENTION_MINUTES:-}` as an empty STRING
+# rather than omitting the variable. `"NAME" in os.environ` is therefore True
+# for a knob nobody set, and `int("")` raises at IMPORT time — taking the whole
+# service down on the one upgrade that changed nothing.
+
+def _config_with_env(monkeypatch, **env):
+    import importlib
+    import index.config as cfg
+    for k, v in env.items():
+        if v is None:
+            monkeypatch.delenv(k, raising=False)
+        else:
+            monkeypatch.setenv(k, v)
+    importlib.reload(cfg)
+    return cfg.AppConfig.from_yaml(
+        str(pathlib.Path(__file__).resolve().parents[1] / "config.yaml"))
+
+
+def test_a_blank_minutes_env_falls_back_instead_of_crashing(monkeypatch):
+    """The deploy bug, pinned. Blank must mean "not set", never "invalid"."""
+    c = _config_with_env(monkeypatch,
+                         SEARCH_RETENTION_MINUTES="", SEARCH_RETENTION_DAYS="30")
+    assert c.store.retention_minutes == 30 * DAY
+
+
+def test_both_blank_leaves_the_shipped_default(monkeypatch):
+    c = _config_with_env(monkeypatch,
+                         SEARCH_RETENTION_MINUTES="", SEARCH_RETENTION_DAYS="")
+    assert c.store.retention_minutes == 30 * DAY
+
+
+def test_an_explicit_minute_value_still_wins(monkeypatch):
+    c = _config_with_env(monkeypatch,
+                         SEARCH_RETENTION_MINUTES="20", SEARCH_RETENTION_DAYS="30")
+    assert c.store.retention_minutes == 20
+
+
+def test_whitespace_is_not_a_value_either(monkeypatch):
+    c = _config_with_env(monkeypatch,
+                         SEARCH_RETENTION_MINUTES="  ", SEARCH_RETENTION_DAYS="7")
+    assert c.store.retention_minutes == 7 * DAY

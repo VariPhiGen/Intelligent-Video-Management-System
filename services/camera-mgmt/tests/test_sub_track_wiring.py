@@ -30,7 +30,7 @@ from backend.routers import cameras as cam_router  # noqa: E402
 from backend.services import substream  # noqa: E402
 
 SUB = {"url_raw": "rtsp://10.0.0.5:554/sub", "codec": "h264", "width": 704,
-       "height": 576, "recording_enabled": True, "retention_days": 14}
+       "height": 576, "recording_enabled": True, "retention_minutes": 14 * 1440}
 SLUG = "gate-a1b2"
 SUB_NAME = sub_recording_name(SLUG)
 
@@ -70,7 +70,7 @@ class _Cam(SimpleNamespace):
 def _camera(**kw):
     base = dict(id=uuid.uuid4(), slug=SLUG, rtsp_url="rtsp://u:pw@10.0.0.5:554/main",
                 enabled=True, recording=True, recording_schedule=None,
-                privacy_masks=[], retention_days=30, groom_after_days=None,
+                privacy_masks=[], retention_minutes=30 * 1440, groom_after_days=None,
                 sub_track=None)
     base.update(kw)
     return _Cam(**base)
@@ -90,7 +90,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(cam_router, "_get_camera_or_404", get_cam)
     monkeypatch.setattr(cam_router, "get_principal", principal)
     monkeypatch.setattr(cam_router.audit_svc, "record", audit)
-    monkeypatch.setattr(cam_router, "sync_now", sync_now)
+    monkeypatch.setattr(cam_router, "sync_camera", sync_now)
+    monkeypatch.setattr(cam_router, "sync_removal", sync_now)
     monkeypatch.setattr(cam_router, "_build_response", lambda c: c)
     monkeypatch.setattr(cam_router.CameraResponse, "from_orm",
                         staticmethod(lambda c, url: c))
@@ -178,7 +179,7 @@ async def test_a_reprobe_keeps_the_operators_retention(wired, monkeypatch):
     async def ok(camera): return dict(fresh), substream.RESOLVED
     monkeypatch.setattr(substream, "resolve_detailed", ok)
     await cam_router.resolve_sub_track(wired.cam.id, wired.req, wired.db)
-    assert wired.cam.sub_track["retention_days"] == 14
+    assert wired.cam.sub_track["retention_minutes"] == 14 * 1440
     assert wired.cam.sub_track["recording_enabled"] is True
 
 
@@ -218,7 +219,8 @@ async def test_enabling_a_sub_repoints_rather_than_adds(wired):
     """add_path reports a stale existing path as success and keeps pulling the
     old profile."""
     wired.cam.sub_track = {**SUB, "recording_enabled": False}
-    body = SimpleNamespace(recording_enabled=True, retention_days=None)
+    body = SimpleNamespace(recording_enabled=True,
+                           resolved_retention_minutes=lambda: None)
     await cam_router.set_sub_track_recording(wired.cam.id, body, wired.req, wired.db)
     verbs = [(v, n) for v, n, _u in wired.calls.relay]
     assert ("ensure", SUB_NAME) in verbs
@@ -352,6 +354,9 @@ async def test_fulfilling_an_erasure_erases_every_track(monkeypatch):
     async def no_search(slug, frm, to): return []
     monkeypatch.setattr(dsr_mod.smartsearch_client, "erase_range", no_search)
 
+    async def no_presence(slug, frm=None, to=None): return 0
+    monkeypatch.setattr(dsr_mod.timeline, "erase_by_slug", no_presence)
+
     ref = SimpleNamespace(camera_id=SLUG,
                           from_=_dt(2026, 9, 7, 10), to=_dt(2026, 9, 7, 11))
     results, all_ok = await _run_erasure(dsr_mod, [ref])
@@ -373,8 +378,14 @@ async def _run_erasure(dsr_mod, refs):
     Extracted so the assertion above is about which client call the module
     makes, not about DSR row bookkeeping — but it calls the module's own
     function rather than restating the loop, which is the whole point.
+
+    `erase_refs` now takes a session, because erasure also has to reach the
+    stills cut from the window (annotations and dataset frames). A StubSession
+    reads back empty, which is the right answer here: this test is about which
+    NVR call is made, and an empty index means those sweeps have nothing to do.
     """
-    return await dsr_mod.erase_refs(refs)
+    from conftest import StubSession
+    return await dsr_mod.erase_refs(StubSession(), refs)
 
 
 # ── The health monitor's orphan sweep must not eat a relay-owned track ─────

@@ -3,7 +3,7 @@ Retention manager — periodically deletes segments older than the configured
 retention period and cleans up expired extracted clips.
 
 Each pass runs in this order:
-  1. Age-based cleanup per camera (retention_days).
+  1. Age-based cleanup per camera (retention_minutes).
   2. Orphan cleanup of unindexed .ts files past the same age cutoff.
   3. Global size-cap enforcement (max_storage_bytes), if configured: oldest
      segments across all cameras are deleted until total indexed size is back
@@ -33,6 +33,7 @@ from storage.index import SegmentIndex
 logger = logging.getLogger(__name__)
 
 _GB = 1024 ** 3
+MINUTES_PER_DAY = 1440
 
 
 class RetentionManager:
@@ -45,12 +46,37 @@ class RetentionManager:
     DISK_FLOOR_FREE_PCT = 5.0     # trigger emergency eviction below this free-%
     DISK_TARGET_FREE_PCT = 8.0    # evict until at least this much is free again
     DISK_FLOOR_MAX_PASSES = 20    # bound the evict/recheck loop per invocation
+
+    # ── How often the sweep runs (see sweep_interval) ────────────────────────
+    # Retention used to be whole days and the pass was simply hourly: an hour
+    # of slack on a thirty-day promise is nothing. Minute-granular retention
+    # breaks that assumption outright — a camera set to ten minutes on an
+    # hourly sweep holds footage for up to seventy, and an operator has no way
+    # to tell whether the setting took effect at all.
+    #
+    # So the interval follows the SHORTEST retention on the appliance, divided
+    # by SWEEP_DIVISOR, which bounds the overshoot at 1/4 of the period. It is
+    # clamped at both ends: never more often than MIN (a sweep is real I/O and
+    # nothing below a minute can be honoured anyway, since segments are 60 s),
+    # never less often than MAX (the long-standing hourly floor, which is what
+    # a fleet of thirty-day cameras still gets).
+    SWEEP_DIVISOR = 4
+    MIN_SWEEP_INTERVAL_S = 60
+    MAX_SWEEP_INTERVAL_S = 3600
+    # The steps that are NOT age-based deletion — orphan globbing, clip and HLS
+    # eviction — stay on the old hourly cadence however fast the sweep runs.
+    # They walk directories and read the whole index per camera, and none of
+    # them is what a short retention is asking to happen sooner: a ten-minute
+    # camera needs its SEGMENTS deleted on time, not its HLS cache swept forty
+    # times an hour. Without this split, shortening one camera's retention
+    # would quietly multiply the I/O cost of every camera on the box.
+    HOUSEKEEPING_INTERVAL_S = 3600
     def __init__(self, index: SegmentIndex, cameras_config: list[dict],
                  clips_path: str, clip_ttl_minutes: int = 30,
                  hls_cache_ttl_minutes: int = 360,
                  storage_path: str | None = None,
                  max_storage_bytes: int | None = None,
-                 default_retention_days: int = 30,
+                 default_retention_minutes: int = 30 * 1440,
                  retention_map_provider=None,
                  max_storage_provider=None,
                  clock_jump_threshold_s: float = 300.0):
@@ -78,10 +104,10 @@ class RetentionManager:
         # restart — mirrors retention_map_provider. Falls back to the static
         # max_storage_bytes when absent.
         self._max_storage_provider = max_storage_provider
-        self._default_days = default_retention_days
-        # Optional callable returning {camera: retention_days} for cameras added
-        # at runtime (the registry-sync path) — the static YAML list alone would
-        # silently exempt them from age-based cleanup and fill the disk.
+        self._default_minutes = default_retention_minutes
+        # Optional callable returning {camera: retention_minutes} for cameras
+        # added at runtime (the registry-sync path) — the static YAML list alone
+        # would silently exempt them from age-based cleanup and fill the disk.
         self._retention_provider = retention_map_provider
         # Storage-pressure history, for the warning surfaces (storage/alerts.py).
         # Recorded as EVENTS rather than inferred later from how much footage is
@@ -100,30 +126,57 @@ class RetentionManager:
         # hourly run_once pass (retention thread). The two-phase delete is
         # individually safe, but the lock stops them double-counting / racing.
         self._disk_floor_lock = threading.Lock()
+        # Monotonic stamp of the last pass that did the hourly housekeeping.
+        # None = never, so the first pass does it.
+        self._last_housekeeping_mono: float | None = None
 
     def _camera_retention_map(self) -> dict[str, int]:
-        """Effective {camera: retention_days} for this pass.
+        """Effective {camera: retention_MINUTES} for this pass.
 
         Union of: every camera present in the segment index (so footage of
         deleted cameras still ages out), the static YAML config, and the
         runtime provider (engine). Provider wins, then YAML, then default.
+
+        cameras.yaml may spell a camera's retention in either unit;
+        `retention_minutes` wins and `retention_days` is converted, so the
+        rest of this class only ever sees minutes.
         """
-        days: dict[str, int] = {}
+        minutes: dict[str, int] = {}
         try:
             for name in self._index.get_cameras():
-                days[name] = self._default_days
+                minutes[name] = self._default_minutes
         except Exception:
             logger.exception("Retention: failed to enumerate index cameras")
         for name, cfg in self._cameras.items():
-            days[name] = cfg.get("retention_days", self._default_days)
+            if cfg.get("retention_minutes"):
+                minutes[name] = int(cfg["retention_minutes"])
+            elif cfg.get("retention_days"):
+                minutes[name] = int(cfg["retention_days"]) * MINUTES_PER_DAY
+            else:
+                minutes[name] = self._default_minutes
         if self._retention_provider is not None:
             try:
-                for name, d in (self._retention_provider() or {}).items():
-                    if d:
-                        days[name] = d
+                for name, m in (self._retention_provider() or {}).items():
+                    if m:
+                        minutes[name] = int(m)
             except Exception:
                 logger.exception("Retention: runtime retention provider failed")
-        return days
+        return minutes
+
+    def sweep_interval(self) -> float:
+        """Seconds to wait before the next pass, paced by the SHORTEST retention.
+
+        Called by the loop in main.py after every pass, not once at startup:
+        retention is edited from the UI at runtime, so a value computed at boot
+        would leave a camera that was just set to ten minutes being swept on
+        whatever cadence the fleet had an hour ago.
+        """
+        shortest = self.shortest_retention_minutes()
+        if not shortest:
+            return float(self.MAX_SWEEP_INTERVAL_S)
+        want = (shortest * 60) / self.SWEEP_DIVISOR
+        return float(min(self.MAX_SWEEP_INTERVAL_S,
+                         max(self.MIN_SWEEP_INTERVAL_S, want)))
 
     def run_once(self) -> dict[str, int]:
         """Run one retention pass. Returns {camera: files_deleted}."""
@@ -160,9 +213,19 @@ class RetentionManager:
                 )
         self._prev_wall, self._prev_mono = now, mono
 
+        # Is this the pass that also does the hourly housekeeping? See
+        # HOUSEKEEPING_INTERVAL_S: age-based segment deletion has to keep up
+        # with the shortest retention on the box, the directory walks do not.
+        housekeeping_due = (
+            self._last_housekeeping_mono is None
+            or (mono - self._last_housekeeping_mono) >= self.HOUSEKEEPING_INTERVAL_S
+        )
+        if housekeeping_due:
+            self._last_housekeeping_mono = mono
+
         if age_cleanup_ok:
-            for name, retention_days in self._camera_retention_map().items():
-                cutoff = now - (retention_days * 86400)
+            for name, retention_minutes in self._camera_retention_map().items():
+                cutoff = now - (retention_minutes * 60)
 
                 # Delete indexed segments older than cutoff
                 deleted_paths = self._index.delete_before(name, cutoff)
@@ -172,8 +235,12 @@ class RetentionManager:
                     except OSError as e:
                         logger.warning("Failed to delete %s: %s", p, e)
 
-                # Delete orphan .ts files (not in DB) older than cutoff
-                orphans = self._clean_orphans(name, cutoff)
+                # Delete orphan .ts files (not in DB) older than cutoff.
+                # Hourly only: it globs the camera directory and reads every
+                # indexed path for the camera, which is the expensive half of
+                # this pass, and an unindexed stray costs disk rather than a
+                # broken retention promise.
+                orphans = self._clean_orphans(name, cutoff) if housekeeping_due else 0
 
                 total = len(deleted_paths) + orphans
                 results[name] = total
@@ -196,12 +263,17 @@ class RetentionManager:
                 self._enforce_size_cap(total_before, limit)
 
         # Emergency disk-floor safety net (real free space, always on). The
-        # engine's 30s disk callback is the fast trigger; this makes the hourly
-        # pass enforce it too, so the floor holds even if the callback is unwired.
+        # engine's 30s disk callback is the fast trigger; this makes every
+        # retention pass enforce it too, so the floor holds even if the
+        # callback is unwired. Not throttled with the housekeeping: it is one
+        # statvfs when there is no pressure, and it is the last thing standing
+        # between a full disk and recording stopping altogether.
         self.enforce_disk_floor()
 
-        # Clean expired clips (mtime-based, so also skipped on an untrusted clock)
-        if age_cleanup_ok:
+        # Clean expired clips (mtime-based, so also skipped on an untrusted
+        # clock). Hourly, for the same reason as the orphan sweep: these have
+        # their own TTLs and are not what a short retention is asking for.
+        if age_cleanup_ok and housekeeping_due:
             clip_count = self._clean_clips(now)
             if clip_count:
                 logger.info("Retention: deleted %d expired clips", clip_count)
@@ -223,15 +295,32 @@ class RetentionManager:
                 "disk_floor_last_at": self._disk_floor_last_at,
             }
 
-    def configured_retention_days(self) -> int | None:
+    def configured_retention_minutes(self) -> int | None:
         """The longest retention any camera is configured for — the promise most
         at risk when the cap starts evicting. None when no camera is known."""
         try:
-            days = [int(d) for d in self._camera_retention_map().values() if d]
+            mins = [int(m) for m in self._camera_retention_map().values() if m]
         except Exception:
             logger.exception("Retention: camera map unavailable")
             return None
-        return max(days) if days else None
+        return max(mins) if mins else None
+
+    def shortest_retention_minutes(self) -> int | None:
+        """The SHORTEST retention any camera is configured for.
+
+        This is what paces the sweep (main.run_retention_loop). An hourly pass
+        was fine while a day was the finest period expressible — an hour of
+        slack on thirty days is nothing. It is not fine for a camera kept for
+        ten minutes, which would hold footage for up to seventy: the policy
+        would be off by a factor of seven, and the operator would have no way
+        to tell whether the setting had taken effect at all.
+        """
+        try:
+            mins = [int(m) for m in self._camera_retention_map().values() if m]
+        except Exception:
+            logger.exception("Retention: camera map unavailable")
+            return None
+        return min(mins) if mins else None
 
     def _size_limit(self) -> int | None:
         """Current size cap in bytes (None = uncapped). Provider wins, so a
@@ -295,7 +384,7 @@ class RetentionManager:
         Ordering-based (oldest first), like the size cap, so it is safe during a
         clock jump. The open, mid-write segment is not indexed yet, so it can
         never be selected. Loud by design: this deletes footage regardless of
-        retention_days to keep recording alive (availability over retention).
+        retention_minutes to keep recording alive (availability over retention).
         When per-camera retention floors land (gap 7) this becomes the explicit
         last-resort path that may cross a floor, and must alert when it does.
         """
@@ -337,7 +426,7 @@ class RetentionManager:
             logger.critical(
                 "Disk-floor EMERGENCY on %s: %.2f GB free < %.2f GB floor "
                 "(%.1f%%) — age-based retention was not enough; evicting oldest "
-                "footage to recover to %.2f GB free, IGNORING retention_days.",
+                "footage to recover to %.2f GB free, IGNORING retention_minutes.",
                 self._storage_path, usage.free / _GB, floor / _GB,
                 self.DISK_FLOOR_FREE_PCT, target / _GB,
             )

@@ -4,7 +4,7 @@
 The service now sweeps on its own timer (index/retention.py), so this script is
 no longer the only thing standing between the index and unbounded growth — which
 it was, unscheduled, until that thread existed. It remains useful for a sweep on
-demand, for --dry-run before changing retention_days, and for --sweep-orphans,
+demand, for --dry-run before changing retention_minutes, and for --sweep-orphans,
 which the timed sweep does not do.
 
 The expiry pass DELEGATES to Store.expire_once rather than keeping its own copy.

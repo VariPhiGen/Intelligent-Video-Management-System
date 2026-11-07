@@ -7,6 +7,10 @@ pyyaml>=6.0,<7
 opencv-python-headless>=4.9,<4.12
 numpy>=1.26,<3
 pillow>=10,<12
+# Multipart upload of operator models (Data Collection) and the ONNX runtime
+# ultralytics uses for .onnx weights.
+python-multipart==0.0.18
+onnxruntime>=1.18,<2
 # Object detection. AGPL-3.0 — compatible only while this ships in tier 1. See
 # the note at the top of analytics/detector.py before moving this feature
 # behind a paid tier.

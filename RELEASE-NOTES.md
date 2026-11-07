@@ -4,6 +4,69 @@ Changes an operator of an EXISTING install must know before running
 `git pull && ./vms up -d`. Newest first. A fresh clone needs none of this —
 the defaults already land where these notes end up.
 
+## 2026-10-12 — per-camera time-lapse (off by default)
+
+**The upgrade needs nothing from you.** Migration 057 adds `cameras.timelapse_enabled`
+(`false` for every existing camera) and `cameras.timelapse_config`, plus two new tables
+(`timelapse_frames`, `timelapse_renders`). Nothing is captured until someone switches a
+camera on under Configure → Time-lapse.
+
+- **Two new permissions** in Roles & permissions: `timelapse_view` (default: supervisor,
+  operator) and `timelapse_manage` (default: supervisor). Admin has both. Viewer and DPO
+  get neither until granted.
+- **Storage:** stills and videos go to the existing object store (the `vms-heatmaps`
+  bucket from compose's MinIO) under a `timelapse/` prefix — no new bucket, no new
+  credentials. Without an object store they are kept in the database, so set
+  `HEATMAP_S3_*` before switching many cameras on. Each camera has its own retention
+  (default 90 days) and size cap (default 5 GB).
+- **New dependency:** Pillow in the camera-mgmt image (already pinned for the NVR). The
+  image rebuilds on `./vms up -d --build`.
+- **Optional env:** `TIMELAPSE_CAPTURE_ENABLED` (appliance kill switch, default true),
+  `TIMELAPSE_CAPTURE_CONCURRENCY` (2), `TIMELAPSE_RENDER_RETENTION_DAYS` (30),
+  `TIMELAPSE_MAX_RENDER_FRAMES` (20000), `TIMELAPSE_NVENC` (false).
+
+## 2026-09-22 — retention is minute-granular
+
+### Retention is now set in minutes, hours or days
+
+`cameras.retention_days` is `cameras.retention_minutes` (migration 042). A
+camera can be kept for twenty minutes, an hour, or thirty days; the Recording
+tab and the Storage tab's bulk apply take a number plus a unit. The floor is
+physical rather than arbitrary — the recorder writes 60-second segments and
+deletes whole ones, so deletion is accurate to about a minute either way.
+
+**The upgrade needs nothing from you.** Migration 042 converts every stored
+value exactly (`× 1440`), so no camera's policy changes. `.env` keeps working
+untouched: `NVR_DEFAULT_RETENTION_DAYS` and `SEARCH_RETENTION_DAYS` are read
+as day-spellings of the same settings. Set `NVR_RETENTION_MINUTES` /
+`SEARCH_RETENTION_MINUTES` only if you want a default days cannot express.
+
+- The APIs accept `retention_minutes` (canonical) and `retention_days`
+  (deprecated, converted on arrival). **Sending both is a 422** rather than
+  one being silently preferred — they would be two different deletion
+  deadlines for the same footage.
+- `GET /cameras` on camera-mgmt now returns `retention_minutes`,
+  `retention_default_minutes` and a human `retention_label`; the old
+  `retention_days` / `retention_default_days` response fields are gone. Same on
+  smartsearch's `GET /cameras` (`retention_minutes`), and on the NVR's storage
+  alert payload (`effective_retention_minutes`, `configured_retention_minutes`).
+- The DPDP posture report reports `retention_minutes` plus a label, and the
+  CSV/XLSX camera sheets gain a "Retention (minutes)" column beside the
+  human one. A camera kept for twenty minutes is a data-minimisation win; a
+  report that rounded it to "0 days" would read as a violation.
+- **The retention sweep paces itself.** It was a fixed hour, which was fine
+  while a day was the finest period expressible — a camera set to ten minutes
+  would have held footage for up to seventy. It now runs at the shortest
+  configured retention ÷ 4, clamped to [60 s, 1 h], re-read after every pass.
+  A fleet of 30-day cameras is still swept hourly, exactly as before. The
+  directory walks (orphan, clip and HLS cleanup) stay hourly regardless, so
+  shortening one camera does not multiply the I/O cost of every camera.
+  Smart Search's expiry sweep paces itself the same way.
+- Downgrading past 042 is lossy on purpose: a sub-day retention cannot be
+  spelled in whole days, so it floors to 0, which the old code reads as "the
+  appliance default". That keeps footage LONGER, visibly, rather than
+  inventing a policy nobody set.
+
 ## 2026-09 — detection split out of Smart Search; retention follows the camera
 
 ### Smart Search indexes NOTHING until you add two profiles
@@ -58,7 +121,8 @@ deletes them.
   DIFFERENT values on purpose, the recording value now wins for cameras the
   registry knows about. `SEARCH_RETENTION_DAYS` remains the fallback for rows
   from a camera the registry no longer carries.
-- Check `GET /cameras` on smartsearch: each entry reports `retention_days`.
+- Check `GET /cameras` on smartsearch: each entry reports its retention
+  (`retention_days` at the time; `retention_minutes` since 2026-09-22).
 
 ### The index is reconciled against the recordings automatically
 

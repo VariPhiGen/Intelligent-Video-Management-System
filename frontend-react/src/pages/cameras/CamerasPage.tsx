@@ -3,9 +3,11 @@
  * uptime sparklines, bulk action bar, row-click → the camera's Configuration
  * page. Pattern-setter for the React migration.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CameraFilterBar } from '@/components/CameraFilterBar';
+import { applyFilter, isEmpty, loadFilter, saveFilter, type CameraFilter } from '@/lib/cameraFilters';
 import { Link, useNavigate } from 'react-router-dom';
-import { apiFetch } from '@/lib/api';
+import { apiDownload, apiFetch } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useCameras, zoneOf } from '@/lib/cameras';
 import { dtLocal } from '@/lib/format';
@@ -15,6 +17,7 @@ import { Modal } from '@/components/Modal';
 import { useToast } from '@/components/Toast';
 import { EditCameraModal } from './EditCameraModal';
 import { BulkApplyModal, DeleteCamerasModal } from './cameraModals';
+import { TimelapseBulkModal, type BulkTimelapseMode } from './TimelapseBulkModal';
 
 const STATUS_META: Record<string, [string, string]> = {
   connected: ['var(--green)', 'Online'],
@@ -37,11 +40,25 @@ function StatusCell({ c, motion }: { c: Camera; motion?: string }) {
       {/* Exceptions only — a camera in its normal state adds no badges. */}
       {c.recording === false && <span className="badge badge-yellow">Rec off</span>}
       {motion === 'TRIGGERED' && <span className="badge badge-red badge-live"><span className="badge-dot" />Motion</span>}
+      {/* Time-lapse is OFF by default (migration 057), so "on" is an exception
+          worth a badge — and it is how a bulk switch shows up row by row. */}
+      {c.timelapse_enabled && <span className="badge badge-cyan" title="Time-lapse is capturing stills for this camera">◷ Time-lapse</span>}
     </div>
   );
 }
 
-export function CamerasTabs({ active }: { active: 'inventory' | 'add' | 'config' }) {
+/** A checkbox that can show "some" — the zone header's state when only part of
+ *  the zone is ticked. `indeterminate` is a DOM property, not an attribute. */
+function TriCheckbox({ checked, some, onChange, label }: {
+  checked: boolean; some: boolean; onChange: (on: boolean) => void; label: string;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (ref.current) ref.current.indeterminate = some && !checked; }, [some, checked]);
+  return <input ref={ref} type="checkbox" style={{ width: 'auto' }} checked={checked} aria-label={label}
+                onClick={e => e.stopPropagation()} onChange={e => onChange(e.target.checked)} />;
+}
+
+export function CamerasTabs({ active }: { active: 'inventory' | 'add' | 'config' | 'ptz' }) {
   const { me } = useAuth();
   // Onboarding is gated on camera_manage server-side — hide the tab for a role
   // that can view the inventory but can't add cameras, rather than offer a
@@ -52,6 +69,7 @@ export function CamerasTabs({ active }: { active: 'inventory' | 'add' | 'config'
       <Link className={`tab${active === 'inventory' ? ' active' : ''}`} to="/cameras">Inventory</Link>
       {canManage && <Link className={`tab${active === 'add' ? ' active' : ''}`} to="/cameras/add">Add cameras</Link>}
       <Link className={`tab${active === 'config' ? ' active' : ''}`} to="/cameras/config">Configuration</Link>
+      <Link className={`tab${active === 'ptz' ? ' active' : ''}`} to="/cameras/ptz">PTZ</Link>
     </div>
   );
 }
@@ -64,9 +82,16 @@ export function CamerasPage() {
   // stays admin-only. Affordances follow the grant so nobody is shown a button
   // that 403s. Admins hold every capability, so canManage is true for them too.
   const canManage = !!me?.permissions?.camera_manage;
+  // Time-lapse has its own grant (routers/timelapse.py explains why), so a site
+  // lead without camera_manage can still switch a whole site's time-lapse on.
+  const canTimelapse = isAdmin || !!me?.permissions?.timelapse_manage;
+  const [tlMode, setTlMode] = useState<BulkTimelapseMode>(null);
   const { cameras, motion, uptime, error, refresh } = useCameras();
   const [q, setQ] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  // Filter chips (PTZ / maker / recording / no ONVIF login); status stays in the dropdown above. Remembered here.
+  const [cf, setCfState] = useState<CameraFilter>(() => loadFilter('cameras'));
+  const setCf = (f: CameraFilter) => { setCfState(f); saveFilter('cameras', f); };
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<Camera | null>(null);
@@ -80,12 +105,12 @@ export function CamerasPage() {
 
   const visible = useMemo(() => {
     const ql = q.toLowerCase();
-    return cameras.filter(c => {
+    return applyFilter(cameras, cf).filter(c => {
       const matchQ = !ql || c.name.toLowerCase().includes(ql) || c.slug.includes(ql)
         || (c.ip || '').includes(ql) || zoneOf(c).toLowerCase().includes(ql);
       return matchQ && (!statusFilter || c.health_status === statusFilter);
     });
-  }, [cameras, q, statusFilter]);
+  }, [cameras, q, statusFilter, cf]);
 
   const groups = useMemo(() => {
     const g: Record<string, Camera[]> = {};
@@ -95,11 +120,14 @@ export function CamerasPage() {
 
   const online = cameras.filter(c => c.health_status === 'connected').length;
   const offline = cameras.length - online;
-  const filtering = !!(q || statusFilter);
+  const filtering = !!(q || statusFilter || !isEmpty(cf));
   const sel = [...selected].filter(id => cameras.some(c => c.id === id));
 
   const toggleSel = (id: string, on: boolean) =>
     setSelected(s => { const n = new Set(s); on ? n.add(id) : n.delete(id); return n; });
+  // Tick / untick every camera of one zone (a site), leaving other zones' ticks alone.
+  const setZoneSel = (cams: Camera[], on: boolean) =>
+    setSelected(s => { const n = new Set(s); cams.forEach(c => (on ? n.add(c.id) : n.delete(c.id))); return n; });
   const toggleZone = (z: string) =>
     setCollapsed(s => { const n = new Set(s); n.has(z) ? n.delete(z) : n.add(z); return n; });
 
@@ -185,6 +213,21 @@ export function CamerasPage() {
     a.download = `cameras_${dtLocal(new Date()).replace(/[:T]/g, '-')}.csv`;
     document.body.appendChild(a); a.click(); a.remove();
   }
+  // Admin Excel export (server-built: name + camera ID first, every field incl. MAC/vendor/
+  // ports/retention/schedule, a Summary sheet, and never a credential). `ids` = the ticked rows;
+  // none ticked = the whole fleet. apiDownload keeps the server's timestamped filename.
+  const [exporting, setExporting] = useState(false);
+  async function exportXlsx(ids: string[] = []) {
+    setExporting(true);
+    try {
+      const qs = ids.length ? `?ids=${encodeURIComponent(ids.join(','))}` : '';
+      await apiDownload(`/cameras/export.xlsx${qs}`, `cameras_${dtLocal(new Date()).replace(/[:T]/g, '-')}.xlsx`);
+      const n = ids.length || cameras.length;
+      toast(`Exported ${n} camera${n === 1 ? '' : 's'} to Excel`);
+    } catch (e: any) {
+      toast(e?.message || 'Export failed', 'err');
+    } finally { setExporting(false); }
+  }
   function openBulkDelete() {
     setConfirmingDelete(true);
     setPurgeFootage(false);
@@ -225,14 +268,16 @@ export function CamerasPage() {
           <option value="error">Error</option>
         </select>
         {filtering && (
-          <button className="btn-subtle btn-sm" onClick={() => { setQ(''); setStatusFilter(''); }}>Clear filters</button>
+          <button className="btn-subtle btn-sm" onClick={() => { setQ(''); setStatusFilter(''); setCf({}); }}>Clear filters</button>
         )}
         <span style={{ flex: 1 }} />
         {canManage && <button className="btn-primary" onClick={() => nav('/cameras/add')}>＋ Add camera</button>}
       </div>
+      <CameraFilterBar cameras={cameras} value={cf} onChange={setCf} groups={['type', 'maker', 'recording', 'attention']} />
 
-      {/* Bulk action bar. The state-changing actions need camera_manage; Export
-          is a client-side CSV (a read) so it stays open; Delete stays admin-only. */}
+      {/* Bulk action bar. The state-changing actions need camera_manage; Export is a read so it
+          stays open — as the server-built Excel workbook for admins, the client-side CSV of what
+          the table shows for everyone else; Delete stays admin-only. */}
       {sel.length > 0 && (
         <div className="inv-bulk">
           <span className="sel">{sel.length} selected</span>
@@ -249,8 +294,19 @@ export function CamerasPage() {
               <button className="btn-ghost btn-sm" onClick={() => setPendingBulk('stopRec')}>Stop rec</button>
             </>
           )}
+          {canTimelapse && (
+            <>
+              <span className="inv-sep" />
+              <button className="btn-ghost btn-sm" onClick={() => setTlMode('on')}
+                      title="Switch time-lapse on for the selected cameras">◷ Time-lapse on</button>
+              <button className="btn-ghost btn-sm" onClick={() => setTlMode('off')}>Time-lapse off</button>
+            </>
+          )}
           <span className="inv-sep" />
-          <button className="btn-ghost btn-sm" onClick={bulkExportCsv}>Export</button>
+          <button className="btn-ghost btn-sm" disabled={exporting}
+                  onClick={() => (isAdmin ? exportXlsx(sel) : bulkExportCsv())}>
+            {isAdmin ? (exporting ? 'Exporting…' : 'Export to Excel') : 'Export'}
+          </button>
           {isAdmin && <button className="btn-danger btn-sm" onClick={openBulkDelete}>Delete</button>}
           <span style={{ flex: 1 }} />
           <button className="btn-ghost btn-sm" onClick={() => setSelected(new Set())}>Clear</button>
@@ -273,6 +329,13 @@ export function CamerasPage() {
               <span className="s"><span className="d" style={{ background: 'var(--green)' }} /><b>{online}</b> online</span>
               <span className="s"><span className="d" style={{ background: offline ? 'var(--red)' : 'var(--dim)' }} /><b>{offline}</b> offline</span>
             </div>
+            {isAdmin && cameras.length > 0 && (
+              <button className="btn-ghost btn-sm" disabled={exporting} onClick={() => exportXlsx(sel)}
+                      title={sel.length ? `Export the ${sel.length} selected cameras to Excel`
+                                        : 'Export every camera (name, camera ID, IP, MAC, model, ports, retention, status…) to Excel'}>
+                {exporting ? 'Exporting…' : `⤓ Export to Excel${sel.length ? ` (${sel.length})` : ''}`}
+              </button>
+            )}
           </div>
         </div>
         <div className="panel-body flush">
@@ -282,6 +345,7 @@ export function CamerasPage() {
               <tr>
                 <th style={{ width: 34 }}>
                   <input type="checkbox" style={{ width: 'auto' }} checked={allChecked}
+                    aria-label="Select all cameras shown"
                     onChange={e => setSelected(e.target.checked ? new Set(visible.map(c => c.id)) : new Set())} />
                 </th>
                 <th>Camera</th><th>IP address</th><th>Zone</th><th>Status</th><th>Uptime 7d</th><th>Firmware</th>
@@ -295,7 +359,7 @@ export function CamerasPage() {
                     <div className="glyph">{filtering ? '⌕' : '▤'}</div>
                     <h4>{filtering ? 'No cameras match' : 'No cameras yet'}</h4>
                     <p>{filtering
-                      ? 'Nothing matches this search and status filter combination.'
+                      ? 'Nothing matches this search and these filters.'
                       : 'Add your first camera to start monitoring, recording and analytics.'}</p>
                     {filtering
                       ? <button className="btn-ghost btn-sm" onClick={() => { setQ(''); setStatusFilter(''); }}>Clear filters</button>
@@ -307,10 +371,13 @@ export function CamerasPage() {
                 const cams = groups[z];
                 const zOnline = cams.filter(c => c.health_status === 'connected').length;
                 const isCollapsed = collapsed.has(z);
+                const zSel = cams.filter(c => selected.has(c.id)).length;
                 return [
                   <tr key={`z-${z}`} className="inv-zone" onClick={() => toggleZone(z)}>
                     <td colSpan={7}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', userSelect: 'none' }}>
+                        <TriCheckbox checked={zSel === cams.length} some={zSel > 0}
+                          label={`Select all cameras in ${z}`} onChange={on => setZoneSel(cams, on)} />
                         <span style={{ fontSize: 10, color: 'var(--dim)', width: 10, display: 'inline-block',
                                        transition: 'transform .15s ease', transform: isCollapsed ? 'none' : 'rotate(90deg)' }}>▶</span>
                         <span style={{ width: 7, height: 7, borderRadius: '50%', background: zOnline ? 'var(--green)' : 'var(--dim)' }} />
@@ -326,6 +393,7 @@ export function CamerasPage() {
                         onClick={() => nav(`/cameras/config?cam=${c.id}`)}>
                       <td onClick={e => e.stopPropagation()}>
                         <input type="checkbox" style={{ width: 'auto' }} checked={selected.has(c.id)}
+                          aria-label={`Select ${c.name}`}
                           onChange={e => toggleSel(c.id, e.target.checked)} />
                       </td>
                       <td>
@@ -371,6 +439,7 @@ export function CamerasPage() {
         confirmingDelete, setConfirmingDelete, deleteBusy, sel, purgeFootage,
         setPurgeFootage, typedConfirm, setTypedConfirm, confirmBulkDelete,
       }} />
+      <TimelapseBulkModal mode={tlMode} ids={sel} onClose={() => setTlMode(null)} onDone={refresh} />
       <BulkApplyModal {...{
         pendingBulk, setPendingBulk, bulkBusy, runPendingBulk, sel,
       }} />

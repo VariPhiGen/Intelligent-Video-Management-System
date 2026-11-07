@@ -75,7 +75,7 @@ export function StepDiscover({ method, setMethod, cidr, setCidr, disc, assign, s
             ...wzCompliance(assign), verify: true,
           }),
         });
-        toast(`${d.name || d.ip} added to relay${d.error ? ' — ' + d.error : ''}`, 'ok');
+        toast(`${d.name || d.ip} added to relay${d.error ? ' — ' + d.error : ''}`, d.error ? 'err' : 'ok');
         onAdded(d.name || manualName.trim() || d.ip || '', d.id);
         setManual('');
         setManualName('');

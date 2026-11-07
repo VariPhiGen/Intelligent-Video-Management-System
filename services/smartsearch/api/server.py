@@ -230,7 +230,7 @@ def create_app(engine: IndexEngine, config: AppConfig, store: Store,
             # loaded on. That was previously knowable only from a boot log line,
             # so "is this running on the GPU?" could not be answered over HTTP.
             "lifecycle": pool.snapshot(),
-            # Whether anything is actually bounding the index. `retention_days`
+            # Whether anything is actually bounding the index. `retention_minutes`
             # under `config` is only the stamp put on new rows; this is the
             # sweep that acts on it, and the two were unconnected until the
             # thread existed. `enabled: false` here means the index grows
@@ -255,7 +255,7 @@ def create_app(engine: IndexEngine, config: AppConfig, store: Store,
                 "expected_source_fps": config.ingest.max_sample_fps,
                 "dedup_window_seconds": config.ingest.dedup_window_seconds,
                 "dedup_cosine_threshold": config.ingest.dedup_cosine_threshold,
-                "retention_days": config.store.retention_days,
+                "retention_minutes": config.store.retention_minutes,
             },
         }
 
@@ -306,14 +306,25 @@ def create_app(engine: IndexEngine, config: AppConfig, store: Store,
             description="Any of " + " / ".join(CAMERA_DOMAINS)
                         + "; default person + vehicles",
         ),
+        retention_minutes: Optional[int] = Query(
+            default=None, ge=1, le=3650 * 1440,
+            description="How long crops from this camera stay searchable, in "
+                        "MINUTES. Omit to follow the appliance default. Should "
+                        "be the camera's RECORDING retention: the index must "
+                        "not outlive the footage it describes.",
+        ),
         retention_days: Optional[int] = Query(
             default=None, ge=1, le=3650,
-            description="How long crops from this camera stay searchable. "
-                        "Omit to follow the appliance default. Should be the "
-                        "camera's RECORDING retention: the index must not "
-                        "outlive the footage it describes.",
+            description="DEPRECATED day-spelling of retention_minutes, "
+                        "converted on arrival. Sending both is a 422.",
         ),
     ) -> dict:
+        if retention_minutes is not None and retention_days is not None:
+            raise HTTPException(
+                422, "Send retention_minutes or retention_days, not both — "
+                     "they are the same field in two units.")
+        if retention_minutes is None and retention_days is not None:
+            retention_minutes = retention_days * 1440
         # FROM THE REGISTRY. This filter was a literal set, and it silently
         # dropped `face` from every camera the VMS registered — the registry
         # accepted the camera, answered 200, and indexed two domains out of
@@ -337,17 +348,17 @@ def create_app(engine: IndexEngine, config: AppConfig, store: Store,
         # that was registered but not being sampled.
         entry, outcome = engine.upsert_camera(
             name, rtsp_url, tuple(picked) if picked else ("person", "vehicles"),
-            retention_days,
+            retention_minutes,
         )
         # AFTER the registry accepted it, and unconditionally rather than only
         # on outcome == "updated": four workers race here and only one of them
         # sees the transition, so gating the restamp on the outcome would drop
         # it whenever another worker won. set_camera_retention is a no-op once
         # the deadline already matches, which is what makes that affordable.
-        restamp = store.set_camera_retention(name, retention_days)
+        restamp = store.set_camera_retention(name, retention_minutes)
         return {"status": "ok", "camera": name,
                 "outcome": outcome, "domains": list(entry.domains),
-                "retention_days": retention_days,
+                "retention_minutes": retention_minutes,
                 # Surfaced so an operator who shortens retention can see the
                 # existing rows move, rather than having to trust that they did.
                 "rows_restamped": restamp["rows_restamped"],

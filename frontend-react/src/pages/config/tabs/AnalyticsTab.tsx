@@ -19,8 +19,13 @@ import { entryArrow, hasEntryDirection } from '@/lib/tripwire';
 import { ZONE_COLORS, dimHex } from '../analytics/activities';
 import { useActivityCatalog } from '../analytics/useActivityCatalog';
 import { buildRegionSave, freeId, freeRegionName, readConfig, watcherCount } from '../analytics/analyticsConfig';
+import { cameraTarget, type AnalyticsTarget } from '../analytics/analyticsTarget';
 
-export function AnalyticsTab({ camera, onSaved }: { camera: Camera; onSaved: () => void }) {
+/** `camera.analytics_config` is the TARGET's config (a PTZ preset's, when one is picked — ConfigPage's view picker),
+ *  and `target` says where it is read fresh and saved. */
+export function AnalyticsTab({ camera, onSaved, target = cameraTarget(camera) }: {
+  camera: Camera; onSaved: () => void; target?: AnalyticsTarget;
+}) {
   const toast = useToast();
   const { byKey } = useActivityCatalog();
   const [regions, setRegions] = useState<Record<string, AnalyticsRegion>>({});
@@ -88,11 +93,11 @@ export function AnalyticsTab({ camera, onSaved }: { camera: Camera; onSaved: () 
       // camera prop only refreshes via ConfigPage's fire-and-forget refresh()
       // (plus a 15s poll that can fail silently), so a stale copy here could
       // silently delete activities AI Config just saved. Fail loudly instead.
-      const fresh = await apiFetch<Camera>(`/cameras/${camera.id}`);
+      const fresh = await target.load();
       const trimmed: Record<string, AnalyticsRegion> = {};
       regionOrder.forEach(rid => { if (regions[rid]) trimmed[rid] = { ...regions[rid], name: regions[rid].name.trim() }; });
-      const payload = buildRegionSave(fresh.analytics_config, trimmed, regionOrder);
-      await apiFetch(`/cameras/${camera.id}/analytics`, { method: 'PUT', body: JSON.stringify(payload) });
+      const payload = buildRegionSave(fresh, trimmed, regionOrder);
+      await target.save(payload);
       toast('Zones saved');
       onSaved();
     } catch (e: any) {
@@ -152,7 +157,7 @@ export function AnalyticsTab({ camera, onSaved }: { camera: Camera; onSaved: () 
           </div>
         </div>
 
-        <PolygonEditor cameraId={camera.id} polygons={editorShapes}
+        <PolygonEditor cameraId={camera.id} snapshotPath={target.snapshotPath} polygons={editorShapes}
           drawing={drawing}
           drawMode={drawKind === 'tripwire' ? 'line' : 'polygon'}
           drawColor={drawing ? nextRegionColor : undefined}
