@@ -139,7 +139,8 @@ def test_a_bare_catalogue_name_is_left_to_ultralytics():
 
 
 def test_a_missing_path_offline_is_a_clear_error(tmp_path, monkeypatch):
-    from ultralytics.utils import downloads
+    # The lean CI job installs no ultralytics; this test is about its downloader.
+    downloads = pytest.importorskip("ultralytics.utils.downloads")
 
     def offline(*a, **kw):
         raise ConnectionError("no route to github.com")

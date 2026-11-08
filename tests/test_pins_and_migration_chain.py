@@ -25,8 +25,8 @@ def test_no_package_pinned_twice_in_a_requirements_file():
 
 
 def test_every_migration_chain_is_one_line():
-    rev_re = re.compile(r'^revision(?::[^=]*)?=\s*["\']([^"\']+)["\']', re.M)
-    down_re = re.compile(r'^down_revision(?::[^=]*)?=\s*["\']?([^"\'\n]*)["\']?', re.M)
+    rev_re = re.compile(r'^revision\s*(?::[^=]*)?=\s*["\']([^"\']+)["\']', re.M)
+    down_re = re.compile(r'^down_revision\s*(?::[^=]*)?=\s*["\']?([^"\'\n]*)["\']?', re.M)
     problems = []
     for versions in sorted(ROOT.glob("services/**/migrations/versions")):
         revs, downs = [], []
