@@ -35,12 +35,12 @@ Generated — do not edit between the markers.
 | --- | ---: | ---: | ---: | ---: |
 | frames | 1,893 | 1,327 | 0.701 | 120 |
 | camera-mgmt | 35,880 | 23,563 | 0.657 | 2024 |
-| analytics | 9,594 | 5,402 | 0.563 | 509 |
+| analytics | 9,595 | 5,402 | 0.563 | 509 |
 | smartsearch | 8,364 | 4,684 | 0.560 | 391 |
 | nvr | 4,949 | 1,771 | 0.358 | 170 |
 | motion | 1,498 | 488 | 0.326 | 32 |
 | frontend-react | 31,893 | 6,177 | 0.194 | 659 |
-| **total** | **94,071** | **43,412** | **0.461** | **3905** |
+| **total** | **94,072** | **43,412** | **0.461** | **3905** |
 
 Plus 19 repo-level structural tests and 93 E2E assertions across 10 journey specs (J1, J10, J2, J3, J4, J5, J6, J7, J8, J9). **Grand total 4017.**
 <!-- LEDGER:END -->

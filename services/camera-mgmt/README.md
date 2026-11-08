@@ -22,9 +22,6 @@ IP Cameras  ──pull──►  MediaMTX :8654  ──serve──►  DeepStrea
                    PostgreSQL    Redis
 ```
 
-See [architecture.md](architecture.md) for the full component diagram and
-scaling analysis.
-
 ---
 
 ## Prerequisites
@@ -271,9 +268,6 @@ curl -X POST http://localhost:8091/api/cameras/{id}/reconnect
 ---
 
 ## Scaling
-
-For deployments beyond a single server, see the **Scale Model** section in
-[architecture.md](architecture.md).
 
 **Rough capacity (pass-through only):**
 

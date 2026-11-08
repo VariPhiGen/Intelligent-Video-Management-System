@@ -120,7 +120,8 @@ def create_app(engine) -> FastAPI:
     # ---- user-uploaded detection models (Data Collection) -------------------
     from analytics.user_models import ModelError, UserModelRegistry
 
-    models_root = Path(getattr(getattr(engine, "_cfg", None), "models_dir", "/models")) / "user"
+    models_cfg = getattr(getattr(engine, "_cfg", None), "models", None)   # models_dir lives on cfg.models
+    models_root = Path(getattr(models_cfg, "models_dir", "/models")) / "user"
     registry = UserModelRegistry(models_root)
     max_upload = int(os.environ.get("ANALYTICS_MODEL_UPLOAD_MAX_MB", "512")) * 1024 * 1024
 
